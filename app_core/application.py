@@ -134,7 +134,7 @@ FACTOR_DESCRIPTIONS: dict[str, str] = {
     "EarningsYield_vs_Sector": "相对于行业的盈利收益率。",
 }
 
-TASK_ORDER = ["fetch"] + [f"predict::{cfg['key']}" for cfg in PREDICTION_TIMELINES]
+TASK_ORDER = [f"predict::{cfg['key']}" for cfg in PREDICTION_TIMELINES]
 
 VALIDATION_PARAMETER_SPECS: list[dict[str, T.Any]] = [
     {"label": "方向", "field": "direction", "fmt": "text", "actual_field": "actual_direction"},
@@ -347,9 +347,7 @@ def _build_validation_figures(
                 fig_prob.add_hline(y=move_value, line_dash="dot", line_color="firebrick", name="实际涨跌幅")
 
     return fig_dci, fig_prob
-TASK_TEMPLATES = {
-    "fetch": {"id": "fetch", "name": "获取财报列表"},
-}
+TASK_TEMPLATES: dict[str, dict[str, T.Any]] = {}
 for _timeline_cfg in PREDICTION_TIMELINES:
     _key = str(_timeline_cfg.get("key"))
     TASK_TEMPLATES[f"predict::{_key}"] = {
@@ -422,7 +420,163 @@ def _merge_task_updates(existing: dict[str, T.Any] | None, updates: list[dict[st
         if key not in TASK_ORDER:
             ordered.append(value)
 
+    seen_incomplete = False
+    for task in ordered:
+        status = str(task.get("status") or "")
+        if status in {"已完成", "失败"}:
+            continue
+        if not seen_incomplete:
+            seen_incomplete = True
+            continue
+        if status != "等待":
+            task["status"] = "等待"
+        if not task.get("detail"):
+            task["detail"] = "等待前序任务完成"
+        if task.get("start_time"):
+            task["start_time"] = ""
+        task["end_time"] = ""
+        task["updated_at"] = now_ts
+
     return {"tasks": ordered}
+
+
+def _normalise_change_value(value: T.Any) -> T.Any:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def _values_equal(a: T.Any, b: T.Any) -> bool:
+    a_norm = _normalise_change_value(a)
+    b_norm = _normalise_change_value(b)
+    if isinstance(a_norm, float) and isinstance(b_norm, float):
+        return abs(a_norm - b_norm) <= 1e-9
+    return a_norm == b_norm
+
+
+def _format_change_value(value: T.Any) -> T.Any:
+    norm = _normalise_change_value(value)
+    if isinstance(norm, float):
+        return round(norm, 6)
+    return norm
+
+
+def _flatten_global_snapshot(snapshot: dict[str, T.Any] | None) -> dict[str, T.Any]:
+    mapping: dict[str, T.Any] = {}
+    if not isinstance(snapshot, dict):
+        return mapping
+    global_data = snapshot.get("global") if "global" in snapshot else snapshot
+    if isinstance(global_data, dict):
+        for key in ("learning_rate", "gamma", "adjustment_scale", "bias", "baseline", "update_count", "total_predictions"):
+            if key in global_data:
+                mapping[f"global::{key}"] = global_data.get(key)
+        weights = global_data.get("weights") if isinstance(global_data.get("weights"), dict) else {}
+        for feature, value in weights.items():
+            mapping[f"global_weight::{feature}"] = value
+    factor_weights = snapshot.get("factor_weights") if isinstance(snapshot.get("factor_weights"), dict) else {}
+    for factor, value in factor_weights.items():
+        mapping[f"factor::{factor}"] = value
+    return mapping
+
+
+def _flatten_sector_snapshot(snapshot: dict[str, T.Any] | None) -> dict[str, T.Any]:
+    mapping: dict[str, T.Any] = {}
+    if not isinstance(snapshot, dict):
+        return mapping
+    sectors = snapshot.get("sectors") if isinstance(snapshot.get("sectors"), dict) else {}
+    for sector_name, payload in sectors.items():
+        if not isinstance(payload, dict):
+            continue
+        for key in ("baseline", "update_count", "total_predictions", "bias"):
+            if key in payload:
+                mapping[f"{sector_name}::{key}"] = payload.get(key)
+        weights = payload.get("weights") if isinstance(payload.get("weights"), dict) else {}
+        for feature, value in weights.items():
+            mapping[f"{sector_name}::weight::{feature}"] = value
+    return mapping
+
+
+def _compute_snapshot_changes(
+    previous: dict[str, T.Any] | None, current: dict[str, T.Any] | None
+) -> tuple[list[dict[str, T.Any]], list[dict[str, T.Any]]]:
+    timestamp = dt.datetime.now(US_EASTERN).strftime("%Y-%m-%d %H:%M:%S")
+
+    prev_global = _flatten_global_snapshot(previous)
+    curr_global = _flatten_global_snapshot(current)
+    prev_sector = _flatten_sector_snapshot(previous)
+    curr_sector = _flatten_sector_snapshot(current)
+
+    global_changes: list[dict[str, T.Any]] = []
+    for key in sorted(set(prev_global) | set(curr_global)):
+        old_value = prev_global.get(key)
+        new_value = curr_global.get(key)
+        if _values_equal(old_value, new_value):
+            continue
+        if key.startswith("global::"):
+            scope = "全局"
+            parameter = key.split("global::", 1)[1]
+        elif key.startswith("global_weight::"):
+            scope = "特征"
+            parameter = key.split("global_weight::", 1)[1]
+        elif key.startswith("factor::"):
+            scope = "因子"
+            parameter = key.split("factor::", 1)[1]
+        else:
+            scope = "其他"
+            parameter = key
+        old_fmt = _format_change_value(old_value)
+        new_fmt = _format_change_value(new_value)
+        delta: T.Any = ""
+        old_norm = _normalise_change_value(old_value)
+        new_norm = _normalise_change_value(new_value)
+        if isinstance(old_norm, float) and isinstance(new_norm, float):
+            delta = round(new_norm - old_norm, 6)
+        global_changes.append(
+            {
+                "timestamp": timestamp,
+                "scope": scope,
+                "parameter": parameter,
+                "old_value": old_fmt,
+                "new_value": new_fmt,
+                "delta": delta,
+            }
+        )
+
+    sector_changes: list[dict[str, T.Any]] = []
+    for key in sorted(set(prev_sector) | set(curr_sector)):
+        old_value = prev_sector.get(key)
+        new_value = curr_sector.get(key)
+        if _values_equal(old_value, new_value):
+            continue
+        if "::weight::" in key:
+            sector_name, _, feature = key.partition("::weight::")
+            parameter = f"权重:{feature}"
+        else:
+            sector_name, _, parameter = key.partition("::")
+        old_fmt = _format_change_value(old_value)
+        new_fmt = _format_change_value(new_value)
+        delta: T.Any = ""
+        old_norm = _normalise_change_value(old_value)
+        new_norm = _normalise_change_value(new_value)
+        if isinstance(old_norm, float) and isinstance(new_norm, float):
+            delta = round(new_norm - old_norm, 6)
+        sector_changes.append(
+            {
+                "timestamp": timestamp,
+                "sector": sector_name,
+                "parameter": parameter,
+                "old_value": old_fmt,
+                "new_value": new_fmt,
+                "delta": delta,
+            }
+        )
+
+    return global_changes[::-1], sector_changes[::-1]
 
 
 def _load_earnings_cache_raw() -> dict[str, T.Any]:
@@ -1512,7 +1666,6 @@ def build_targets(target_date: dt.date) -> pd.DataFrame:
     tomorrow_us = next_trading_day(target_date)
     is_friday = target_date.weekday() == 4
     pre_market_label = "下周一盘前" if is_friday else "次日盘前"
-    not_supplied_label = "下周一待定" if is_friday else "次日待定"
 
     rows_today = fetch_earnings_by_date(target_date)
     rows_tomorrow = fetch_earnings_by_date(tomorrow_us)
@@ -1528,15 +1681,7 @@ def build_targets(target_date: dt.date) -> pd.DataFrame:
             "decision_date": target_date.isoformat(),
             "bucket": pre_market_label,
         }
-        for r in pick_by_times(rows_tomorrow, want_pre_market=True)
-    ]
-    targets += [
-        {
-            **r,
-            "decision_date": tomorrow_us.isoformat(),
-            "bucket": not_supplied_label,
-        }
-        for r in pick_by_times(rows_tomorrow, want_not_supplied=True)
+        for r in pick_by_times(rows_tomorrow, want_pre_market=True, want_not_supplied=True)
     ]
 
     # dedupe by (symbol, bucket, decision_date)
@@ -1603,14 +1748,27 @@ def run_login(n_clicks, username, password, twofa, log_state):  # noqa: D401
     Output("task-store", "data", allow_duplicate=True),
     Input("auto-run-trigger", "n_intervals"),
     Input("earnings-date-picker", "date"),
+    Input("refresh-earnings-btn", "n_clicks"),
     State("ft-username", "value"),
     State("ft-password", "value"),
     State("ft-2fa", "value"),
     State("ft-session-store", "data"),
     State("task-store", "data"),
+    State("log-store", "data"),
     prevent_initial_call="initial_duplicate",
 )
-def start_run(auto_intervals, selected_date, username, password, twofa, session_state, task_state):  # noqa: D401
+def start_run(
+    auto_intervals,
+    selected_date,
+    refresh_clicks,
+    username,
+    password,
+    twofa,
+    session_state,
+    task_state,
+    log_state,
+):  # noqa: D401
+    del refresh_clicks
     trigger = ctx.triggered_id
     if trigger == "auto-run-trigger":
         if auto_intervals is None:
@@ -1621,6 +1779,8 @@ def start_run(auto_intervals, selected_date, username, password, twofa, session_
     else:
         return no_update, no_update, no_update, no_update, no_update, no_update
 
+    logs = log_state if isinstance(log_state, list) else []
+
     target_date = _coerce_date(selected_date) or us_eastern_today()
     today_limit = us_eastern_today()
     max_allowed = today_limit + dt.timedelta(days=14)
@@ -1630,11 +1790,37 @@ def start_run(auto_intervals, selected_date, username, password, twofa, session_
     if target_date < min_allowed:
         target_date = min_allowed
 
-    fetch_name = f"{target_date.strftime('%m月%d日')} 的财报列表"
+    twofa_code = (twofa or "").strip()
+    if not twofa_code:
+        message = "已取消：请先在数据连接页输入双重验证码。"
+        logs = append_log(logs, message)
+        return no_update, logs, message, no_update, True, no_update
 
-    cache_entry = _get_cached_earnings(target_date)
+    session_payload = session_state if isinstance(session_state, dict) else None
+    retry_failures: list[dict[str, T.Any]] = []
+    for attempt in range(3):
+        statuses = _check_resource_connections(session_payload)
+        retry_failures = [
+            entry
+            for entry in statuses
+            if not entry.get("ok") and entry.get("resource") != "Firstrade 会话"
+        ]
+        if not retry_failures:
+            break
+        failure_names = "、".join(str(item.get("resource", "未知资源")) for item in retry_failures)
+        logs = append_log(logs, f"资源连接失败（第{attempt + 1}次）：{failure_names}，准备重试。")
+        time.sleep(1)
+
+    if retry_failures:
+        failure_names = "、".join(str(item.get("resource", "未知资源")) for item in retry_failures)
+        message = f"资源连接失败，已取消任务：{failure_names}。"
+        logs = append_log(logs, message)
+        return no_update, logs, message, no_update, True, no_update
+
+    force_refresh = trigger == "refresh-earnings-btn"
+    cache_entry = _get_cached_earnings(target_date) if not force_refresh else None
     if cache_entry:
-        logs = append_log([], f"命中 {target_date} 的本地缓存。")
+        logs = append_log(logs, f"命中 {target_date} 的本地缓存。")
         cached_status = str(cache_entry.get("status") or "")
         extra = "（来自本地缓存，无需重新请求。）"
         status_out = (cached_status + "\n" + extra) if cached_status else extra
@@ -1670,18 +1856,7 @@ def start_run(auto_intervals, selected_date, username, password, twofa, session_
                 }
             )
 
-        tasks = _merge_task_updates(
-            task_state,
-            [
-                {
-                    "id": "fetch",
-                    "name": fetch_name,
-                    "status": "已完成",
-                    "detail": f"命中 {target_date} 的本地缓存",
-                },
-                *timeline_updates,
-            ],
-        )
+        tasks = _merge_task_updates(task_state, timeline_updates)
         return None, logs, status_out, row_data, True, tasks
 
     run_id = uuid.uuid4().hex
@@ -1693,7 +1868,7 @@ def start_run(auto_intervals, selected_date, username, password, twofa, session_
             run_id,
             username or "",
             password or "",
-            (twofa or ""),
+            twofa_code,
             session_state if isinstance(session_state, dict) else {},
             target_date,
         ),
@@ -1702,6 +1877,11 @@ def start_run(auto_intervals, selected_date, username, password, twofa, session_
     thread.start()
 
     status_message = f"开始获取 {target_date} 的数据……"
+    if force_refresh:
+        logs = append_log(logs, f"用户手动刷新 {target_date} 的财报列表。")
+    else:
+        logs = append_log(logs, f"准备获取 {target_date} 的财报列表。")
+
     timeline_waiting = []
     for cfg in PREDICTION_TIMELINES:
         task_id, name, offset_label = _describe_timeline_task(target_date, cfg)
@@ -1714,19 +1894,8 @@ def start_run(auto_intervals, selected_date, username, password, twofa, session_
             }
         )
 
-    tasks = _merge_task_updates(
-        task_state,
-        [
-            {
-                "id": "fetch",
-                "name": fetch_name,
-                "status": "进行中",
-                "detail": f"正在获取 {target_date} 的财报列表",
-            },
-            *timeline_waiting,
-        ],
-    )
-    return run_id, [], status_message, [], False, tasks
+    tasks = _merge_task_updates(task_state, timeline_waiting)
+    return run_id, logs, status_message, [], False, tasks
 
 
 def _execute_run(
@@ -1903,37 +2072,36 @@ def poll_run_state(n_intervals, run_id, existing_logs, current_rows, task_state)
 
     task_updates: list[dict[str, T.Any]] = []
     target_date = state.get("target_date")
-    fetch_name = None
-    if isinstance(target_date, dt.date):
-        fetch_name = f"{target_date.strftime('%m月%d日')} 的财报列表"
 
-    if isinstance(status, str) and "错误" in status:
-        task_updates.append({"id": "fetch", "name": fetch_name, "status": "失败", "detail": status})
-        if isinstance(target_date, dt.date):
-            for cfg in PREDICTION_TIMELINES:
-                task_id, name, offset_label = _describe_timeline_task(target_date, cfg)
-                task_updates.append(
-                    {
-                        "id": task_id,
-                        "name": name,
-                        "status": "失败",
-                        "detail": f"财报列表失败，无法执行 {offset_label}",
-                    }
-                )
-    if isinstance(row_data, list) and row_data != current_rows:
-        detail = f"共 {len(row_data)} 个标的"
-        task_updates.append({"id": "fetch", "name": fetch_name, "status": "已完成", "detail": detail})
-        if isinstance(target_date, dt.date):
-            for cfg in PREDICTION_TIMELINES:
-                task_id, name, offset_label = _describe_timeline_task(target_date, cfg)
-                task_updates.append(
-                    {
-                        "id": task_id,
-                        "name": name,
-                        "status": "进行中",
-                        "detail": f"准备生成 {offset_label} 预测 ({len(row_data)} 个标的)",
-                    }
-                )
+    if isinstance(status, str) and "错误" in status and isinstance(target_date, dt.date):
+        for cfg in PREDICTION_TIMELINES:
+            task_id, name, offset_label = _describe_timeline_task(target_date, cfg)
+            task_updates.append(
+                {
+                    "id": task_id,
+                    "name": name,
+                    "status": "失败",
+                    "detail": f"财报列表失败，无法执行 {offset_label}",
+                }
+            )
+    if isinstance(row_data, list) and row_data != current_rows and isinstance(target_date, dt.date):
+        total = len(row_data)
+        for idx, cfg in enumerate(PREDICTION_TIMELINES):
+            task_id, name, offset_label = _describe_timeline_task(target_date, cfg)
+            if idx == 0:
+                status_value = "进行中"
+                detail_text = f"准备生成 {offset_label} 预测 ({total} 个标的)"
+            else:
+                status_value = "等待"
+                detail_text = f"等待执行 {offset_label} 预测 ({total} 个标的)"
+            task_updates.append(
+                {
+                    "id": task_id,
+                    "name": name,
+                    "status": status_value,
+                    "detail": detail_text,
+                }
+            )
 
     tasks_out = _merge_task_updates(task_state, task_updates) if task_updates else no_update
 
@@ -1944,6 +2112,7 @@ def poll_run_state(n_intervals, run_id, existing_logs, current_rows, task_state)
     Output("prediction-store", "data"),
     Output("prediction-status", "children"),
     Output("rl-agent-store", "data"),
+    Output("rl-change-store", "data", allow_duplicate=True),
     Output("task-store", "data", allow_duplicate=True),
     Output("log-store", "data", allow_duplicate=True),
     Input("table", "selectedRows"),
@@ -1951,15 +2120,17 @@ def poll_run_state(n_intervals, run_id, existing_logs, current_rows, task_state)
     State("task-store", "data"),
     State("earnings-date-picker", "date"),
     State("log-store", "data"),
+    State("rl-agent-store", "data"),
+    State("rl-change-store", "data"),
     prevent_initial_call="initial_duplicate",
 )
-def update_predictions(selected_rows, row_data, task_state, picker_date, log_state):  # noqa: D401
+def update_predictions(selected_rows, row_data, task_state, picker_date, log_state, rl_snapshot_state, change_state):  # noqa: D401
     initial_snapshot = RL_MANAGER.snapshot() if RL_MANAGER is not None else None
     triggered = ctx.triggered_id
     task_state_local = task_state if isinstance(task_state, dict) else {"tasks": []}
 
     if triggered == "table.selectedRows" and not selected_rows:
-        return no_update, no_update, no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update, no_update, no_update
 
     use_all_rows = triggered == "table.rowData"
     symbols: list[str] = []
@@ -1987,6 +2158,7 @@ def update_predictions(selected_rows, row_data, task_state, picker_date, log_sta
             {"results": [], "missing": [], "errors": [], "rl_snapshot": initial_snapshot},
             message,
             initial_snapshot,
+            no_update,
             no_update,
             no_update,
         )
@@ -2168,10 +2340,25 @@ def update_predictions(selected_rows, row_data, task_state, picker_date, log_sta
                     entry["prediction_correct"] = actual.get("prediction_correct")
                     entry["actual_checked_at"] = evaluation.get("checked_at")
 
+    previous_snapshot = rl_snapshot_state if isinstance(rl_snapshot_state, dict) else None
+    change_state_map = change_state if isinstance(change_state, dict) else {"global": [], "sectors": []}
+    change_output: T.Any = no_update
+    if isinstance(snapshot, dict):
+        global_changes, sector_changes = _compute_snapshot_changes(previous_snapshot, snapshot)
+        if global_changes or sector_changes:
+            existing_global = change_state_map.get("global") if isinstance(change_state_map.get("global"), list) else []
+            existing_sector = change_state_map.get("sectors") if isinstance(change_state_map.get("sectors"), list) else []
+            updated_state = {
+                "global": (global_changes + existing_global)[:200],
+                "sectors": (sector_changes + existing_sector)[:200],
+            }
+            change_output = updated_state
+
     return (
         {"results": results, "missing": missing, "errors": errors, "rl_snapshot": snapshot},
         message or "",
         snapshot,
+        change_output,
         task_updates,
         log_output,
     )
@@ -2200,23 +2387,26 @@ def render_prediction_table(store_data):  # noqa: D401
 @app.callback(
     Output("evaluation-store", "data"),
     Output("rl-agent-store", "data", allow_duplicate=True),
+    Output("rl-change-store", "data", allow_duplicate=True),
     Input("post-open-eval", "n_intervals"),
     State("evaluation-store", "data"),
+    State("rl-agent-store", "data"),
+    State("rl-change-store", "data"),
     prevent_initial_call="initial_duplicate",
 )
-def auto_evaluate_predictions(n_intervals, existing_store):  # noqa: D401
+def auto_evaluate_predictions(n_intervals, existing_store, rl_snapshot_state, change_state):  # noqa: D401
     del n_intervals
 
     now = dt.datetime.now(US_EASTERN)
     if now.hour < 9 or (now.hour == 9 and now.minute < 40):
-        return no_update, no_update
+        return no_update, no_update, no_update
 
     today = now.date()
     today_iso = today.isoformat()
 
     store = existing_store if isinstance(existing_store, dict) else {}
     if store.get("last_run") == today_iso:
-        return no_update, no_update
+        return no_update, no_update, no_update
 
     target_date = previous_trading_day(today)
     archive_entry = _get_prediction_archive(target_date)
@@ -2261,7 +2451,7 @@ def auto_evaluate_predictions(n_intervals, existing_store):  # noqa: D401
             "summary": evaluation_payload["summary"],
             "message": evaluation_payload.get("message"),
         }
-        return evaluation_store, no_update
+        return evaluation_store, no_update, no_update
 
     for entry in results:
         symbol = str(entry.get("symbol") or "").upper()
@@ -2375,7 +2565,22 @@ def auto_evaluate_predictions(n_intervals, existing_store):  # noqa: D401
         evaluation_store["message"] = "; ".join(errors)
 
     snapshot = RL_MANAGER.snapshot() if RL_MANAGER is not None else None
-    return evaluation_store, snapshot or no_update
+    previous_snapshot = rl_snapshot_state if isinstance(rl_snapshot_state, dict) else None
+    change_state_map = change_state if isinstance(change_state, dict) else {"global": [], "sectors": []}
+    change_output: T.Any = no_update
+    if isinstance(snapshot, dict):
+        global_changes, sector_changes = _compute_snapshot_changes(previous_snapshot, snapshot)
+        if global_changes or sector_changes:
+            existing_global = change_state_map.get("global") if isinstance(change_state_map.get("global"), list) else []
+            existing_sector = change_state_map.get("sectors") if isinstance(change_state_map.get("sectors"), list) else []
+            updated_state = {
+                "global": (global_changes + existing_global)[:200],
+                "sectors": (sector_changes + existing_sector)[:200],
+            }
+            change_output = updated_state
+
+    rl_output = snapshot if isinstance(snapshot, dict) else no_update
+    return evaluation_store, rl_output, change_output
 
 
 @app.callback(
@@ -2475,17 +2680,23 @@ def render_task_table(task_state):  # noqa: D401
 @app.callback(
     Output("model-global-summary", "children"),
     Output("model-sector-table", "rowData"),
+    Output("model-global-parameters", "rowData"),
+    Output("model-sector-parameters", "rowData"),
+    Output("model-global-change-log", "rowData"),
+    Output("model-sector-change-log", "rowData"),
     Input("rl-agent-store", "data"),
+    Input("rl-change-store", "data"),
 )
-def render_model_parameters(agent_data):  # noqa: D401
+def render_model_parameters(agent_data, change_data):  # noqa: D401
     default_summary = "模型尚未初始化。"
     if not isinstance(agent_data, dict):
-        return default_summary, []
+        return default_summary, [], [], [], [], []
 
     global_data = agent_data.get("global") if "global" in agent_data else agent_data
     sectors = agent_data.get("sectors") if isinstance(agent_data.get("sectors"), dict) else {}
 
     lines: list[str] = []
+    global_param_rows: list[dict[str, T.Any]] = []
     if isinstance(global_data, dict):
         lines.append(f"学习率: {global_data.get('learning_rate')}")
         lines.append(f"折现因子: {global_data.get('gamma')}")
@@ -2493,24 +2704,46 @@ def render_model_parameters(agent_data):  # noqa: D401
         lines.append(f"偏置: {round(float(global_data.get('bias', 0.0)), 4)}")
         lines.append(f"当前基准: {round(float(global_data.get('baseline', 0.0)), 4)}")
         lines.append(f"累计更新: {global_data.get('update_count')}")
-        weights = global_data.get("weights")
-        if isinstance(weights, dict) and weights:
+        lines.append(f"累计预测: {global_data.get('total_predictions')}")
+        for key in ("learning_rate", "gamma", "adjustment_scale", "bias", "baseline", "update_count", "total_predictions"):
+            if key in global_data:
+                value = global_data.get(key)
+                display = round(float(value), 6) if isinstance(value, (int, float)) else value
+                global_param_rows.append(
+                    {
+                        "parameter": key,
+                        "value": display,
+                        "description": RL_PARAM_DESCRIPTIONS.get(key, "参数说明待补充。"),
+                    }
+                )
+        weights = global_data.get("weights") if isinstance(global_data.get("weights"), dict) else {}
+        if weights:
             sorted_weights = sorted(weights.items(), key=lambda kv: abs(float(kv[1])), reverse=True)
-            top_weights = sorted_weights[:10]
-            lines.append("主要权重:")
-            for key, value in top_weights:
-                lines.append(f"  {key}: {round(float(value), 5)}")
-        else:
-            lines.append("主要权重: 无")
-        factor_weights = agent_data.get("factor_weights")
-        if isinstance(factor_weights, dict) and factor_weights:
-            lines.append("当前因子权重:")
-            for key, value in sorted(factor_weights.items(), key=lambda kv: kv[0]):
-                lines.append(f"  {key}: {round(float(value), 4)}")
+            for feature, weight in sorted_weights[:10]:
+                global_param_rows.append(
+                    {
+                        "parameter": f"特征:{feature}",
+                        "value": round(float(weight), 6),
+                        "description": RL_PARAM_DESCRIPTIONS.get("weights", "特征权重。"),
+                    }
+                )
+        factor_weights = agent_data.get("factor_weights") if isinstance(agent_data.get("factor_weights"), dict) else {}
+        for factor_name, weight in sorted(factor_weights.items(), key=lambda kv: kv[0]):
+            global_param_rows.append(
+                {
+                    "parameter": f"因子:{factor_name}",
+                    "value": round(float(weight), 6),
+                    "description": FACTOR_DESCRIPTIONS.get(
+                        factor_name,
+                        RL_PARAM_DESCRIPTIONS.get("factor_weights", "DCI 因子权重。"),
+                    ),
+                }
+            )
     else:
         lines.append(default_summary)
 
     sector_rows: list[dict[str, T.Any]] = []
+    sector_param_rows: list[dict[str, T.Any]] = []
     if sectors:
         for sector_name, payload in sectors.items():
             if not isinstance(payload, dict):
@@ -2531,94 +2764,41 @@ def render_model_parameters(agent_data):  # noqa: D401
                     "top_weights": top_display or "-",
                 }
             )
-
-    return "\n".join(lines), sector_rows
-
-
-@app.callback(
-    Output("rl-model-table", "rowData"),
-    Input("rl-agent-store", "data"),
-)
-def render_model_details(agent_data):  # noqa: D401
-    if not isinstance(agent_data, dict):
-        return []
-
-    rows: list[dict[str, T.Any]] = []
-
-    def _format_value(value: T.Any) -> T.Any:
-        if isinstance(value, float):
-            return round(float(value), 6)
-        return value
-
-    global_data = agent_data.get("global") if "global" in agent_data else agent_data
-    if isinstance(global_data, dict):
-        for key in ("learning_rate", "gamma", "adjustment_scale", "bias", "baseline", "update_count"):
-            if key in global_data:
-                rows.append(
-                    {
-                        "model": "全局",
-                        "parameter": key,
-                        "value": _format_value(global_data.get(key)),
-                        "description": RL_PARAM_DESCRIPTIONS.get(key, "参数说明待补充。"),
-                    }
-                )
-        weights = global_data.get("weights") if isinstance(global_data.get("weights"), dict) else {}
-        if weights:
-            sorted_weights = sorted(weights.items(), key=lambda kv: abs(float(kv[1])), reverse=True)
-            for feature, weight in sorted_weights[:10]:
-                rows.append(
-                    {
-                        "model": "全局-权重",
-                        "parameter": feature,
-                        "value": _format_value(weight),
-                        "description": RL_PARAM_DESCRIPTIONS.get("weights", "特征权重。"),
-                    }
-                )
-
-        factor_weights = agent_data.get("factor_weights")
-        if isinstance(factor_weights, dict) and factor_weights:
-            for factor_name, weight in sorted(factor_weights.items(), key=lambda kv: kv[0]):
-                rows.append(
-                    {
-                        "model": "DCI-因子权重",
-                        "parameter": factor_name,
-                        "value": _format_value(weight),
-                        "description": FACTOR_DESCRIPTIONS.get(
-                            factor_name,
-                            RL_PARAM_DESCRIPTIONS.get("factor_weights", "DCI 因子权重。"),
-                        ),
-                    }
-                )
-
-    sectors = agent_data.get("sectors") if isinstance(agent_data.get("sectors"), dict) else {}
-    if sectors:
-        for sector_name, payload in sectors.items():
-            if not isinstance(payload, dict):
-                continue
-            for key in ("baseline", "update_count", "total_predictions"):
+            for key in ("baseline", "update_count", "total_predictions", "bias"):
                 if key in payload:
-                    rows.append(
+                    value = payload.get(key)
+                    display = round(float(value), 6) if isinstance(value, (int, float)) else value
+                    sector_param_rows.append(
                         {
-                            "model": f"行业:{sector_name}",
+                            "sector": sector_name,
                             "parameter": key,
-                            "value": _format_value(payload.get(key)),
+                            "value": display,
                             "description": RL_PARAM_DESCRIPTIONS.get(key, "参数说明待补充。"),
                         }
                     )
-            weights = payload.get("weights") if isinstance(payload.get("weights"), dict) else {}
             if weights:
-                sorted_weights = sorted(weights.items(), key=lambda kv: abs(float(kv[1])), reverse=True)
-                for feature, weight in sorted_weights[:5]:
-                    rows.append(
+                for feature, weight in sorted(weights.items(), key=lambda kv: abs(float(kv[1])), reverse=True)[:5]:
+                    sector_param_rows.append(
                         {
-                            "model": f"行业:{sector_name}-权重",
-                            "parameter": feature,
-                            "value": _format_value(weight),
+                            "sector": sector_name,
+                            "parameter": f"特征:{feature}",
+                            "value": round(float(weight), 6),
                             "description": RL_PARAM_DESCRIPTIONS.get("weights", "特征权重。"),
                         }
                     )
 
-    return rows
+    change_data = change_data if isinstance(change_data, dict) else {}
+    global_change_rows = change_data.get("global") if isinstance(change_data.get("global"), list) else []
+    sector_change_rows = change_data.get("sectors") if isinstance(change_data.get("sectors"), list) else []
+
+    return (
+        "\n".join(lines),
+        sector_rows,
+        global_param_rows,
+        sector_param_rows,
+        global_change_rows,
+        sector_change_rows,
+    )
 
 
 @app.callback(

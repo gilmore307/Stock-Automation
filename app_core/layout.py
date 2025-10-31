@@ -153,6 +153,7 @@ def _build_earnings_tab(config: LayoutConfig) -> html.Div:
             ),
             html.Div(
                 [
+                    html.Button("刷新列表", id="refresh-earnings-btn"),
                     html.Button("下载 CSV", id="dl-btn"),
                 ],
                 style={"display": "flex", "gap": "8px", "marginBottom": "10px"},
@@ -351,10 +352,6 @@ def _build_model_tab() -> html.Div:
     return html.Div(
         [
             html.Div(
-                "本页展示强化学习模型的全局与行业级参数，所有更新均由自动检验驱动。",
-                style={"margin": "8px 0", "whiteSpace": "pre-wrap"},
-            ),
-            html.Div(
                 [
                     html.H5("全局模型概览"),
                     html.Pre(
@@ -367,6 +364,46 @@ def _build_model_tab() -> html.Div:
                             "padding": "12px",
                             "borderRadius": "6px",
                         },
+                    ),
+                    dag.AgGrid(
+                        id="model-global-parameters",
+                        columnDefs=[
+                            {"headerName": "参数", "field": "parameter"},
+                            {"headerName": "当前值", "field": "value"},
+                            {"headerName": "说明", "field": "description"},
+                        ],
+                        rowData=[],
+                        defaultColDef={
+                            "sortable": True,
+                            "resizable": True,
+                            "filter": True,
+                            "flex": 1,
+                            "minWidth": 140,
+                        },
+                        dashGridOptions={"domLayout": "autoHeight", "pagination": False},
+                        className="ag-theme-alpine",
+                        style={"marginTop": "16px"},
+                    ),
+                    dag.AgGrid(
+                        id="model-global-change-log",
+                        columnDefs=[
+                            {"headerName": "时间", "field": "timestamp", "minWidth": 150},
+                            {"headerName": "范围", "field": "scope", "minWidth": 100},
+                            {"headerName": "参数", "field": "parameter", "minWidth": 140},
+                            {"headerName": "旧值", "field": "old_value", "minWidth": 120},
+                            {"headerName": "新值", "field": "new_value", "minWidth": 120},
+                            {"headerName": "变化", "field": "delta", "minWidth": 120},
+                        ],
+                        rowData=[],
+                        defaultColDef={
+                            "sortable": True,
+                            "resizable": True,
+                            "filter": True,
+                            "flex": 1,
+                        },
+                        dashGridOptions={"domLayout": "autoHeight", "pagination": False},
+                        className="ag-theme-alpine",
+                        style={"marginTop": "16px"},
                     ),
                 ],
                 style={"marginBottom": "16px"},
@@ -394,28 +431,48 @@ def _build_model_tab() -> html.Div:
                         dashGridOptions={"domLayout": "autoHeight", "pagination": False},
                         className="ag-theme-alpine",
                     ),
+                    dag.AgGrid(
+                        id="model-sector-parameters",
+                        columnDefs=[
+                            {"headerName": "行业", "field": "sector", "minWidth": 120},
+                            {"headerName": "参数", "field": "parameter", "minWidth": 140},
+                            {"headerName": "当前值", "field": "value", "minWidth": 120},
+                            {"headerName": "说明", "field": "description", "minWidth": 160},
+                        ],
+                        rowData=[],
+                        defaultColDef={
+                            "sortable": True,
+                            "resizable": True,
+                            "filter": True,
+                            "flex": 1,
+                        },
+                        dashGridOptions={"domLayout": "autoHeight", "pagination": False},
+                        className="ag-theme-alpine",
+                        style={"marginTop": "16px"},
+                    ),
+                    dag.AgGrid(
+                        id="model-sector-change-log",
+                        columnDefs=[
+                            {"headerName": "时间", "field": "timestamp", "minWidth": 150},
+                            {"headerName": "行业", "field": "sector", "minWidth": 120},
+                            {"headerName": "参数", "field": "parameter", "minWidth": 140},
+                            {"headerName": "旧值", "field": "old_value", "minWidth": 120},
+                            {"headerName": "新值", "field": "new_value", "minWidth": 120},
+                            {"headerName": "变化", "field": "delta", "minWidth": 120},
+                        ],
+                        rowData=[],
+                        defaultColDef={
+                            "sortable": True,
+                            "resizable": True,
+                            "filter": True,
+                            "flex": 1,
+                        },
+                        dashGridOptions={"domLayout": "autoHeight", "pagination": False},
+                        className="ag-theme-alpine",
+                        style={"marginTop": "16px"},
+                    ),
                 ],
                 style={"marginBottom": "16px"},
-            ),
-            html.Hr(),
-            dag.AgGrid(
-                id="rl-model-table",
-                columnDefs=[
-                    {"headerName": "模型", "field": "model"},
-                    {"headerName": "参数", "field": "parameter"},
-                    {"headerName": "取值", "field": "value"},
-                    {"headerName": "用途说明", "field": "description"},
-                ],
-                rowData=[],
-                defaultColDef={
-                    "sortable": True,
-                    "resizable": True,
-                    "filter": True,
-                    "flex": 1,
-                    "minWidth": 140,
-                },
-                dashGridOptions={"domLayout": "autoHeight", "pagination": False},
-                className="ag-theme-alpine",
             ),
         ]
     )
@@ -444,6 +501,11 @@ def build_layout(config: LayoutConfig) -> html.Div:
                 },
             ),
             dcc.Store(id="rl-agent-store", storage_type="memory", data=config.rl_snapshot),
+            dcc.Store(
+                id="rl-change-store",
+                storage_type="memory",
+                data={"global": [], "sectors": []},
+            ),
             dcc.Store(id="evaluation-store", storage_type="memory", data={}),
             dcc.Interval(id="log-poller", interval=1000, disabled=True),
             dcc.Interval(id="connection-poller", interval=60000, n_intervals=0),
