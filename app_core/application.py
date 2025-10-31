@@ -158,6 +158,10 @@ def _prediction_archive_file(date_value: dt.date) -> Path:
     return PREDICTION_ARCHIVE_DIR / f"{date_value.isoformat()}.json"
 
 
+def _prediction_symbol_dir(date_value: dt.date) -> Path:
+    return PREDICTION_ARCHIVE_DIR / date_value.isoformat()
+
+
 def _persist_parameter_snapshot(timestamp: str, snapshot: dict[str, T.Any]) -> None:
     base_name = _safe_timestamp_to_filename(timestamp)
     path = _prepare_unique_archive_path(PARAMETER_ARCHIVE_DIR, base_name)
@@ -590,6 +594,8 @@ def _get_cached_earnings(date_value: dt.date) -> dict[str, T.Any] | None:
         entry = cache.get(key)
         if not isinstance(entry, dict):
             return None
+        if entry.get("options_filter_applied") is not True:
+            return None
         # deep copy via JSON round-trip to avoid accidental mutation
         try:
             return json.loads(json.dumps(entry))
@@ -604,6 +610,8 @@ def _store_cached_earnings(
     *,
     options_filter_applied: bool | None = None,
 ) -> None:
+    if options_filter_applied is not True:
+        return
     key = date_value.isoformat()
     payload = {
         "rowData": row_data,
@@ -688,11 +696,12 @@ def _store_prediction_results(
     status: str,
 ) -> None:
     key = target_date.isoformat()
+    generated_at = dt.datetime.now(US_EASTERN).isoformat()
     payload = {
         "rowData": row_data,
         "results": results,
         "status": status,
-        "generated_at": dt.datetime.now(US_EASTERN).isoformat(),
+        "generated_at": generated_at,
     }
     with PREDICTION_LOCK:
         archive_file = _prediction_archive_file(target_date)
@@ -707,6 +716,54 @@ def _store_prediction_results(
             except (OSError, json.JSONDecodeError):
                 payload_to_write = payload
         _write_archive_file(archive_file, payload_to_write)
+
+        symbol_dir = _prediction_symbol_dir(target_date)
+        try:
+            if symbol_dir.exists():
+                for old_file in symbol_dir.glob("*.json"):
+                    if old_file.is_file():
+                        old_file.unlink()
+        except OSError:
+            pass
+
+        symbol_groups: dict[str, list[dict[str, T.Any]]] = {}
+        for entry in results or []:
+            if not isinstance(entry, dict):
+                continue
+            symbol = str(entry.get("symbol") or "").upper()
+            if not symbol:
+                continue
+            symbol_groups.setdefault(symbol, []).append(entry)
+
+        metadata_lookup: dict[str, dict[str, T.Any]] = {}
+        for meta in row_data or []:
+            if not isinstance(meta, dict):
+                continue
+            symbol = str(meta.get("symbol") or "").upper()
+            if symbol:
+                metadata_lookup[symbol] = meta
+
+        if symbol_groups:
+            symbol_dir.mkdir(parents=True, exist_ok=True)
+            for symbol, entries in symbol_groups.items():
+                per_symbol_payload = {
+                    "decision_date": key,
+                    "symbol": symbol,
+                    "results": sorted(
+                        entries,
+                        key=lambda item: (
+                            item.get("symbol", ""),
+                            item.get("timeline_key", ""),
+                            item.get("lookback_days", 0),
+                        ),
+                    ),
+                    "status": status,
+                    "generated_at": generated_at,
+                }
+                metadata = metadata_lookup.get(symbol)
+                if metadata:
+                    per_symbol_payload["metadata"] = metadata
+                _write_archive_file(symbol_dir / f"{symbol}.json", per_symbol_payload)
 
         archive = _load_prediction_archive_raw()
         archive[key] = payload_to_write
@@ -1892,15 +1949,16 @@ def start_run(auto_intervals, selected_date, refresh_clicks, session_data, usern
     cache_entry = _get_cached_earnings(target_date)
     bypass_cache = manual_refresh
     if login_trigger:
-        if not cache_entry:
-            return no_update, no_update, no_update, no_update, no_update, no_update
-        options_flag = cache_entry.get("options_filter_applied")
-        cached_status = str(cache_entry.get("status") or "")
-        already_filtered = options_flag is True or (
-            options_flag is None and "未进行周五期权筛选" not in cached_status
-        )
-        if already_filtered:
-            return no_update, no_update, no_update, no_update, no_update, no_update
+        if cache_entry:
+            options_flag = cache_entry.get("options_filter_applied")
+            cached_status = str(cache_entry.get("status") or "")
+            already_filtered = options_flag is True or (
+                options_flag is None and "未进行周五期权筛选" not in cached_status
+            )
+            if already_filtered:
+                return no_update, no_update, no_update, no_update, no_update, no_update
+        bypass_cache = True
+    if login_trigger and not cache_entry:
         bypass_cache = True
 
     if cache_entry and not bypass_cache:
@@ -2149,10 +2207,16 @@ def _execute_run(
         )
         return
 
+    final_rows: list[dict[str, T.Any]] = rows if options_filter_applied else []
+    final_status = status_text or ""
+    if options_filter_applied is not True:
+        warning = "【提示】财报列表尚未完成 Firstrade 周五期权筛选，请登录后重新刷新。"
+        final_status = (final_status + "\n" + warning).strip()
+
     _update_run_state(
         run_id,
-        rowData=rows,
-        status=status_text or "",
+        rowData=final_rows,
+        status=final_status,
         session_state=session_out if session_out is not None else NO_UPDATE_SENTINEL,
         completed=True,
         options_filter_applied=options_filter_applied,
@@ -2160,7 +2224,7 @@ def _execute_run(
     _store_cached_earnings(
         target_date,
         rows,
-        status_text or "",
+        final_status,
         options_filter_applied=options_filter_applied,
     )
 
@@ -2236,20 +2300,27 @@ def poll_run_state(n_intervals, run_id, existing_logs, current_rows, task_state)
             )
     if isinstance(row_data, list) and row_data != current_rows and isinstance(target_date, dt.date):
         options_flag = state.get("options_filter_applied")
-        base_detail = f"财报列表就绪，共 {len(row_data)} 个标的"
         if options_flag is False:
-            base_detail += "（未进行周五期权筛选）"
+            base_detail = "财报列表未完成周五期权筛选，请登录 Firstrade 并刷新。"
+        else:
+            base_detail = f"财报列表就绪，共 {len(row_data)} 个标的"
         for idx, cfg in enumerate(PREDICTION_TIMELINES, start=1):
             task_id, name, offset_label = _describe_timeline_task(target_date, cfg)
-            if idx == 1:
-                detail_text = base_detail
+            if options_flag is False:
+                if idx == 1:
+                    status_value = "失败"
+                    detail_text = base_detail
+                else:
+                    status_value = "等待"
+                    detail_text = f"等待周五期权筛选完成后执行 {offset_label}"
             else:
-                detail_text = f"等待前序任务完成后执行 {offset_label}"
+                status_value = "等待"
+                detail_text = base_detail if idx == 1 else f"等待前序任务完成后执行 {offset_label}"
             task_updates.append(
                 {
                     "id": task_id,
                     "name": name,
-                    "status": "等待",
+                    "status": status_value,
                     "detail": detail_text,
                 }
             )
@@ -2277,7 +2348,7 @@ def poll_run_state(n_intervals, run_id, existing_logs, current_rows, task_state)
     State("ft-session-store", "data"),
     State("ft-username", "value"),
     State("ft-password", "value"),
-    State("ft-twofa", "value"),
+    State("ft-2fa", "value"),
     prevent_initial_call="initial_duplicate",
 )
 def update_predictions(
@@ -2372,8 +2443,32 @@ def update_predictions(
                 task_state_local,
                 log_output,
             )
-        effective_rows = fetched_rows
         cached_options_flag = options_applied
+        if options_applied is not True:
+            warning_detail = "财报列表尚未完成周五期权筛选，无法开始预测。"
+            _emit(warning_detail)
+            failure_updates = []
+            for cfg in PREDICTION_TIMELINES:
+                task_id, name, offset_label = _describe_timeline_task(target_date, cfg)
+                failure_updates.append(
+                    {
+                        "id": task_id,
+                        "name": name,
+                        "status": "失败",
+                        "detail": f"财报列表未筛选，跳过 {offset_label}",
+                    }
+                )
+            task_state_local = _merge_task_updates(task_state_local, failure_updates, target_date=target_date_iso)
+            tasks_changed = True
+            log_output = log_entries if log_entries != initial_logs else no_update
+            return (
+                {"results": [], "missing": [], "errors": [], "rl_snapshot": initial_snapshot},
+                warning_detail,
+                initial_snapshot,
+                task_state_local,
+                log_output,
+            )
+        effective_rows = fetched_rows
         if status_text:
             _emit(status_text)
         _store_cached_earnings(
@@ -2985,42 +3080,14 @@ def render_task_table(task_state):  # noqa: D401
 
 
 @app.callback(
-    Output("model-global-summary", "children"),
     Output("model-sector-table", "rowData"),
     Input("rl-agent-store", "data"),
 )
 def render_model_parameters(agent_data):  # noqa: D401
-    default_summary = "模型尚未初始化。"
     if not isinstance(agent_data, dict):
-        return default_summary, []
+        return []
 
-    global_data = agent_data.get("global") if "global" in agent_data else agent_data
     sectors = agent_data.get("sectors") if isinstance(agent_data.get("sectors"), dict) else {}
-
-    lines: list[str] = []
-    if isinstance(global_data, dict):
-        lines.append(f"学习率: {global_data.get('learning_rate')}")
-        lines.append(f"折现因子: {global_data.get('gamma')}")
-        lines.append(f"调整系数: {global_data.get('adjustment_scale')}")
-        lines.append(f"偏置: {round(float(global_data.get('bias', 0.0)), 4)}")
-        lines.append(f"当前基准: {round(float(global_data.get('baseline', 0.0)), 4)}")
-        lines.append(f"累计更新: {global_data.get('update_count')}")
-        weights = global_data.get("weights")
-        if isinstance(weights, dict) and weights:
-            sorted_weights = sorted(weights.items(), key=lambda kv: abs(float(kv[1])), reverse=True)
-            top_weights = sorted_weights[:10]
-            lines.append("主要权重:")
-            for key, value in top_weights:
-                lines.append(f"  {key}: {round(float(value), 5)}")
-        else:
-            lines.append("主要权重: 无")
-        factor_weights = agent_data.get("factor_weights")
-        if isinstance(factor_weights, dict) and factor_weights:
-            lines.append("当前因子权重:")
-            for key, value in sorted(factor_weights.items(), key=lambda kv: kv[0]):
-                lines.append(f"  {key}: {round(float(value), 4)}")
-    else:
-        lines.append(default_summary)
 
     sector_rows: list[dict[str, T.Any]] = []
     if sectors:
@@ -3044,7 +3111,7 @@ def render_model_parameters(agent_data):  # noqa: D401
                 }
             )
 
-    return "\n".join(lines), sector_rows
+    return sector_rows
 
 
 @app.callback(
