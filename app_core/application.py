@@ -181,6 +181,16 @@ def _write_archive_file(path: Path, payload: dict[str, T.Any]) -> None:
         pass
 
 
+def _json_safe(value: T.Any) -> T.Any:
+    if isinstance(value, (dt.datetime, dt.date)):
+        return value.isoformat()
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe(val) for key, val in value.items()}
+    return value
+
+
 def _safe_timestamp_to_filename(timestamp: str) -> str:
     safe = timestamp.strip().replace(" ", "T").replace(":", "-")
     safe = "".join(ch for ch in safe if ch.isalnum() or ch in {"-", "_", "T"})
@@ -815,14 +825,26 @@ def _store_prediction_results(
     results: list[dict[str, T.Any]],
     status: str,
     timeline_sources: dict[str, str] | None = None,
+    run_identifier: str | None = None,
 ) -> None:
     key = target_date.isoformat()
     generated_at = dt.datetime.now(US_EASTERN).isoformat()
+    run_id = run_identifier or uuid.uuid4().hex
+
+    sorted_results = sorted(
+        [entry for entry in results or [] if isinstance(entry, dict)],
+        key=lambda item: (
+            item.get("symbol", ""),
+            item.get("timeline_key", ""),
+            item.get("lookback_days", 0),
+        ),
+    )
     payload = {
-        "rowData": row_data,
-        "results": results,
+        "rowData": _json_safe(row_data),
+        "results": _json_safe(sorted_results),
         "status": status,
         "generated_at": generated_at,
+        "run_id": run_id,
     }
     if timeline_sources:
         payload["timeline_sources"] = timeline_sources
@@ -841,18 +863,9 @@ def _store_prediction_results(
         _write_archive_file(archive_file, payload_to_write)
 
         symbol_dir = _prediction_symbol_dir(target_date)
-        try:
-            if symbol_dir.exists():
-                for old_file in symbol_dir.glob("*.json"):
-                    if old_file.is_file():
-                        old_file.unlink()
-        except OSError:
-            pass
 
         symbol_groups: dict[str, list[dict[str, T.Any]]] = {}
-        for entry in results or []:
-            if not isinstance(entry, dict):
-                continue
+        for entry in sorted_results:
             symbol = str(entry.get("symbol") or "").upper()
             if not symbol:
                 continue
@@ -869,25 +882,55 @@ def _store_prediction_results(
         if symbol_groups:
             symbol_dir.mkdir(parents=True, exist_ok=True)
             for symbol, entries in symbol_groups.items():
+                file_path = symbol_dir / f"{key}_{symbol}.json"
+                try:
+                    with file_path.open("r", encoding="utf-8") as fh:
+                        existing_payload = json.load(fh)
+                except (OSError, json.JSONDecodeError):
+                    existing_payload = {}
+
+                history = existing_payload.get("history")
+                if not isinstance(history, list):
+                    history = []
+
+                entry_results_safe = _json_safe(entries)
+
+                history_entry = {
+                    "run_id": run_id,
+                    "generated_at": generated_at,
+                    "status": status,
+                    "results": entry_results_safe,
+                }
+                if timeline_sources:
+                    history_entry["timeline_sources"] = timeline_sources
+
+                history.append(history_entry)
+
+                metadata = metadata_lookup.get(symbol)
+                if metadata is None and isinstance(existing_payload.get("metadata"), dict):
+                    metadata = existing_payload["metadata"]
+                metadata_safe = _json_safe(metadata) if metadata is not None else None
+
                 per_symbol_payload = {
                     "decision_date": key,
                     "symbol": symbol,
-                    "results": sorted(
-                        entries,
-                        key=lambda item: (
-                            item.get("symbol", ""),
-                            item.get("timeline_key", ""),
-                            item.get("lookback_days", 0),
-                        ),
-                    ),
-                    "status": status,
-                    "generated_at": generated_at,
+                    "history": _json_safe(history),
+                    "total_runs": len(history),
+                    "latest_run_id": run_id,
+                    "latest_generated_at": generated_at,
+                    "latest_status": status,
+                    "latest_results": entry_results_safe,
                 }
-                metadata = metadata_lookup.get(symbol)
-                if metadata:
-                    per_symbol_payload["metadata"] = metadata
-                filename = f"{key}_{symbol}.json"
-                _write_archive_file(symbol_dir / filename, per_symbol_payload)
+                if metadata_safe:
+                    per_symbol_payload["metadata"] = metadata_safe
+                if timeline_sources:
+                    per_symbol_payload["timeline_sources"] = timeline_sources
+
+                for preserved_key in ("evaluation", "actuals"):
+                    if preserved_key in existing_payload:
+                        per_symbol_payload[preserved_key] = existing_payload[preserved_key]
+
+                _write_archive_file(file_path, per_symbol_payload)
 
         archive = _load_prediction_archive_raw()
         archive[key] = payload_to_write
@@ -1251,8 +1294,15 @@ def _compute_dci_for_symbols(
 def _check_resource_connections(ft_session: dict[str, T.Any] | None) -> list[dict[str, T.Any]]:
     statuses: list[dict[str, T.Any]] = []
 
-    def add_status(name: str, ok: bool, detail: str) -> None:
-        statuses.append({"resource": name, "ok": ok, "detail": detail})
+    def add_status(name: str, parameter: str, ok: bool, detail: str) -> None:
+        statuses.append(
+            {
+                "resource": name,
+                "parameter": parameter,
+                "ok": ok,
+                "detail": detail,
+            }
+        )
 
     today_str = dt.date.today().isoformat()
 
@@ -1282,15 +1332,63 @@ def _check_resource_connections(ft_session: dict[str, T.Any] | None) -> list[dic
                 headers=HEADERS,
                 timeout=5,
             )
-            ok = resp.ok
-            detail = f"HTTP {resp.status_code}" if resp is not None else "无响应"
+            if resp.ok:
+                try:
+                    payload = resp.json()
+                except ValueError:
+                    payload = None
+                rows_data = None
+                if isinstance(payload, dict):
+                    data_block = payload.get("data") if isinstance(payload.get("data"), dict) else None
+                    calendar_block = (
+                        data_block.get("calendar")
+                        if isinstance((data_block or {}).get("calendar"), dict)
+                        else None
+                    )
+                    if isinstance(calendar_block, dict):
+                        rows_data = calendar_block.get("rows")
+                    if rows_data is None and isinstance(data_block, dict):
+                        rows_data = data_block.get("rows")
+                    if rows_data is None:
+                        rows_data = payload.get("rows")
+                rows = rows_data if isinstance(rows_data, list) else []
+                if rows:
+                    sample = rows[0]
+                    symbol = (
+                        sample.get("symbol")
+                        or sample.get("Symbol")
+                        or sample.get("companyTickerSymbol")
+                        or ""
+                    )
+                    time_field = (
+                        sample.get("time")
+                        or sample.get("Time")
+                        or sample.get("EPSTime")
+                        or sample.get("timeStatus")
+                        or sample.get("when")
+                        or ""
+                    )
+                    symbol = str(symbol).strip().upper()
+                    time_field = str(time_field).strip() or "未提供时间"
+                    if symbol:
+                        ok = True
+                        detail = f"示例：{symbol}｜{time_field}"
+                    else:
+                        ok = False
+                        detail = "返回行缺少代码字段"
+                else:
+                    ok = False
+                    detail = "缺少财报行数据"
+            else:
+                ok = False
+                detail = f"HTTP {resp.status_code}"
         except requests.RequestException as exc:
             ok = False
             detail = f"请求异常：{exc}"[:160]
         return ok, detail
 
     ok, detail = run_with_retry(_check_nasdaq_once)
-    add_status("Nasdaq 财报 API", ok, detail)
+    add_status("Nasdaq 财报 API", "财报列表（代码/时间段）", ok, detail)
 
     # Finnhub API
     def _check_finnhub_once() -> tuple[bool, str]:
@@ -1305,8 +1403,19 @@ def _check_resource_connections(ft_session: dict[str, T.Any] | None) -> list[dic
                     payload = resp.json()
                 except ValueError:
                     payload = None
-                ok = isinstance(payload, dict) and "c" in payload
-                detail = "返回有效报价" if ok else "返回内容异常"
+                if isinstance(payload, dict):
+                    price = payload.get("c")
+                    prev_close = payload.get("pc")
+                    timestamp = payload.get("t")
+                    if price is not None and prev_close is not None and timestamp:
+                        ok = True
+                        detail = f"现价 {price}｜昨收 {prev_close}"
+                    else:
+                        ok = False
+                        detail = "缺少现价/昨收数据"
+                else:
+                    ok = False
+                    detail = "返回内容异常"
             else:
                 ok = False
                 detail = f"HTTP {resp.status_code}"
@@ -1316,7 +1425,7 @@ def _check_resource_connections(ft_session: dict[str, T.Any] | None) -> list[dic
         return ok, detail
 
     ok, detail = run_with_retry(_check_finnhub_once)
-    add_status("Finnhub API", ok, detail)
+    add_status("Finnhub API", "实时行情（现价/昨收）", ok, detail)
 
     # OpenFIGI API
     def _check_openfigi_once() -> tuple[bool, str]:
@@ -1335,8 +1444,26 @@ def _check_resource_connections(ft_session: dict[str, T.Any] | None) -> list[dic
                     payload = resp.json()
                 except ValueError:
                     payload = None
-                ok = isinstance(payload, list) and bool(payload)
-                detail = "返回有效映射" if ok else "返回内容异常"
+                if isinstance(payload, list) and payload:
+                    entry = payload[0]
+                    data_rows = entry.get("data") if isinstance(entry, dict) else None
+                    if isinstance(data_rows, list) and data_rows:
+                        mapping = data_rows[0]
+                        figi = (mapping or {}).get("figi")
+                        name = (mapping or {}).get("name") or (mapping or {}).get("securityName")
+                        if figi:
+                            ok = True
+                            name_part = f"｜{name}" if name else ""
+                            detail = f"AAPL → {figi}{name_part}"
+                        else:
+                            ok = False
+                            detail = "缺少 FIGI 字段"
+                    else:
+                        ok = False
+                        detail = "缺少映射条目"
+                else:
+                    ok = False
+                    detail = "返回内容异常"
             else:
                 ok = False
                 detail = f"HTTP {resp.status_code}"
@@ -1346,17 +1473,19 @@ def _check_resource_connections(ft_session: dict[str, T.Any] | None) -> list[dic
         return ok, detail
 
     ok, detail = run_with_retry(_check_openfigi_once)
-    add_status("OpenFIGI API", ok, detail)
+    add_status("OpenFIGI API", "Ticker → FIGI 映射", ok, detail)
 
     # FRED API
     def _check_fred_once() -> tuple[bool, str]:
         try:
             resp = requests.get(
-                "https://api.stlouisfed.org/fred/series",
+                "https://api.stlouisfed.org/fred/series/observations",
                 params={
                     "series_id": "DGS3MO",
                     "api_key": FRED_API_KEY,
                     "file_type": "json",
+                    "sort_order": "desc",
+                    "limit": 1,
                 },
                 timeout=5,
             )
@@ -1365,8 +1494,24 @@ def _check_resource_connections(ft_session: dict[str, T.Any] | None) -> list[dic
                     payload = resp.json()
                 except ValueError:
                     payload = None
-                ok = isinstance(payload, dict) and payload.get("seriess")
-                detail = "返回有效数据" if ok else "返回内容异常"
+                observations = (
+                    payload.get("observations")
+                    if isinstance(payload, dict)
+                    else None
+                )
+                if isinstance(observations, list) and observations:
+                    latest = observations[0]
+                    value = (latest or {}).get("value")
+                    date_text = (latest or {}).get("date")
+                    if value and value != ".":
+                        ok = True
+                        detail = f"{date_text} → {value}"
+                    else:
+                        ok = False
+                        detail = "观测值缺失"
+                else:
+                    ok = False
+                    detail = "缺少观测数据"
             else:
                 ok = False
                 detail = f"HTTP {resp.status_code}"
@@ -1376,7 +1521,7 @@ def _check_resource_connections(ft_session: dict[str, T.Any] | None) -> list[dic
         return ok, detail
 
     ok, detail = run_with_retry(_check_fred_once)
-    add_status("FRED API", ok, detail)
+    add_status("FRED API", "DGS3MO 系列（最新观测值）", ok, detail)
 
     # Firstrade session status
     if isinstance(ft_session, dict) and ft_session:
@@ -1386,7 +1531,7 @@ def _check_resource_connections(ft_session: dict[str, T.Any] | None) -> list[dic
     else:
         ok = False
         detail = "尚未登录或无会话信息"
-    add_status("Firstrade 会话", ok, detail)
+    add_status("Firstrade 会话", "周五期权筛选凭证", ok, detail)
 
     return statuses
 
@@ -1419,6 +1564,7 @@ def _render_connection_statuses(
             html.Tr(
                 [
                     html.Td(entry.get("resource", "")),
+                    html.Td(entry.get("parameter", "")),
                     html.Td(badge),
                     html.Td(entry.get("detail", "")),
                 ]
@@ -1427,7 +1573,14 @@ def _render_connection_statuses(
 
     table = dbc.Table(
         [
-            html.Thead(html.Tr([html.Th("资源"), html.Th("状态"), html.Th("详情")])),
+            html.Thead(
+                html.Tr([
+                    html.Th("资源"),
+                    html.Th("参数"),
+                    html.Th("状态"),
+                    html.Th("详情"),
+                ])
+            ),
             html.Tbody(rows),
         ],
         bordered=True,
@@ -2572,6 +2725,8 @@ def update_predictions(
             log_output,
         )
 
+    run_identifier = uuid.uuid4().hex
+
     if triggered == "ft-session-store":
         summary_msg = (
             f"{target_date.strftime('%m月%d日')} 的预测序列已启动，共 {len(PREDICTION_TIMELINES)} 个时点。"
@@ -2950,7 +3105,14 @@ def update_predictions(
         key: value.isoformat() for key, value in timeline_dates.items() if isinstance(value, dt.date)
     }
 
-    _store_prediction_results(target_date, aggregated_row_data, results, message or "", timeline_sources)
+    _store_prediction_results(
+        target_date,
+        aggregated_row_data,
+        results,
+        message or "",
+        timeline_sources,
+        run_identifier=run_identifier,
+    )
 
     archive_entry = _get_prediction_archive(target_date)
 
