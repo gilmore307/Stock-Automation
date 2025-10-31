@@ -50,6 +50,13 @@ SYMBOL_META_LOCK = threading.Lock()
 SYMBOL_META_PATH = Path(__file__).with_name("symbol_metadata.json")
 SYMBOL_META_CACHE: dict[str, dict[str, T.Any]] = {}
 
+LOG_ARCHIVE_DIR = ARCHIVE_ROOT / "logs"
+LOG_LINES_PER_FILE = 200
+LOG_MAX_FILES = 20
+LOG_FILE_LOCK = threading.Lock()
+CURRENT_LOG_FILE: Path | None = None
+CURRENT_LOG_LINE_COUNT = 0
+
 FINNHUB_API_KEY = os.getenv(
     "FINNHUB_API_KEY",
     "d3ifbshr01qn6oiodof0d3ifbshr01qn6oiodofg",
@@ -189,6 +196,52 @@ def _prepare_unique_archive_path(directory: Path, base_name: str) -> Path:
         return candidate
     suffix = uuid.uuid4().hex[:6]
     return directory / f"{base_name}-{suffix}.json"
+
+
+def _reset_log_rotation_state() -> None:
+    global CURRENT_LOG_FILE, CURRENT_LOG_LINE_COUNT
+    CURRENT_LOG_FILE = None
+    CURRENT_LOG_LINE_COUNT = 0
+
+
+def _enforce_log_rotation() -> None:
+    try:
+        files = sorted(
+            LOG_ARCHIVE_DIR.glob("log-*.txt"),
+            key=lambda path: path.stat().st_mtime,
+        )
+    except OSError:
+        return
+    excess = len(files) - LOG_MAX_FILES
+    for _ in range(max(excess, 0)):
+        oldest = files.pop(0)
+        try:
+            oldest.unlink()
+        except OSError:
+            continue
+
+
+def _persist_log_entry(entry: str) -> None:
+    global CURRENT_LOG_FILE, CURRENT_LOG_LINE_COUNT
+    try:
+        with LOG_FILE_LOCK:
+            LOG_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+            needs_new_file = (
+                CURRENT_LOG_FILE is None
+                or CURRENT_LOG_LINE_COUNT >= LOG_LINES_PER_FILE
+                or not CURRENT_LOG_FILE.exists()
+            )
+            if needs_new_file:
+                stamp = dt.datetime.now(US_EASTERN).strftime("%Y%m%d-%H%M%S")
+                suffix = uuid.uuid4().hex[:6]
+                CURRENT_LOG_FILE = LOG_ARCHIVE_DIR / f"log-{stamp}-{suffix}.txt"
+                CURRENT_LOG_LINE_COUNT = 0
+            with CURRENT_LOG_FILE.open("a", encoding="utf-8") as fh:
+                fh.write(entry + "\n")
+            CURRENT_LOG_LINE_COUNT += 1
+            _enforce_log_rotation()
+    except OSError:
+        return
 
 
 def _has_valid_ft_session(session_state: dict[str, T.Any] | None) -> bool:
@@ -1415,6 +1468,7 @@ def _get_run_state(run_id: str) -> dict[str, T.Any] | None:
 def _append_run_log(run_id: str, message: str) -> None:
     stamp = dt.datetime.now(US_EASTERN).strftime("%H:%M:%S")
     entry = f"[{stamp}] {message}"
+    _persist_log_entry(entry)
     with RUN_LOCK:
         state = RUN_STATES.get(run_id)
         if not state:
@@ -1554,11 +1608,16 @@ def pick_by_times(rows: T.List[dict], want_after_hours=False, want_pre_market=Fa
     return out
 
 
-def append_log(logs: T.Optional[T.List[str]], message: str) -> T.List[str]:
+def append_log(
+    logs: T.Optional[T.List[str]], message: str, *, task_label: str | None = None
+) -> T.List[str]:
     if not isinstance(logs, list):
         logs = []
     stamp = dt.datetime.now(US_EASTERN).strftime("%H:%M:%S")
-    return logs + [f"[{stamp}] {message}"]
+    label = f"[{task_label}] " if task_label else ""
+    entry = f"[{stamp}] {label}{message}"
+    _persist_log_entry(entry)
+    return logs + [entry]
 # ---------- Firstrade (unofficial) ----------
 class FTClient:
     LOGIN_URL = "https://api3x.firstrade.com/sess/login"
@@ -1911,7 +1970,7 @@ def build_targets(target_date: dt.date) -> pd.DataFrame:
     targets += [
         {
             **r,
-            "decision_date": tomorrow_us.isoformat(),
+            "decision_date": target_date.isoformat(),
             "bucket": not_supplied_label,
         }
         for r in pick_by_times(rows_tomorrow, want_not_supplied=True)
@@ -1950,11 +2009,15 @@ def run_login(n_clicks, username, password, twofa, log_state):  # noqa: D401
     username = (username or "").strip()
     password = password or ""
     twofa = (twofa or "").strip()
-    logs = append_log(log_state, f"收到用户“{username or '（空）'}”的登录请求。")
+    logs = append_log(
+        log_state,
+        f"收到用户“{username or '（空）'}”的登录请求。",
+        task_label="登录",
+    )
 
     def log(message: str) -> None:
         nonlocal logs
-        logs = append_log(logs, message)
+        logs = append_log(logs, message, task_label="登录")
 
     if not username or not password:
         log("登录终止：必须填写用户名和密码。")
@@ -2010,9 +2073,14 @@ def start_run(auto_intervals, selected_date, refresh_clicks, session_data, usern
     else:
         return no_update, no_update, no_update, no_update, no_update, no_update
 
+    if login_trigger and not logged_in:
+        message = "检测到无效的 Firstrade 会话，请重新登录。"
+        logs = append_log([], message, task_label="财报日程")
+        return no_update, logs, message, [], True, no_update
+
     if not logged_in and not login_trigger:
         message = "尚未登录 Firstrade，请先在连接页登录后再刷新财报列表。"
-        logs = append_log([], message)
+        logs = append_log([], message, task_label="财报日程")
         return no_update, logs, message, [], True, no_update
 
     target_date = _coerce_date(selected_date) or us_eastern_today()
@@ -2026,23 +2094,46 @@ def start_run(auto_intervals, selected_date, refresh_clicks, session_data, usern
 
     target_date_iso = target_date.isoformat()
 
+    if login_trigger:
+        timeline_waiting = []
+        for cfg in PREDICTION_TIMELINES:
+            task_id, name, offset_label = _describe_timeline_task(target_date, cfg)
+            offset_days = _resolve_timeline_offset_days(cfg)
+            future_date = target_date + dt.timedelta(days=offset_days)
+            detail_text = (
+                f"等待预测任务 -> 将抓取 {future_date} 的财报列表并执行 {offset_label}"
+            )
+            timeline_waiting.append(
+                {
+                    "id": task_id,
+                    "name": name,
+                    "status": "等待",
+                    "detail": detail_text,
+                }
+            )
+        tasks = _merge_task_updates(
+            task_state,
+            timeline_waiting,
+            target_date=target_date_iso,
+        )
+        status_message = (
+            "已登录 Firstrade，预测任务将依次拉取各决策日财报并开始运行。"
+        )
+        logs = append_log([], status_message, task_label="财报日程")
+        return (
+            no_update,
+            logs,
+            status_message,
+            [],
+            True,
+            tasks,
+        )
+
     cache_entry = _get_cached_earnings(target_date)
     bypass_cache = manual_refresh
-    if login_trigger:
-        if cache_entry:
-            options_flag = cache_entry.get("options_filter_applied")
-            cached_status = str(cache_entry.get("status") or "")
-            already_filtered = options_flag is True or (
-                options_flag is None and "未进行周五期权筛选" not in cached_status
-            )
-            if already_filtered:
-                return no_update, no_update, no_update, no_update, no_update, no_update
-        bypass_cache = True
-    if login_trigger and not cache_entry:
-        bypass_cache = True
 
     if cache_entry and not bypass_cache:
-        logs = append_log([], f"命中 {target_date} 的本地缓存。")
+        logs = append_log([], f"命中 {target_date} 的本地缓存。", task_label="财报日程")
         cached_status = str(cache_entry.get("status") or "")
         extra = "（来自本地缓存，无需重新请求。）"
         status_out = (cached_status + "\n" + extra) if cached_status else extra
@@ -2273,7 +2364,7 @@ def _execute_run(
         username,
         password,
         twofa,
-        logger=lambda message: _append_run_log(run_id, message),
+        logger=lambda message: _append_run_log(run_id, f"[财报日程] {message}"),
     )
 
     if error_msg:
@@ -2301,12 +2392,13 @@ def _execute_run(
         completed=True,
         options_filter_applied=options_filter_applied,
     )
-    _store_cached_earnings(
-        target_date,
-        rows,
-        final_status,
-        options_filter_applied=options_filter_applied,
-    )
+    if options_filter_applied:
+        _store_cached_earnings(
+            target_date,
+            rows,
+            final_status,
+            options_filter_applied=options_filter_applied,
+        )
 
 
 @app.callback(
@@ -2422,10 +2514,10 @@ def poll_run_state(n_intervals, run_id, existing_logs, current_rows, task_state)
     Output("log-store", "data", allow_duplicate=True),
     Input("table", "selectedRows"),
     Input("table", "rowData"),
+    Input("ft-session-store", "data"),
     State("task-store", "data"),
     State("earnings-date-picker", "date"),
     State("log-store", "data"),
-    State("ft-session-store", "data"),
     State("ft-username", "value"),
     State("ft-password", "value"),
     State("ft-2fa", "value"),
@@ -2434,10 +2526,10 @@ def poll_run_state(n_intervals, run_id, existing_logs, current_rows, task_state)
 def update_predictions(
     selected_rows,
     row_data,
+    session_state,
     task_state,
     picker_date,
     log_state,
-    session_state,
     username,
     password,
     twofa,
@@ -2462,15 +2554,15 @@ def update_predictions(
     initial_logs = log_state if isinstance(log_state, list) else []
     log_entries = initial_logs
 
-    def _emit(message: str) -> None:
+    def _emit(message: str, task_label: str | None = None) -> None:
         nonlocal log_entries
         if not message:
             return
-        log_entries = append_log(log_entries, message)
+        log_entries = append_log(log_entries, message, task_label=task_label)
 
     if not logged_in:
         message = "尚未登录 Firstrade，无法执行预测任务。"
-        _emit(message)
+        _emit(message, task_label="预测任务")
         log_output = log_entries if log_entries != initial_logs else no_update
         return (
             no_update,
@@ -2479,6 +2571,12 @@ def update_predictions(
             no_update,
             log_output,
         )
+
+    if triggered == "ft-session-store":
+        summary_msg = (
+            f"{target_date.strftime('%m月%d日')} 的预测序列已启动，共 {len(PREDICTION_TIMELINES)} 个时点。"
+        )
+        _emit(summary_msg, task_label="预测任务")
 
     session_local = session_data
     timeline_rows_map: dict[str, list[dict[str, T.Any]]] = {}
@@ -2503,26 +2601,29 @@ def update_predictions(
             status_text = str(cached_entry.get("status") or "")
 
         if not rows:
-            _emit(f"未找到 {timeline_date} 的筛选财报列表（{label}），开始自动刷新。")
+            _emit(
+                f"未找到 {timeline_date} 的筛选财报列表（{label}），开始自动刷新。",
+                task_label=label,
+            )
             fetched_rows, status_text, session_out, options_applied, error_message = _prepare_earnings_dataset(
                 timeline_date,
                 session_local,
                 username,
                 password,
                 twofa,
-                logger=(lambda message, tag=label: _emit(f"[{tag}] {message}")),
+                logger=(lambda message, tag=label: _emit(message, task_label=tag)),
             )
             if isinstance(session_out, dict) and session_out:
                 session_local = session_out
             if error_message:
                 detail_message = f"{label} 财报列表获取失败：{error_message}"
                 timeline_errors[timeline_key] = detail_message
-                _emit(detail_message)
+                _emit(detail_message, task_label=label)
                 rows = []
             elif options_applied is not True:
                 detail_message = f"{label} 财报列表未完成 Firstrade 筛选，已跳过。"
                 timeline_errors[timeline_key] = detail_message
-                _emit(detail_message)
+                _emit(detail_message, task_label=label)
                 rows = []
             else:
                 rows = fetched_rows
@@ -2536,11 +2637,14 @@ def update_predictions(
 
         if rows:
             timeline_rows_map[timeline_key] = rows
-            _emit(f"{label}（{timeline_date}）共 {len(rows)} 个标的。")
+            _emit(
+                f"{label}（{timeline_date}）共 {len(rows)} 个标的。",
+                task_label=label,
+            )
         elif timeline_key not in timeline_errors:
             detail_message = f"{label}（{timeline_date}）无可用财报标的。"
             timeline_errors[timeline_key] = detail_message
-            _emit(detail_message)
+            _emit(detail_message, task_label=label)
 
     timeline_metadata_map: dict[str, dict[str, dict[str, T.Any]]] = {}
     aggregated_row_data: list[dict[str, T.Any]] = []
@@ -2580,24 +2684,38 @@ def update_predictions(
         key = str(timeline.get("key") or label)
         timeline_date_value = timeline_dates.get(key)
         date_str = timeline_date_value.isoformat() if isinstance(timeline_date_value, dt.date) else "-"
+        meta_entry = (timeline_metadata_map.get(key) or {}).get(symbol, {})
+        bucket_label = str(meta_entry.get("bucket") or "")
+        bucket_part = f"（{bucket_label}）" if bucket_label else ""
         message: str | None = None
         if stage == "start":
-            message = f"开始生成 {symbol} 的 {label} 预测（决策日 {date_str}）。"
+            tracker = progress_tracker.setdefault(
+                key,
+                {
+                    "total": timeline_symbol_counts.get(key, 0),
+                    "completed": 0,
+                    "processed": 0,
+                },
+            )
+            current_index = tracker.get("processed", 0) + 1
+            message = (
+                f"准备标的 #{current_index}：{symbol}{bucket_part}｜决策日 {date_str}"
+            )
         elif stage == "success":
             timeline_summary.setdefault(key, {"label": label, "success": 0, "missing": 0, "error": 0})
             timeline_summary[key]["success"] = timeline_summary[key].get("success", 0) + 1
-            message = f"完成 {symbol} 的 {label} 预测。"
+            message = f"完成 {symbol} 的 {label} 预测{bucket_part}。"
         elif stage == "missing":
             timeline_summary.setdefault(key, {"label": label, "success": 0, "missing": 0, "error": 0})
             timeline_summary[key]["missing"] = timeline_summary[key].get("missing", 0) + 1
-            message = f"{symbol} 的 {label} 输入缺失，跳过该时点。"
+            message = f"{symbol} 的 {label} 输入缺失，跳过该时点{bucket_part}。"
         elif stage == "error":
             timeline_summary.setdefault(key, {"label": label, "success": 0, "missing": 0, "error": 0})
             timeline_summary[key]["error"] = timeline_summary[key].get("error", 0) + 1
             detail_text = f"：{detail}" if detail else ""
-            message = f"{symbol} 的 {label} 预测失败{detail_text}。"
+            message = f"{symbol} 的 {label} 预测失败{bucket_part}{detail_text}。"
         if message:
-            _emit(message)
+            _emit(message, task_label=label)
 
         if stage in {"success", "missing", "error"}:
             total_for_task = timeline_symbol_counts.get(key, 0)
@@ -2642,6 +2760,7 @@ def update_predictions(
         timeline_date_value = timeline_dates.get(timeline_key)
         timeline_date_str = timeline_date_value.isoformat() if isinstance(timeline_date_value, dt.date) else "-"
         symbol_count = timeline_symbol_counts.get(timeline_key, 0)
+        label = str(cfg.get("label") or offset_label)
 
         if timeline_key in timeline_errors:
             detail_text = f"{offset_label}｜决策日 {timeline_date_str}：{timeline_errors[timeline_key]}"
@@ -2713,7 +2832,7 @@ def update_predictions(
             target_date=target_date_iso,
         )
         tasks_changed = True
-        _emit(f"{name}（决策日 {timeline_date_str}）已开始。")
+        _emit(f"{name}（决策日 {timeline_date_str}）已开始。", task_label=label)
 
         metadata_map = timeline_metadata_map.get(timeline_key, {})
         symbols = list(metadata_map.keys())
@@ -2781,7 +2900,7 @@ def update_predictions(
             target_date=target_date_iso,
         )
         tasks_changed = True
-        _emit(f"{name} 完成：{detail_text}")
+        _emit(f"{name} 完成：{detail_text}", task_label=label)
 
     results = sorted(all_results, key=lambda row: (row.get("symbol", ""), row.get("lookback_days", 0)))
     missing = sorted(set(all_missing))
@@ -2819,7 +2938,7 @@ def update_predictions(
                 lines.append(f"- {label}（{date_str}）：{report}")
                 summary_texts.append(f"{label} -> {report}")
     if summary_texts:
-        _emit("时点统计：" + "；".join(summary_texts))
+        _emit("时点统计：" + "；".join(summary_texts), task_label="预测汇总")
 
     message = "\n".join(lines)
 
