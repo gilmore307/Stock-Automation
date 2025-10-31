@@ -484,13 +484,21 @@ def _get_cached_earnings(date_value: dt.date) -> dict[str, T.Any] | None:
             return None
 
 
-def _store_cached_earnings(date_value: dt.date, row_data: list[dict[str, T.Any]], status: str) -> None:
+def _store_cached_earnings(
+    date_value: dt.date,
+    row_data: list[dict[str, T.Any]],
+    status: str,
+    *,
+    options_filter_applied: bool | None = None,
+) -> None:
     key = date_value.isoformat()
     payload = {
         "rowData": row_data,
         "status": status,
         "generated_at": dt.datetime.now(US_EASTERN).isoformat(),
     }
+    if options_filter_applied is not None:
+        payload["options_filter_applied"] = bool(options_filter_applied)
     with CACHE_LOCK:
         cache = _load_earnings_cache_raw()
         cache[key] = payload
@@ -1678,23 +1686,29 @@ def run_login(n_clicks, username, password, twofa, log_state):  # noqa: D401
     Input("auto-run-trigger", "n_intervals"),
     Input("earnings-date-picker", "date"),
     Input("earnings-refresh-btn", "n_clicks"),
+    Input("ft-session-store", "data"),
     State("ft-username", "value"),
     State("ft-password", "value"),
     State("ft-2fa", "value"),
-    State("ft-session-store", "data"),
     State("task-store", "data"),
     prevent_initial_call="initial_duplicate",
 )
-def start_run(auto_intervals, selected_date, refresh_clicks, username, password, twofa, session_state, task_state):  # noqa: D401
+def start_run(auto_intervals, selected_date, refresh_clicks, session_data, username, password, twofa, task_state):  # noqa: D401
     trigger = ctx.triggered_id
+    session_state = session_data if isinstance(session_data, dict) else {}
+    manual_refresh = trigger == "earnings-refresh-btn"
+    login_trigger = trigger == "ft-session-store"
     if trigger == "auto-run-trigger":
         if auto_intervals is None:
             return no_update, no_update, no_update, no_update, no_update, no_update
     elif trigger == "earnings-date-picker":
         if not selected_date:
             return no_update, no_update, no_update, no_update, no_update, no_update
-    elif trigger == "earnings-refresh-btn":
+    elif manual_refresh:
         if not refresh_clicks:
+            return no_update, no_update, no_update, no_update, no_update, no_update
+    elif login_trigger:
+        if not session_state:
             return no_update, no_update, no_update, no_update, no_update, no_update
     else:
         return no_update, no_update, no_update, no_update, no_update, no_update
@@ -1712,7 +1726,20 @@ def start_run(auto_intervals, selected_date, refresh_clicks, username, password,
     target_date_iso = target_date.isoformat()
 
     cache_entry = _get_cached_earnings(target_date)
-    if cache_entry:
+    bypass_cache = manual_refresh
+    if login_trigger:
+        if not cache_entry:
+            return no_update, no_update, no_update, no_update, no_update, no_update
+        options_flag = cache_entry.get("options_filter_applied")
+        cached_status = str(cache_entry.get("status") or "")
+        already_filtered = options_flag is True or (
+            options_flag is None and "未进行周五期权筛选" not in cached_status
+        )
+        if already_filtered:
+            return no_update, no_update, no_update, no_update, no_update, no_update
+        bypass_cache = True
+
+    if cache_entry and not bypass_cache:
         logs = append_log([], f"命中 {target_date} 的本地缓存。")
         cached_status = str(cache_entry.get("status") or "")
         extra = "（来自本地缓存，无需重新请求。）"
@@ -1774,14 +1801,19 @@ def start_run(auto_intervals, selected_date, refresh_clicks, username, password,
             username or "",
             password or "",
             (twofa or ""),
-            session_state if isinstance(session_state, dict) else {},
+            session_state,
             target_date,
         ),
         daemon=True,
     )
     thread.start()
 
-    status_message = f"开始获取 {target_date} 的数据……"
+    if login_trigger and bypass_cache:
+        status_message = f"检测到 Firstrade 登录，开始重新筛选 {target_date} 的数据……"
+    elif manual_refresh:
+        status_message = f"正在刷新 {target_date} 的财报列表……"
+    else:
+        status_message = f"开始获取 {target_date} 的数据……"
     timeline_waiting = []
     for cfg in PREDICTION_TIMELINES:
         task_id, name, offset_label = _describe_timeline_task(target_date, cfg)
@@ -1794,6 +1826,13 @@ def start_run(auto_intervals, selected_date, refresh_clicks, username, password,
             }
         )
 
+    if login_trigger and bypass_cache:
+        fetch_detail = f"检测到登录，重新筛选 {target_date} 的财报列表"
+    elif manual_refresh:
+        fetch_detail = f"手动刷新 -> 正在获取 {target_date} 的财报列表"
+    else:
+        fetch_detail = f"正在获取 {target_date} 的财报列表"
+
     tasks = _merge_task_updates(
         task_state,
         [
@@ -1801,7 +1840,7 @@ def start_run(auto_intervals, selected_date, refresh_clicks, username, password,
                 "id": "fetch",
                 "name": fetch_name,
                 "status": "进行中",
-                "detail": f"正在获取 {target_date} 的财报列表",
+                "detail": fetch_detail,
             },
             *timeline_waiting,
         ],
@@ -1931,8 +1970,14 @@ def _execute_run(
         status=status_text,
         session_state=store_out,
         completed=True,
+        options_filter_applied=options_filter_applied,
     )
-    _store_cached_earnings(target_date, row_records, status_text)
+    _store_cached_earnings(
+        target_date,
+        row_records,
+        status_text,
+        options_filter_applied=options_filter_applied,
+    )
 
 
 @app.callback(

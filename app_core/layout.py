@@ -354,48 +354,24 @@ def _build_model_tab() -> html.Div:
             html.Div(
                 [
                     html.H5("全局模型概览"),
-                    dbc.Row(
-                        [
-                            dbc.Col(
-                                html.Pre(
-                                    id="model-global-summary",
-                                    style={
-                                        "maxHeight": "240px",
-                                        "overflowY": "auto",
-                                        "whiteSpace": "pre-wrap",
-                                        "backgroundColor": "#f8f9fa",
-                                        "padding": "12px",
-                                        "borderRadius": "6px",
-                                    },
-                                ),
-                                md=12,
-                                lg=5,
-                            ),
-                            dbc.Col(
-                                dag.AgGrid(
-                                    id="rl-model-table",
-                                    columnDefs=[
-                                        {"headerName": "模型", "field": "model"},
-                                        {"headerName": "参数", "field": "parameter"},
-                                        {"headerName": "取值", "field": "value"},
-                                        {"headerName": "用途说明", "field": "description"},
-                                    ],
-                                    rowData=[],
-                                    defaultColDef={
-                                        "sortable": True,
-                                        "resizable": True,
-                                        "filter": True,
-                                        "flex": 1,
-                                        "minWidth": 140,
-                                    },
-                                    dashGridOptions={"domLayout": "autoHeight", "pagination": False},
-                                    className="ag-theme-alpine",
-                                ),
-                                md=12,
-                                lg=7,
-                            ),
+                    dag.AgGrid(
+                        id="rl-model-table",
+                        columnDefs=[
+                            {"headerName": "模型", "field": "model"},
+                            {"headerName": "参数", "field": "parameter"},
+                            {"headerName": "取值", "field": "value"},
+                            {"headerName": "用途说明", "field": "description"},
                         ],
-                        className="gy-3",
+                        rowData=[],
+                        defaultColDef={
+                            "sortable": True,
+                            "resizable": True,
+                            "filter": True,
+                            "flex": 1,
+                            "minWidth": 140,
+                        },
+                        dashGridOptions={"domLayout": "autoHeight", "pagination": False},
+                        className="ag-theme-alpine",
                     ),
                     html.Div(
                         [
