@@ -198,10 +198,10 @@ def _build_task_tab() -> html.Div:
                 columnDefs=[
                     {"headerName": "任务", "field": "name"},
                     {"headerName": "状态", "field": "status"},
+                    {"headerName": "标的进度", "field": "symbol_progress"},
                     {"headerName": "详情", "field": "detail"},
                     {"headerName": "开始时间", "field": "start_time"},
                     {"headerName": "结束时间", "field": "end_time"},
-                    {"headerName": "更新时间", "field": "updated_at"},
                 ],
                 rowData=[],
                 defaultColDef={

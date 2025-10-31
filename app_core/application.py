@@ -424,6 +424,32 @@ for _timeline_cfg in PREDICTION_TIMELINES:
     }
 
 
+def _coerce_non_negative_int(value: T.Any, fallback: int = 0) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return max(fallback, 0)
+    return max(parsed, 0)
+
+
+def _ensure_task_progress(entry: dict[str, T.Any]) -> dict[str, T.Any]:
+    total = _coerce_non_negative_int(entry.get("total_symbols"), 0)
+    completed = _coerce_non_negative_int(entry.get("completed_symbols"), 0)
+    processed = _coerce_non_negative_int(entry.get("processed_symbols"), completed)
+    if processed < completed:
+        processed = completed
+    entry["total_symbols"] = total
+    entry["completed_symbols"] = completed
+    entry["processed_symbols"] = processed
+    if total <= 0 and completed <= 0:
+        entry["symbol_progress"] = "-"
+    elif total <= 0:
+        entry["symbol_progress"] = str(completed)
+    else:
+        entry["symbol_progress"] = f"{completed}/{total}"
+    return entry
+
+
 def _normalise_task_entry(entry: dict[str, T.Any]) -> dict[str, T.Any]:
     if not isinstance(entry, dict):
         return {}
@@ -437,7 +463,7 @@ def _normalise_task_entry(entry: dict[str, T.Any]) -> dict[str, T.Any]:
     merged.setdefault("updated_at", dt.datetime.now(US_EASTERN).strftime("%H:%M:%S"))
     merged.setdefault("start_time", base.get("start_time"))
     merged.setdefault("end_time", base.get("end_time"))
-    return merged
+    return _ensure_task_progress(merged)
 
 
 def _merge_task_updates(
@@ -475,6 +501,16 @@ def _merge_task_updates(
         status = norm.get("status") or previous.get("status") or "等待"
         norm["status"] = status
 
+        total_symbols = norm.get("total_symbols")
+        if total_symbols is None and isinstance(previous, dict):
+            total_symbols = previous.get("total_symbols")
+        completed_symbols = norm.get("completed_symbols")
+        if completed_symbols is None and isinstance(previous, dict):
+            completed_symbols = previous.get("completed_symbols")
+        processed_symbols = norm.get("processed_symbols")
+        if processed_symbols is None and isinstance(previous, dict):
+            processed_symbols = previous.get("processed_symbols")
+
         if status == "进行中":
             start_val = norm.get("start_time") or previous.get("start_time") or now_ts
             norm["start_time"] = start_val
@@ -489,6 +525,10 @@ def _merge_task_updates(
             if previous.get("end_time") and not norm.get("end_time"):
                 norm["end_time"] = previous.get("end_time")
 
+        norm["total_symbols"] = total_symbols
+        norm["completed_symbols"] = completed_symbols
+        norm["processed_symbols"] = processed_symbols
+        norm = _ensure_task_progress(norm)
         norm["updated_at"] = now_ts
 
         current_map[task_id] = norm
@@ -514,10 +554,11 @@ def _merge_task_updates(
             else:
                 if status in {"进行中", "等待", "失败", "无数据"}:
                     block_following = True
+            entry = _ensure_task_progress(entry)
             ordered.append(entry)
     for key, value in current_map.items():
         if key not in TASK_ORDER:
-            ordered.append(value)
+            ordered.append(_ensure_task_progress(value))
 
     return {"tasks": ordered, "target_date": requested_target}
 
@@ -2400,8 +2441,12 @@ def update_predictions(
     all_missing: list[str] = []
     all_errors: list[str] = []
     timeline_reports: dict[str, str] = {}
+    task_lookup: dict[str, tuple[str, str, str]] = {}
+    progress_tracker: dict[str, dict[str, int]] = {}
 
     def _progress(symbol: str, timeline: dict[str, T.Any], stage: str, detail: str | None) -> None:
+        nonlocal log_entries, task_state_local, tasks_changed
+
         label = str(timeline.get("label") or timeline.get("key") or "未知时点")
         key = str(timeline.get("key") or label)
         message: str | None = None
@@ -2423,9 +2468,49 @@ def update_predictions(
         if message:
             _emit(message)
 
+        if stage in {"success", "missing", "error"}:
+            tracker = progress_tracker.setdefault(
+                key,
+                {"total": len(unique_symbols), "completed": 0, "processed": 0},
+            )
+            if stage == "success":
+                tracker["completed"] = tracker.get("completed", 0) + 1
+            tracker["processed"] = tracker.get("processed", 0) + 1
+
+            lookup = task_lookup.get(key)
+            if lookup:
+                progress_parts = [
+                    f"共 {tracker['total']} 个标的",
+                    f"已完成 {tracker['completed']} 个",
+                ]
+                if tracker["processed"] > tracker["completed"]:
+                    progress_parts.append(f"已处理 {tracker['processed']} 个")
+                if stage == "error" and detail:
+                    progress_parts.append(f"最近错误：{detail}")
+                update_payload = {
+                    "id": lookup[0],
+                    "name": lookup[1],
+                    "detail": f"{lookup[2]}：" + "，".join(progress_parts),
+                    "total_symbols": tracker["total"],
+                    "completed_symbols": tracker["completed"],
+                    "processed_symbols": tracker["processed"],
+                }
+                task_state_local = _merge_task_updates(
+                    task_state_local,
+                    [update_payload],
+                    target_date=target_date_iso,
+                )
+                tasks_changed = True
+
     for cfg in PREDICTION_TIMELINES:
         task_id, name, offset_label = _describe_timeline_task(target_date, cfg)
         start_ts = dt.datetime.now(US_EASTERN).strftime("%H:%M:%S")
+        timeline_key = str(cfg.get("key") or offset_label)
+        task_lookup[timeline_key] = (task_id, name, offset_label)
+        progress_tracker.setdefault(
+            timeline_key,
+            {"total": len(unique_symbols), "completed": 0, "processed": 0},
+        )
         task_state_local = _merge_task_updates(
             task_state_local,
             [
@@ -2436,6 +2521,9 @@ def update_predictions(
                     "detail": f"正在处理 {len(unique_symbols)} 个标的 ({offset_label})",
                     "start_time": start_ts,
                     "end_time": "",
+                    "total_symbols": len(unique_symbols),
+                    "completed_symbols": 0,
+                    "processed_symbols": 0,
                 }
             ],
             target_date=target_date_iso,
@@ -2467,6 +2555,32 @@ def update_predictions(
         if error_cnt:
             parts.append(f"失败{error_cnt}次")
         detail_text = f"{offset_label}：" + ("，".join(parts) if parts else "无数据")
+        tracker_final = progress_tracker.get(timeline_key)
+        total_symbols_for_task = (
+            tracker_final.get("total")
+            if isinstance(tracker_final, dict)
+            else len(unique_symbols)
+        )
+        completed_for_task = (
+            tracker_final.get("completed")
+            if isinstance(tracker_final, dict)
+            else success
+        )
+        processed_for_task = (
+            tracker_final.get("processed")
+            if isinstance(tracker_final, dict)
+            else success + missing_cnt + error_cnt
+        )
+        if total_symbols_for_task > 0:
+            progress_phrase = f"{completed_for_task}/{total_symbols_for_task}"
+        else:
+            progress_phrase = str(completed_for_task)
+        progress_suffix = (
+            f"，已处理 {processed_for_task} 个"
+            if processed_for_task > completed_for_task
+            else ""
+        )
+        detail_text = f"{detail_text}｜进度：{progress_phrase}{progress_suffix}"
         timeline_reports[key] = detail_text
 
         if success:
@@ -2486,6 +2600,9 @@ def update_predictions(
                     "status": status_value,
                     "detail": detail_text,
                     "end_time": end_ts,
+                    "total_symbols": total_symbols_for_task,
+                    "completed_symbols": completed_for_task,
+                    "processed_symbols": processed_for_task,
                 }
             ],
             target_date=target_date_iso,
@@ -3460,13 +3577,18 @@ def download_csv(n, data):
     del n
     if not data:
         return dcc.send_string(
-            "symbol,company,bucket,decision_date\n",
+            "\ufeffsymbol,company,bucket,decision_date\n",
             filename="earnings_weeklies.csv",
         )
     df = pd.DataFrame(data)
     if "weekly_exp_this_fri" in df.columns:
         df = df.drop(columns=["weekly_exp_this_fri"])
-    return dcc.send_data_frame(df.to_csv, "earnings_weeklies.csv", index=False)
+    return dcc.send_data_frame(
+        df.to_csv,
+        "earnings_weeklies.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
 
 
 def create_dash_app() -> Dash:
