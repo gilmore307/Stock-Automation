@@ -40,7 +40,10 @@ RUN_LOCK = threading.Lock()
 RUN_STATES: dict[str, dict[str, T.Any]] = {}
 NO_UPDATE_SENTINEL = object()
 
+ARCHIVE_ROOT = Path(__file__).with_name("archives")
+
 PREDICTION_LOCK = threading.Lock()
+PREDICTION_ARCHIVE_DIR = ARCHIVE_ROOT / "predictions"
 PREDICTION_ARCHIVE_PATH = Path(__file__).with_name("prediction_archive.json")
 
 SYMBOL_META_LOCK = threading.Lock()
@@ -97,7 +100,72 @@ PREDICTION_TIMELINES = [
 ]
 
 EARNINGS_CACHE_PATH = Path(__file__).with_name("earnings_cache.json")
+EARNINGS_ARCHIVE_DIR = ARCHIVE_ROOT / "earnings"
 CACHE_LOCK = threading.Lock()
+
+PARAMETER_ARCHIVE_DIR = ARCHIVE_ROOT / "parameter_changes"
+
+
+def _load_archive_directory(directory: Path) -> dict[str, T.Any]:
+    result: dict[str, T.Any] = {}
+    if not directory.exists():
+        return result
+    for path in sorted(directory.glob("*.json")):
+        if not path.is_file():
+            continue
+        key = path.stem
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            result[key] = payload
+    return result
+
+
+def _write_archive_file(path: Path, payload: dict[str, T.Any]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+def _safe_timestamp_to_filename(timestamp: str) -> str:
+    safe = timestamp.strip().replace(" ", "T").replace(":", "-")
+    safe = "".join(ch for ch in safe if ch.isalnum() or ch in {"-", "_", "T"})
+    if not safe:
+        safe = dt.datetime.now(US_EASTERN).strftime("%Y%m%dT%H%M%S")
+    return safe
+
+
+def _prepare_unique_archive_path(directory: Path, base_name: str) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    candidate = directory / f"{base_name}.json"
+    if not candidate.exists():
+        return candidate
+    suffix = uuid.uuid4().hex[:6]
+    return directory / f"{base_name}-{suffix}.json"
+
+
+def _earnings_archive_file(date_value: dt.date) -> Path:
+    return EARNINGS_ARCHIVE_DIR / f"{date_value.isoformat()}.json"
+
+
+def _prediction_archive_file(date_value: dt.date) -> Path:
+    return PREDICTION_ARCHIVE_DIR / f"{date_value.isoformat()}.json"
+
+
+def _persist_parameter_snapshot(timestamp: str, snapshot: dict[str, T.Any]) -> None:
+    base_name = _safe_timestamp_to_filename(timestamp)
+    path = _prepare_unique_archive_path(PARAMETER_ARCHIVE_DIR, base_name)
+    try:
+        with path.open("w", encoding="utf-8") as fh:
+            json.dump(snapshot, fh, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
 
 
 def _describe_timeline_task(target_date: dt.date, timeline_cfg: dict[str, T.Any]) -> tuple[str, str, str]:
@@ -455,17 +523,23 @@ def _merge_task_updates(
 
 
 def _load_earnings_cache_raw() -> dict[str, T.Any]:
+    directory_payload = _load_archive_directory(EARNINGS_ARCHIVE_DIR)
+
+    legacy_payload: dict[str, T.Any] = {}
     try:
         with EARNINGS_CACHE_PATH.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
     except FileNotFoundError:
-        return {}
-    except json.JSONDecodeError:
-        return {}
+        data = {}
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    if isinstance(data, dict):
+        legacy_payload = {str(k): v for k, v in data.items()}
 
-    if not isinstance(data, dict):
-        return {}
-    return data
+    combined: dict[str, T.Any] = {}
+    combined.update(legacy_payload)
+    combined.update(directory_payload)
+    return combined
 
 
 def _get_cached_earnings(date_value: dt.date) -> dict[str, T.Any] | None:
@@ -498,8 +572,21 @@ def _store_cached_earnings(
     if options_filter_applied is not None:
         payload["options_filter_applied"] = bool(options_filter_applied)
     with CACHE_LOCK:
+        archive_file = _earnings_archive_file(date_value)
+        payload_to_write = payload
+        if archive_file.exists():
+            try:
+                with archive_file.open("r", encoding="utf-8") as fh:
+                    existing = json.load(fh)
+                if isinstance(existing, dict):
+                    existing.update(payload_to_write)
+                    payload_to_write = existing
+            except (OSError, json.JSONDecodeError):
+                payload_to_write = payload
+        _write_archive_file(archive_file, payload_to_write)
+
         cache = _load_earnings_cache_raw()
-        cache[key] = payload
+        cache[key] = payload_to_write
         try:
             with EARNINGS_CACHE_PATH.open("w", encoding="utf-8") as fh:
                 json.dump(cache, fh, ensure_ascii=False, indent=2)
@@ -508,22 +595,41 @@ def _store_cached_earnings(
 
 
 def _load_prediction_archive_raw() -> dict[str, T.Any]:
+    directory_payload = _load_archive_directory(PREDICTION_ARCHIVE_DIR)
+
+    legacy_payload: dict[str, T.Any] = {}
     try:
         with PREDICTION_ARCHIVE_PATH.open("r", encoding="utf-8") as fh:
             payload = json.load(fh)
     except FileNotFoundError:
-        return {}
-    except json.JSONDecodeError:
-        return {}
+        payload = {}
+    except (OSError, json.JSONDecodeError):
+        payload = {}
+    if isinstance(payload, dict):
+        legacy_payload = {str(k): v for k, v in payload.items()}
 
-    if not isinstance(payload, dict):
-        return {}
-    return payload
+    combined: dict[str, T.Any] = {}
+    combined.update(legacy_payload)
+    combined.update(directory_payload)
+    return combined
 
 
 def _get_prediction_archive(date_value: dt.date) -> dict[str, T.Any] | None:
     key = date_value.isoformat()
     with PREDICTION_LOCK:
+        archive_file = _prediction_archive_file(date_value)
+        if archive_file.exists():
+            try:
+                with archive_file.open("r", encoding="utf-8") as fh:
+                    file_entry = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                file_entry = None
+            if isinstance(file_entry, dict):
+                try:
+                    return json.loads(json.dumps(file_entry))
+                except (TypeError, ValueError):
+                    return file_entry
+
         archive = _load_prediction_archive_raw()
         entry = archive.get(key)
         if not isinstance(entry, dict):
@@ -548,13 +654,21 @@ def _store_prediction_results(
         "generated_at": dt.datetime.now(US_EASTERN).isoformat(),
     }
     with PREDICTION_LOCK:
+        archive_file = _prediction_archive_file(target_date)
+        payload_to_write = payload
+        if archive_file.exists():
+            try:
+                with archive_file.open("r", encoding="utf-8") as fh:
+                    existing = json.load(fh)
+                if isinstance(existing, dict):
+                    existing.update(payload_to_write)
+                    payload_to_write = existing
+            except (OSError, json.JSONDecodeError):
+                payload_to_write = payload
+        _write_archive_file(archive_file, payload_to_write)
+
         archive = _load_prediction_archive_raw()
-        base = archive.get(key)
-        if isinstance(base, dict):
-            base.update(payload)
-            archive[key] = base
-        else:
-            archive[key] = payload
+        archive[key] = payload_to_write
         try:
             with PREDICTION_ARCHIVE_PATH.open("w", encoding="utf-8") as fh:
                 json.dump(archive, fh, ensure_ascii=False, indent=2)
@@ -565,12 +679,24 @@ def _store_prediction_results(
 def _store_prediction_evaluation(target_date: dt.date, evaluation: dict[str, T.Any]) -> None:
     key = target_date.isoformat()
     with PREDICTION_LOCK:
-        archive = _load_prediction_archive_raw()
-        entry = archive.get(key)
-        if not isinstance(entry, dict):
-            entry = {"evaluation": evaluation}
+        archive_file = _prediction_archive_file(target_date)
+        entry: dict[str, T.Any]
+        if archive_file.exists():
+            try:
+                with archive_file.open("r", encoding="utf-8") as fh:
+                    existing = json.load(fh)
+                if isinstance(existing, dict):
+                    entry = existing
+                else:
+                    entry = {}
+            except (OSError, json.JSONDecodeError):
+                entry = {}
         else:
-            entry["evaluation"] = evaluation
+            entry = {}
+        entry["evaluation"] = evaluation
+        _write_archive_file(archive_file, entry)
+
+        archive = _load_prediction_archive_raw()
         archive[key] = entry
         try:
             with PREDICTION_ARCHIVE_PATH.open("w", encoding="utf-8") as fh:
@@ -2968,6 +3094,8 @@ def update_parameter_history(agent_data, history_state):  # noqa: D401
     timestamp = dt.datetime.now(US_EASTERN).strftime("%Y-%m-%d %H:%M:%S")
     history = copy.deepcopy(base_history)
     max_records = 200
+    recorded_global_changes: list[dict[str, T.Any]] = []
+    recorded_sector_changes: list[dict[str, T.Any]] = []
 
     global_section = history.setdefault("global", {"last": {}, "changes": []})
     previous_global = global_section.get("last") if isinstance(global_section.get("last"), dict) else {}
@@ -2999,6 +3127,7 @@ def update_parameter_history(agent_data, history_state):  # noqa: D401
     if global_changes:
         existing_changes = global_section.get("changes") if isinstance(global_section.get("changes"), list) else []
         global_section["changes"] = (existing_changes + global_changes)[-max_records:]
+        recorded_global_changes.extend(copy.deepcopy(global_changes))
     global_section["last"] = {k: _normalise_history_value(v) for k, v in current_global.items()}
 
     sectors_section = history.setdefault("sectors", {})
@@ -3035,6 +3164,7 @@ def update_parameter_history(agent_data, history_state):  # noqa: D401
         if sector_changes:
             existing_sector_changes = sector_entry.get("changes") if isinstance(sector_entry.get("changes"), list) else []
             sector_entry["changes"] = (existing_sector_changes + sector_changes)[-max_records:]
+            recorded_sector_changes.extend(copy.deepcopy(sector_changes))
         sector_entry["last"] = {k: _normalise_history_value(v) for k, v in params.items()}
 
     removed_sectors = [name for name in sectors_section.keys() if name not in current_sectors]
@@ -3056,7 +3186,17 @@ def update_parameter_history(agent_data, history_state):  # noqa: D401
             ]
             existing_changes = entry.get("changes") if isinstance(entry.get("changes"), list) else []
             entry["changes"] = (existing_changes + removal_entries)[-max_records:]
+            recorded_sector_changes.extend(copy.deepcopy(removal_entries))
         entry["last"] = {}
+
+    if recorded_global_changes or recorded_sector_changes:
+        snapshot_payload = {
+            "timestamp": timestamp,
+            "global_changes": recorded_global_changes,
+            "sector_changes": recorded_sector_changes,
+            "state": copy.deepcopy(history),
+        }
+        _persist_parameter_snapshot(timestamp, snapshot_payload)
 
     return history
 
