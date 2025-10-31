@@ -374,14 +374,27 @@ def _normalise_task_entry(entry: dict[str, T.Any]) -> dict[str, T.Any]:
     return merged
 
 
-def _merge_task_updates(existing: dict[str, T.Any] | None, updates: list[dict[str, T.Any]]) -> dict[str, T.Any]:
+def _merge_task_updates(
+    existing: dict[str, T.Any] | None,
+    updates: list[dict[str, T.Any]],
+    target_date: str | None = None,
+) -> dict[str, T.Any]:
     current_map: dict[str, dict[str, T.Any]] = {}
+    existing_target = None
     if isinstance(existing, dict):
+        existing_target = str(existing.get("target_date") or "") or None
         tasks = existing.get("tasks")
         if isinstance(tasks, list):
             for item in tasks:
                 if isinstance(item, dict) and item.get("id"):
                     current_map[str(item["id"])] = item
+
+    requested_target = str(target_date) if target_date else None
+    if requested_target and requested_target != existing_target:
+        current_map = {}
+        existing_target = requested_target
+    elif requested_target is None:
+        requested_target = existing_target
 
     now_ts = dt.datetime.now(US_EASTERN).strftime("%H:%M:%S")
 
@@ -415,14 +428,32 @@ def _merge_task_updates(existing: dict[str, T.Any] | None, updates: list[dict[st
         current_map[task_id] = norm
 
     ordered: list[dict[str, T.Any]] = []
+    block_following = False
     for key in TASK_ORDER:
         if key in current_map:
-            ordered.append(current_map[key])
+            entry = current_map[key]
+            status = str(entry.get("status") or "等待")
+            if block_following and status not in {"已完成", "失败", "无数据"}:
+                if status != "等待":
+                    detail_text = str(entry.get("detail") or "")
+                    if not detail_text.startswith("等待前序任务完成"):
+                        prefix = "等待前序任务完成"
+                        detail_text = f"{prefix}：{detail_text}" if detail_text else prefix
+                    entry["detail"] = detail_text
+                entry["status"] = "等待"
+                entry.pop("start_time", None)
+                if entry.get("end_time") and entry.get("status") != "已完成":
+                    entry.pop("end_time", None)
+                entry["updated_at"] = now_ts
+            else:
+                if status in {"进行中", "等待", "失败", "无数据"}:
+                    block_following = True
+            ordered.append(entry)
     for key, value in current_map.items():
         if key not in TASK_ORDER:
             ordered.append(value)
 
-    return {"tasks": ordered}
+    return {"tasks": ordered, "target_date": requested_target}
 
 
 def _load_earnings_cache_raw() -> dict[str, T.Any]:
@@ -868,93 +899,126 @@ def _check_resource_connections(ft_session: dict[str, T.Any] | None) -> list[dic
 
     today_str = dt.date.today().isoformat()
 
+    def run_with_retry(checker: T.Callable[[], tuple[bool, str]], retries: int = 1) -> tuple[bool, str]:
+        attempts = retries + 1
+        details: list[str] = []
+        for attempt in range(attempts):
+            ok, detail = checker()
+            if ok:
+                if attempt:
+                    suffix = f"（第{attempt + 1}次尝试成功）"
+                    detail = f"{detail}{suffix}" if detail else suffix
+                return True, detail
+            details.append(detail or "")
+        combined = "；".join(filter(None, details))
+        if retries:
+            retry_note = f"（已重试 {retries} 次）"
+            combined = f"{combined}{retry_note}" if combined else retry_note
+        return False, combined
+
     # Nasdaq earnings API
-    try:
-        resp = requests.get(
-            NASDAQ_API,
-            params={"date": today_str},
-            headers=HEADERS,
-            timeout=5,
-        )
-        ok = resp.ok
-        detail = f"HTTP {resp.status_code}" if resp is not None else "无响应"
-    except requests.RequestException as exc:
-        ok = False
-        detail = f"请求异常：{exc}"[:160]
+    def _check_nasdaq_once() -> tuple[bool, str]:
+        try:
+            resp = requests.get(
+                NASDAQ_API,
+                params={"date": today_str},
+                headers=HEADERS,
+                timeout=5,
+            )
+            ok = resp.ok
+            detail = f"HTTP {resp.status_code}" if resp is not None else "无响应"
+        except requests.RequestException as exc:
+            ok = False
+            detail = f"请求异常：{exc}"[:160]
+        return ok, detail
+
+    ok, detail = run_with_retry(_check_nasdaq_once)
     add_status("Nasdaq 财报 API", ok, detail)
 
     # Finnhub API
-    try:
-        resp = requests.get(
-            "https://finnhub.io/api/v1/quote",
-            params={"symbol": "AAPL", "token": FINNHUB_API_KEY},
-            timeout=5,
-        )
-        if resp.ok:
-            try:
-                payload = resp.json()
-            except ValueError:
-                payload = None
-            ok = isinstance(payload, dict) and "c" in payload
-            detail = "返回有效报价" if ok else "返回内容异常"
-        else:
+    def _check_finnhub_once() -> tuple[bool, str]:
+        try:
+            resp = requests.get(
+                "https://finnhub.io/api/v1/quote",
+                params={"symbol": "AAPL", "token": FINNHUB_API_KEY},
+                timeout=5,
+            )
+            if resp.ok:
+                try:
+                    payload = resp.json()
+                except ValueError:
+                    payload = None
+                ok = isinstance(payload, dict) and "c" in payload
+                detail = "返回有效报价" if ok else "返回内容异常"
+            else:
+                ok = False
+                detail = f"HTTP {resp.status_code}"
+        except requests.RequestException as exc:
             ok = False
-            detail = f"HTTP {resp.status_code}"
-    except requests.RequestException as exc:
-        ok = False
-        detail = f"请求异常：{exc}"[:160]
+            detail = f"请求异常：{exc}"[:160]
+        return ok, detail
+
+    ok, detail = run_with_retry(_check_finnhub_once)
     add_status("Finnhub API", ok, detail)
 
     # OpenFIGI API
-    try:
-        resp = requests.post(
-            "https://api.openfigi.com/v3/mapping",
-            headers={
-                "Content-Type": "application/json",
-                "X-OPENFIGI-APIKEY": OPENFIGI_API_KEY,
-            },
-            json=[{"idType": "TICKER", "idValue": "AAPL"}],
-            timeout=5,
-        )
-        if resp.ok:
-            try:
-                payload = resp.json()
-            except ValueError:
-                payload = None
-            ok = isinstance(payload, list) and bool(payload)
-            detail = "返回有效映射" if ok else "返回内容异常"
-        else:
+    def _check_openfigi_once() -> tuple[bool, str]:
+        try:
+            resp = requests.post(
+                "https://api.openfigi.com/v3/mapping",
+                headers={
+                    "Content-Type": "application/json",
+                    "X-OPENFIGI-APIKEY": OPENFIGI_API_KEY,
+                },
+                json=[{"idType": "TICKER", "idValue": "AAPL"}],
+                timeout=5,
+            )
+            if resp.ok:
+                try:
+                    payload = resp.json()
+                except ValueError:
+                    payload = None
+                ok = isinstance(payload, list) and bool(payload)
+                detail = "返回有效映射" if ok else "返回内容异常"
+            else:
+                ok = False
+                detail = f"HTTP {resp.status_code}"
+        except requests.RequestException as exc:
             ok = False
-            detail = f"HTTP {resp.status_code}"
-    except requests.RequestException as exc:
-        ok = False
-        detail = f"请求异常：{exc}"[:160]
+            detail = f"请求异常：{exc}"[:160]
+        return ok, detail
+
+    ok, detail = run_with_retry(_check_openfigi_once)
     add_status("OpenFIGI API", ok, detail)
 
     # FRED API
-    try:
-        resp = requests.get(
-            "https://api.stlouisfed.org/fred/series",
-            params={
-                "series_id": "DGS3MO",
-                "api_key": FRED_API_KEY,
-                "file_type": "json",
-            },
-            timeout=5,
-        )
-        if resp.ok:
-            try:
-                payload = resp.json()
-            except ValueError:
-                payload = None
-            ok = isinstance(payload, dict) and payload.get("seriess")
-            detail = "返回有效数据" if ok else "返回内容异常"
-        else:
+    def _check_fred_once() -> tuple[bool, str]:
+        try:
+            resp = requests.get(
+                "https://api.stlouisfed.org/fred/series",
+                params={
+                    "series_id": "DGS3MO",
+                    "api_key": FRED_API_KEY,
+                    "file_type": "json",
+                },
+                timeout=5,
+            )
+            if resp.ok:
+                try:
+                    payload = resp.json()
+                except ValueError:
+                    payload = None
+                ok = isinstance(payload, dict) and payload.get("seriess")
+                detail = "返回有效数据" if ok else "返回内容异常"
+            else:
+                ok = False
+                detail = f"HTTP {resp.status_code}"
+        except requests.RequestException as exc:
             ok = False
-            detail = f"HTTP {resp.status_code}"
-    except requests.RequestException as exc:
-        ok = False
-        detail = f"请求异常：{exc}"[:160]
+            detail = f"请求异常：{exc}"[:160]
+        return ok, detail
+
+    ok, detail = run_with_retry(_check_fred_once)
     add_status("FRED API", ok, detail)
 
     # Firstrade session status
@@ -1153,13 +1217,23 @@ def _is_after_hours(s: str) -> bool:
 
 
 def _is_pre_market(s: str) -> bool:
-    s = (s or "").lower()
-    return ("pre" in s) or ("before" in s) or ("bmo" in s) or ("pre-market" in s)
+    text = s or ""
+    lowered = text.lower()
+    if any(keyword in lowered for keyword in ("pre", "before", "bmo", "pre-market")):
+        return True
+    if any(keyword in lowered for keyword in ("tbd", "unconfirmed")):
+        return True
+    if any(keyword in text for keyword in ("待定", "未确认", "待公布")):
+        return True
+    return False
 
 
 def _is_time_not_supplied(s: str) -> bool:
-    s = (s or "").lower()
-    return ("not" in s and "suppl" in s) or ("tbd" in s) or ("unconfirmed" in s) or (s == "")
+    text = s or ""
+    if _is_pre_market(text):
+        return False
+    lowered = text.lower()
+    return ("not" in lowered and "suppl" in lowered) or ("tbd" in lowered) or ("unconfirmed" in lowered) or (lowered == "")
 
 
 def pick_by_times(rows: T.List[dict], want_after_hours=False, want_pre_market=False, want_not_supplied=False) -> T.List[dict]:
@@ -1603,6 +1677,7 @@ def run_login(n_clicks, username, password, twofa, log_state):  # noqa: D401
     Output("task-store", "data", allow_duplicate=True),
     Input("auto-run-trigger", "n_intervals"),
     Input("earnings-date-picker", "date"),
+    Input("earnings-refresh-btn", "n_clicks"),
     State("ft-username", "value"),
     State("ft-password", "value"),
     State("ft-2fa", "value"),
@@ -1610,13 +1685,16 @@ def run_login(n_clicks, username, password, twofa, log_state):  # noqa: D401
     State("task-store", "data"),
     prevent_initial_call="initial_duplicate",
 )
-def start_run(auto_intervals, selected_date, username, password, twofa, session_state, task_state):  # noqa: D401
+def start_run(auto_intervals, selected_date, refresh_clicks, username, password, twofa, session_state, task_state):  # noqa: D401
     trigger = ctx.triggered_id
     if trigger == "auto-run-trigger":
         if auto_intervals is None:
             return no_update, no_update, no_update, no_update, no_update, no_update
     elif trigger == "earnings-date-picker":
         if not selected_date:
+            return no_update, no_update, no_update, no_update, no_update, no_update
+    elif trigger == "earnings-refresh-btn":
+        if not refresh_clicks:
             return no_update, no_update, no_update, no_update, no_update, no_update
     else:
         return no_update, no_update, no_update, no_update, no_update, no_update
@@ -1631,6 +1709,7 @@ def start_run(auto_intervals, selected_date, username, password, twofa, session_
         target_date = min_allowed
 
     fetch_name = f"{target_date.strftime('%m月%d日')} 的财报列表"
+    target_date_iso = target_date.isoformat()
 
     cache_entry = _get_cached_earnings(target_date)
     if cache_entry:
@@ -1681,6 +1760,7 @@ def start_run(auto_intervals, selected_date, username, password, twofa, session_
                 },
                 *timeline_updates,
             ],
+            target_date=target_date_iso,
         )
         return None, logs, status_out, row_data, True, tasks
 
@@ -1725,6 +1805,7 @@ def start_run(auto_intervals, selected_date, username, password, twofa, session_
             },
             *timeline_waiting,
         ],
+        target_date=target_date_iso,
     )
     return run_id, [], status_message, [], False, tasks
 
@@ -1766,6 +1847,7 @@ def _execute_run(
     ft_error: str | None = None
     store_out: T.Any = NO_UPDATE_SENTINEL
     session_state = session_state or {}
+    options_filter_applied = False
 
     if session_state:
         attempted_ft = True
@@ -1794,6 +1876,10 @@ def _execute_run(
                         has_w = None
                     weekly.append(has_w)
                 df["weekly_exp_this_fri"] = weekly
+                if weekly:
+                    options_filter_applied = any(value is not None for value in weekly)
+                else:
+                    options_filter_applied = True
                 _append_run_log(run_id, "周度期权查询完成。")
                 exported = ft.export_session_state() or session_state
                 store_out = exported if exported else NO_UPDATE_SENTINEL
@@ -1833,6 +1919,9 @@ def _execute_run(
         status_lines.append(f"Firstrade 会话状态：{'有效' if ft_ok else '失败'}{detail}")
     else:
         status_lines.append("Firstrade 会话状态：未登录（请先在连接页登录）")
+
+    if not options_filter_applied:
+        status_lines.append("提示：当前公司列表未进行周五期权筛选，请登录 Firstrade 并刷新。")
 
     row_records = df.to_dict("records")
     status_text = "\n".join(status_lines)
@@ -1903,6 +1992,7 @@ def poll_run_state(n_intervals, run_id, existing_logs, current_rows, task_state)
 
     task_updates: list[dict[str, T.Any]] = []
     target_date = state.get("target_date")
+    target_date_str = target_date.isoformat() if isinstance(target_date, dt.date) else None
     fetch_name = None
     if isinstance(target_date, dt.date):
         fetch_name = f"{target_date.strftime('%m月%d日')} 的财报列表"
@@ -1935,7 +2025,11 @@ def poll_run_state(n_intervals, run_id, existing_logs, current_rows, task_state)
                     }
                 )
 
-    tasks_out = _merge_task_updates(task_state, task_updates) if task_updates else no_update
+    tasks_out = (
+        _merge_task_updates(task_state, task_updates, target_date=target_date_str)
+        if task_updates
+        else no_update
+    )
 
     return logs_out, table_out, status_out, session_out, bool(completed), tasks_out
 
@@ -1992,6 +2086,7 @@ def update_predictions(selected_rows, row_data, task_state, picker_date, log_sta
         )
 
     target_date = _coerce_date(picker_date) or us_eastern_today()
+    target_date_iso = target_date.isoformat()
 
     log_state = log_state if isinstance(log_state, list) else []
     progress_messages: list[str] = []
@@ -2041,6 +2136,7 @@ def update_predictions(selected_rows, row_data, task_state, picker_date, log_sta
                     "end_time": "",
                 }
             ],
+            target_date=target_date_iso,
         )
         progress_messages.append(f"{name} 已开始。")
 
@@ -2089,6 +2185,7 @@ def update_predictions(selected_rows, row_data, task_state, picker_date, log_sta
                     "end_time": end_ts,
                 }
             ],
+            target_date=target_date_iso,
         )
         progress_messages.append(f"{name} 完成：{detail_text}")
 
@@ -2619,6 +2716,225 @@ def render_model_details(agent_data):  # noqa: D401
                     )
 
     return rows
+
+
+def _normalise_history_value(value: T.Any) -> T.Any:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return int(value)
+    if isinstance(value, float):
+        return round(float(value), 6)
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple, set)):
+        return ", ".join(str(_normalise_history_value(item)) for item in value)
+    if isinstance(value, dict):
+        try:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            return str(value)
+    return str(value)
+
+
+def _extract_global_trackable(agent_data: dict[str, T.Any]) -> dict[str, T.Any]:
+    result: dict[str, T.Any] = {}
+    global_data = agent_data.get("global") if isinstance(agent_data.get("global"), dict) else agent_data
+    if isinstance(global_data, dict):
+        for key in ("learning_rate", "gamma", "adjustment_scale", "bias", "baseline", "update_count", "total_predictions"):
+            if key in global_data:
+                result[key] = global_data.get(key)
+        weights = global_data.get("weights") if isinstance(global_data.get("weights"), dict) else {}
+        if weights:
+            sorted_weights = sorted(weights.items(), key=lambda kv: abs(float(kv[1])), reverse=True)
+            top_display = "; ".join(
+                f"{name}:{round(float(value), 4)}" for name, value in sorted_weights[:5]
+            )
+            result["weights:top"] = top_display
+    factor_weights = agent_data.get("factor_weights") if isinstance(agent_data.get("factor_weights"), dict) else {}
+    for factor_name, value in sorted(factor_weights.items(), key=lambda kv: kv[0]):
+        result[f"factor_weights::{factor_name}"] = value
+    return result
+
+
+def _extract_sector_trackable(agent_data: dict[str, T.Any]) -> dict[str, dict[str, T.Any]]:
+    sectors_map: dict[str, dict[str, T.Any]] = {}
+    sectors = agent_data.get("sectors") if isinstance(agent_data.get("sectors"), dict) else {}
+    for sector_name, payload in sectors.items():
+        if not isinstance(payload, dict):
+            continue
+        params: dict[str, T.Any] = {}
+        for key in ("baseline", "update_count", "total_predictions"):
+            if key in payload:
+                params[key] = payload.get(key)
+        weights = payload.get("weights") if isinstance(payload.get("weights"), dict) else {}
+        if weights:
+            sorted_weights = sorted(weights.items(), key=lambda kv: abs(float(kv[1])), reverse=True)
+            params["weights:top"] = "; ".join(
+                f"{name}:{round(float(value), 4)}" for name, value in sorted_weights[:5]
+            )
+        if params:
+            sectors_map[sector_name] = params
+    return sectors_map
+
+
+@app.callback(
+    Output("rl-parameter-history", "data"),
+    Input("rl-agent-store", "data"),
+    State("rl-parameter-history", "data"),
+)
+def update_parameter_history(agent_data, history_state):  # noqa: D401
+    base_history: dict[str, T.Any]
+    if isinstance(history_state, dict):
+        base_history = history_state
+    else:
+        base_history = {"global": {"last": {}, "changes": []}, "sectors": {}}
+
+    if not isinstance(agent_data, dict):
+        return base_history
+
+    timestamp = dt.datetime.now(US_EASTERN).strftime("%Y-%m-%d %H:%M:%S")
+    history = copy.deepcopy(base_history)
+    max_records = 200
+
+    global_section = history.setdefault("global", {"last": {}, "changes": []})
+    previous_global = global_section.get("last") if isinstance(global_section.get("last"), dict) else {}
+    current_global = _extract_global_trackable(agent_data)
+    global_changes: list[dict[str, T.Any]] = []
+    for key, value in current_global.items():
+        norm_value = _normalise_history_value(value)
+        norm_previous = _normalise_history_value(previous_global.get(key))
+        if norm_value != norm_previous:
+            global_changes.append(
+                {
+                    "timestamp": timestamp,
+                    "parameter": key,
+                    "old_value": norm_previous,
+                    "new_value": norm_value,
+                }
+            )
+    for key in previous_global:
+        if key not in current_global:
+            norm_previous = _normalise_history_value(previous_global.get(key))
+            global_changes.append(
+                {
+                    "timestamp": timestamp,
+                    "parameter": key,
+                    "old_value": norm_previous,
+                    "new_value": None,
+                }
+            )
+    if global_changes:
+        existing_changes = global_section.get("changes") if isinstance(global_section.get("changes"), list) else []
+        global_section["changes"] = (existing_changes + global_changes)[-max_records:]
+    global_section["last"] = {k: _normalise_history_value(v) for k, v in current_global.items()}
+
+    sectors_section = history.setdefault("sectors", {})
+    current_sectors = _extract_sector_trackable(agent_data)
+    for sector_name, params in current_sectors.items():
+        sector_entry = sectors_section.setdefault(sector_name, {"last": {}, "changes": []})
+        previous_params = sector_entry.get("last") if isinstance(sector_entry.get("last"), dict) else {}
+        sector_changes: list[dict[str, T.Any]] = []
+        for key, value in params.items():
+            norm_value = _normalise_history_value(value)
+            norm_previous = _normalise_history_value(previous_params.get(key))
+            if norm_value != norm_previous:
+                sector_changes.append(
+                    {
+                        "timestamp": timestamp,
+                        "sector": sector_name,
+                        "parameter": key,
+                        "old_value": norm_previous,
+                        "new_value": norm_value,
+                    }
+                )
+        for key in previous_params:
+            if key not in params:
+                norm_previous = _normalise_history_value(previous_params.get(key))
+                sector_changes.append(
+                    {
+                        "timestamp": timestamp,
+                        "sector": sector_name,
+                        "parameter": key,
+                        "old_value": norm_previous,
+                        "new_value": None,
+                    }
+                )
+        if sector_changes:
+            existing_sector_changes = sector_entry.get("changes") if isinstance(sector_entry.get("changes"), list) else []
+            sector_entry["changes"] = (existing_sector_changes + sector_changes)[-max_records:]
+        sector_entry["last"] = {k: _normalise_history_value(v) for k, v in params.items()}
+
+    removed_sectors = [name for name in sectors_section.keys() if name not in current_sectors]
+    for sector_name in removed_sectors:
+        entry = sectors_section.get(sector_name)
+        if not isinstance(entry, dict):
+            continue
+        previous_params = entry.get("last") if isinstance(entry.get("last"), dict) else {}
+        if previous_params:
+            removal_entries = [
+                {
+                    "timestamp": timestamp,
+                    "sector": sector_name,
+                    "parameter": key,
+                    "old_value": _normalise_history_value(value),
+                    "new_value": None,
+                }
+                for key, value in previous_params.items()
+            ]
+            existing_changes = entry.get("changes") if isinstance(entry.get("changes"), list) else []
+            entry["changes"] = (existing_changes + removal_entries)[-max_records:]
+        entry["last"] = {}
+
+    return history
+
+
+@app.callback(
+    Output("model-global-history-table", "rowData"),
+    Output("model-sector-history-table", "rowData"),
+    Input("rl-parameter-history", "data"),
+)
+def render_parameter_history_tables(history_state):  # noqa: D401
+    if not isinstance(history_state, dict):
+        return [], []
+
+    global_rows: list[dict[str, T.Any]] = []
+    global_section = history_state.get("global") if isinstance(history_state.get("global"), dict) else {}
+    global_changes = global_section.get("changes") if isinstance(global_section.get("changes"), list) else []
+    for change in global_changes:
+        if not isinstance(change, dict):
+            continue
+        global_rows.append(
+            {
+                "timestamp": change.get("timestamp"),
+                "parameter": change.get("parameter"),
+                "old_value": change.get("old_value"),
+                "new_value": change.get("new_value"),
+            }
+        )
+    global_rows = sorted(global_rows, key=lambda row: row.get("timestamp") or "", reverse=True)
+
+    sector_rows: list[dict[str, T.Any]] = []
+    sectors_section = history_state.get("sectors") if isinstance(history_state.get("sectors"), dict) else {}
+    for sector_name, payload in sectors_section.items():
+        if not isinstance(payload, dict):
+            continue
+        changes = payload.get("changes") if isinstance(payload.get("changes"), list) else []
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            sector_rows.append(
+                {
+                    "timestamp": change.get("timestamp"),
+                    "sector": change.get("sector") or sector_name,
+                    "parameter": change.get("parameter"),
+                    "old_value": change.get("old_value"),
+                    "new_value": change.get("new_value"),
+                }
+            )
+    sector_rows = sorted(sector_rows, key=lambda row: row.get("timestamp") or "", reverse=True)
+
+    return global_rows, sector_rows
 
 
 @app.callback(

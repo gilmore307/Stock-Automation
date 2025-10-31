@@ -153,6 +153,7 @@ def _build_earnings_tab(config: LayoutConfig) -> html.Div:
             ),
             html.Div(
                 [
+                    html.Button("刷新列表", id="earnings-refresh-btn"),
                     html.Button("下载 CSV", id="dl-btn"),
                 ],
                 style={"display": "flex", "gap": "8px", "marginBottom": "10px"},
@@ -351,25 +352,78 @@ def _build_model_tab() -> html.Div:
     return html.Div(
         [
             html.Div(
-                "本页展示强化学习模型的全局与行业级参数，所有更新均由自动检验驱动。",
-                style={"margin": "8px 0", "whiteSpace": "pre-wrap"},
-            ),
-            html.Div(
                 [
                     html.H5("全局模型概览"),
-                    html.Pre(
-                        id="model-global-summary",
-                        style={
-                            "maxHeight": "240px",
-                            "overflowY": "auto",
-                            "whiteSpace": "pre-wrap",
-                            "backgroundColor": "#f8f9fa",
-                            "padding": "12px",
-                            "borderRadius": "6px",
-                        },
+                    dbc.Row(
+                        [
+                            dbc.Col(
+                                html.Pre(
+                                    id="model-global-summary",
+                                    style={
+                                        "maxHeight": "240px",
+                                        "overflowY": "auto",
+                                        "whiteSpace": "pre-wrap",
+                                        "backgroundColor": "#f8f9fa",
+                                        "padding": "12px",
+                                        "borderRadius": "6px",
+                                    },
+                                ),
+                                md=12,
+                                lg=5,
+                            ),
+                            dbc.Col(
+                                dag.AgGrid(
+                                    id="rl-model-table",
+                                    columnDefs=[
+                                        {"headerName": "模型", "field": "model"},
+                                        {"headerName": "参数", "field": "parameter"},
+                                        {"headerName": "取值", "field": "value"},
+                                        {"headerName": "用途说明", "field": "description"},
+                                    ],
+                                    rowData=[],
+                                    defaultColDef={
+                                        "sortable": True,
+                                        "resizable": True,
+                                        "filter": True,
+                                        "flex": 1,
+                                        "minWidth": 140,
+                                    },
+                                    dashGridOptions={"domLayout": "autoHeight", "pagination": False},
+                                    className="ag-theme-alpine",
+                                ),
+                                md=12,
+                                lg=7,
+                            ),
+                        ],
+                        className="gy-3",
+                    ),
+                    html.Div(
+                        [
+                            html.H6("参数变化追踪"),
+                            dag.AgGrid(
+                                id="model-global-history-table",
+                                columnDefs=[
+                                    {"headerName": "时间", "field": "timestamp", "minWidth": 160},
+                                    {"headerName": "参数", "field": "parameter", "minWidth": 140},
+                                    {"headerName": "旧值", "field": "old_value", "minWidth": 120},
+                                    {"headerName": "新值", "field": "new_value", "minWidth": 120},
+                                ],
+                                rowData=[],
+                                defaultColDef={
+                                    "sortable": True,
+                                    "resizable": True,
+                                    "filter": True,
+                                    "flex": 1,
+                                    "minWidth": 120,
+                                },
+                                dashGridOptions={"domLayout": "autoHeight", "pagination": False},
+                                className="ag-theme-alpine",
+                            ),
+                        ],
+                        style={"marginTop": "16px"},
                     ),
                 ],
-                style={"marginBottom": "16px"},
+                style={"marginBottom": "24px"},
             ),
             html.Div(
                 [
@@ -394,28 +448,33 @@ def _build_model_tab() -> html.Div:
                         dashGridOptions={"domLayout": "autoHeight", "pagination": False},
                         className="ag-theme-alpine",
                     ),
+                    html.Div(
+                        [
+                            html.H6("行业参数变化追踪"),
+                            dag.AgGrid(
+                                id="model-sector-history-table",
+                                columnDefs=[
+                                    {"headerName": "时间", "field": "timestamp", "minWidth": 160},
+                                    {"headerName": "行业", "field": "sector", "minWidth": 120},
+                                    {"headerName": "参数", "field": "parameter", "minWidth": 140},
+                                    {"headerName": "旧值", "field": "old_value", "minWidth": 120},
+                                    {"headerName": "新值", "field": "new_value", "minWidth": 120},
+                                ],
+                                rowData=[],
+                                defaultColDef={
+                                    "sortable": True,
+                                    "resizable": True,
+                                    "filter": True,
+                                    "flex": 1,
+                                    "minWidth": 120,
+                                },
+                                dashGridOptions={"domLayout": "autoHeight", "pagination": False},
+                                className="ag-theme-alpine",
+                            ),
+                        ],
+                        style={"marginTop": "16px"},
+                    ),
                 ],
-                style={"marginBottom": "16px"},
-            ),
-            html.Hr(),
-            dag.AgGrid(
-                id="rl-model-table",
-                columnDefs=[
-                    {"headerName": "模型", "field": "model"},
-                    {"headerName": "参数", "field": "parameter"},
-                    {"headerName": "取值", "field": "value"},
-                    {"headerName": "用途说明", "field": "description"},
-                ],
-                rowData=[],
-                defaultColDef={
-                    "sortable": True,
-                    "resizable": True,
-                    "filter": True,
-                    "flex": 1,
-                    "minWidth": 140,
-                },
-                dashGridOptions={"domLayout": "autoHeight", "pagination": False},
-                className="ag-theme-alpine",
             ),
         ]
     )
@@ -444,6 +503,11 @@ def build_layout(config: LayoutConfig) -> html.Div:
                 },
             ),
             dcc.Store(id="rl-agent-store", storage_type="memory", data=config.rl_snapshot),
+            dcc.Store(
+                id="rl-parameter-history",
+                storage_type="memory",
+                data={"global": {"last": {}, "changes": []}, "sectors": {}},
+            ),
             dcc.Store(id="evaluation-store", storage_type="memory", data={}),
             dcc.Interval(id="log-poller", interval=1000, disabled=True),
             dcc.Interval(id="connection-poller", interval=60000, n_intervals=0),
