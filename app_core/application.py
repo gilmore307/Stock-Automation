@@ -68,33 +68,74 @@ DCI_DATA_PATH = Path(os.getenv("DCI_DATA_PATH", str(DEFAULT_DCI_DATA_PATH)))
 
 PREDICTION_TIMELINES = [
     {
-        "key": "minus14",
-        "label": "决策日前14天",
-        "lookback": -14,
-        "aliases": ["minus14", "-14", "t-14", "d-14"],
+        "key": "plus14",
+        "label": "决策日后14天",
+        "lookback": 14,
+        "offset_days": 14,
+        "aliases": [
+            "plus14",
+            "d+14",
+            "t+14",
+            "p14",
+            "minus14",
+            "-14",
+            "t-14",
+            "d-14",
+        ],
     },
     {
-        "key": "minus7",
-        "label": "决策日前7天",
-        "lookback": -7,
-        "aliases": ["minus7", "-7", "t-7", "d-7"],
+        "key": "plus7",
+        "label": "决策日后7天",
+        "lookback": 7,
+        "offset_days": 7,
+        "aliases": [
+            "plus7",
+            "d+7",
+            "t+7",
+            "p7",
+            "minus7",
+            "-7",
+            "t-7",
+            "d-7",
+        ],
     },
     {
-        "key": "minus3",
-        "label": "决策日前3天",
-        "lookback": -3,
-        "aliases": ["minus3", "-3", "t-3", "d-3"],
+        "key": "plus3",
+        "label": "决策日后3天",
+        "lookback": 3,
+        "offset_days": 3,
+        "aliases": [
+            "plus3",
+            "d+3",
+            "t+3",
+            "p3",
+            "minus3",
+            "-3",
+            "t-3",
+            "d-3",
+        ],
     },
     {
-        "key": "minus1",
-        "label": "决策日前1天",
-        "lookback": -1,
-        "aliases": ["minus1", "-1", "t-1", "d-1"],
+        "key": "plus1",
+        "label": "决策日后1天",
+        "lookback": 1,
+        "offset_days": 1,
+        "aliases": [
+            "plus1",
+            "d+1",
+            "t+1",
+            "p1",
+            "minus1",
+            "-1",
+            "t-1",
+            "d-1",
+        ],
     },
     {
         "key": "decision_day",
         "label": "决策日收盘前",
         "lookback": 0,
+        "offset_days": 0,
         "aliases": ["decision_day", "day0", "decision", "today", "0", "final"],
     },
 ]
@@ -186,6 +227,24 @@ def _describe_timeline_task(target_date: dt.date, timeline_cfg: dict[str, T.Any]
     offset_label = f"T{lookback:+d}"
     name = f"{target_date.strftime('%m月%d日')} 的 {offset_label} 天预测"
     return f"predict::{key}", name, offset_label
+
+
+def _resolve_timeline_offset_days(timeline_cfg: dict[str, T.Any]) -> int:
+    """Return the calendar-day offset configured for a prediction timeline."""
+
+    offset = timeline_cfg.get("offset_days")
+    if isinstance(offset, (int, float)):
+        try:
+            return int(offset)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            return int(float(offset)) if offset is not None else 0
+    lookback = timeline_cfg.get("lookback")
+    if isinstance(lookback, (int, float)):
+        try:
+            return int(lookback)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            return int(float(lookback)) if lookback is not None else 0
+    return 0
 
 RL_PARAM_DESCRIPTIONS: dict[str, str] = {
     "learning_rate": "学习率：控制每次权重更新的幅度。",
@@ -702,6 +761,7 @@ def _store_prediction_results(
     row_data: list[dict[str, T.Any]],
     results: list[dict[str, T.Any]],
     status: str,
+    timeline_sources: dict[str, str] | None = None,
 ) -> None:
     key = target_date.isoformat()
     generated_at = dt.datetime.now(US_EASTERN).isoformat()
@@ -711,6 +771,8 @@ def _store_prediction_results(
         "status": status,
         "generated_at": generated_at,
     }
+    if timeline_sources:
+        payload["timeline_sources"] = timeline_sources
     with PREDICTION_LOCK:
         archive_file = _prediction_archive_file(target_date)
         payload_to_write = payload
@@ -771,7 +833,8 @@ def _store_prediction_results(
                 metadata = metadata_lookup.get(symbol)
                 if metadata:
                     per_symbol_payload["metadata"] = metadata
-                _write_archive_file(symbol_dir / f"{symbol}.json", per_symbol_payload)
+                filename = f"{key}_{symbol}.json"
+                _write_archive_file(symbol_dir / filename, per_symbol_payload)
 
         archive = _load_prediction_archive_raw()
         archive[key] = payload_to_write
@@ -1000,6 +1063,7 @@ def _compute_dci_for_symbols(
 
         meta_entry = metadata_map.get(symbol) if isinstance(metadata_map, dict) else None
         decision_date = str((meta_entry or {}).get("decision_date") or "")
+        timeline_date_value = str((meta_entry or {}).get("timeline_date") or decision_date)
         bucket = str((meta_entry or {}).get("bucket") or "")
         company_name = str((meta_entry or {}).get("company") or "")
         sector_value = (meta_entry or {}).get("sector") or _get_symbol_sector(symbol)
@@ -1076,6 +1140,8 @@ def _compute_dci_for_symbols(
                         "timeline_key": timeline.get('key'),
                         "timeline_alias": alias or timeline.get('key'),
                         "lookback_days": int(timeline.get('lookback', 0)),
+                        "timeline_offset_days": int(timeline.get('lookback', 0)),
+                        "timeline_date": timeline_date_value,
                         "decision_date": decision_date,
                         "bucket": bucket,
                         "company": company_name,
@@ -2384,16 +2450,11 @@ def update_predictions(
     if triggered == "table.selectedRows" and not selected_rows:
         return no_update, no_update, no_update, no_update, no_update
 
-    use_all_rows = triggered == "table.rowData"
-
     session_data = session_state if isinstance(session_state, dict) else {}
     logged_in = _has_valid_ft_session(session_data)
     username = (username or "").strip()
     password = (password or "").strip()
     twofa = (twofa or "").strip()
-
-    table_rows = row_data if isinstance(row_data, list) else []
-    selected_rows_list = selected_rows if isinstance(selected_rows, list) else []
 
     target_date = _coerce_date(picker_date) or us_eastern_today()
     target_date_iso = target_date.isoformat()
@@ -2419,161 +2480,109 @@ def update_predictions(
             log_output,
         )
 
-    cached_entry = _get_cached_earnings(target_date)
-    cached_rows: list[dict[str, T.Any]] = []
-    cached_options_flag: bool | None = None
-    if isinstance(cached_entry, dict):
-        payload = cached_entry.get("rowData")
-        if isinstance(payload, list):
-            cached_rows = payload
-        cached_options_flag = cached_entry.get("options_filter_applied")
+    session_local = session_data
+    timeline_rows_map: dict[str, list[dict[str, T.Any]]] = {}
+    timeline_errors: dict[str, str] = {}
+    timeline_dates: dict[str, dt.date] = {}
 
-    effective_rows = table_rows if table_rows else cached_rows
+    for cfg in PREDICTION_TIMELINES:
+        timeline_key = str(cfg.get("key") or "")
+        offset_days = _resolve_timeline_offset_days(cfg)
+        timeline_date = target_date + dt.timedelta(days=offset_days)
+        timeline_dates[timeline_key] = timeline_date
+        offset_label = f"T{offset_days:+d}"
+        label = str(cfg.get("label") or offset_label)
 
-    needs_refresh = False
-    if not effective_rows:
-        needs_refresh = True
-    elif cached_options_flag is False and session_data:
-        needs_refresh = True
+        cached_entry = _get_cached_earnings(timeline_date)
+        rows: list[dict[str, T.Any]] = []
+        status_text = ""
+        if isinstance(cached_entry, dict):
+            payload = cached_entry.get("rowData")
+            if isinstance(payload, list):
+                rows = payload
+            status_text = str(cached_entry.get("status") or "")
 
-    if needs_refresh:
-        _emit(f"未找到已筛选的财报列表，自动刷新 {target_date} 的数据。")
-        fetched_rows, status_text, _, options_applied, error_message = _prepare_earnings_dataset(
-            target_date,
-            session_data,
-            username,
-            password,
-            twofa,
-            logger=_emit,
-        )
-        if error_message:
-            failure_detail = f"自动获取财报列表失败：{error_message}"
-            _emit(failure_detail)
-            failure_updates = []
-            for cfg in PREDICTION_TIMELINES:
-                task_id, name, offset_label = _describe_timeline_task(target_date, cfg)
-                failure_updates.append(
-                    {
-                        "id": task_id,
-                        "name": name,
-                        "status": "失败",
-                        "detail": f"财报列表异常，跳过 {offset_label}",
-                    }
-                )
-            task_state_local = _merge_task_updates(task_state_local, failure_updates, target_date=target_date_iso)
-            tasks_changed = True
-            log_output = log_entries if log_entries != initial_logs else no_update
-            return (
-                {"results": [], "missing": [], "errors": [], "rl_snapshot": initial_snapshot},
-                failure_detail,
-                initial_snapshot,
-                task_state_local,
-                log_output,
+        if not rows:
+            _emit(f"未找到 {timeline_date} 的筛选财报列表（{label}），开始自动刷新。")
+            fetched_rows, status_text, session_out, options_applied, error_message = _prepare_earnings_dataset(
+                timeline_date,
+                session_local,
+                username,
+                password,
+                twofa,
+                logger=(lambda message, tag=label: _emit(f"[{tag}] {message}")),
             )
-        cached_options_flag = options_applied
-        if options_applied is not True:
-            warning_detail = "财报列表尚未完成周五期权筛选，无法开始预测。"
-            _emit(warning_detail)
-            failure_updates = []
-            for cfg in PREDICTION_TIMELINES:
-                task_id, name, offset_label = _describe_timeline_task(target_date, cfg)
-                failure_updates.append(
-                    {
-                        "id": task_id,
-                        "name": name,
-                        "status": "失败",
-                        "detail": f"财报列表未筛选，跳过 {offset_label}",
-                    }
-                )
-            task_state_local = _merge_task_updates(task_state_local, failure_updates, target_date=target_date_iso)
-            tasks_changed = True
-            log_output = log_entries if log_entries != initial_logs else no_update
-            return (
-                {"results": [], "missing": [], "errors": [], "rl_snapshot": initial_snapshot},
-                warning_detail,
-                initial_snapshot,
-                task_state_local,
-                log_output,
-            )
-        effective_rows = fetched_rows
-        if status_text:
-            _emit(status_text)
-        _store_cached_earnings(
-            target_date,
-            fetched_rows,
-            status_text or "",
-            options_filter_applied=cached_options_flag,
-        )
-    elif use_all_rows and table_rows:
-        _emit(f"使用当前表格中的财报列表，共 {len(table_rows)} 个标的。")
+            if isinstance(session_out, dict) and session_out:
+                session_local = session_out
+            if error_message:
+                detail_message = f"{label} 财报列表获取失败：{error_message}"
+                timeline_errors[timeline_key] = detail_message
+                _emit(detail_message)
+                rows = []
+            elif options_applied is not True:
+                detail_message = f"{label} 财报列表未完成 Firstrade 筛选，已跳过。"
+                timeline_errors[timeline_key] = detail_message
+                _emit(detail_message)
+                rows = []
+            else:
+                rows = fetched_rows
+                if rows:
+                    _store_cached_earnings(
+                        timeline_date,
+                        rows,
+                        status_text or "",
+                        options_filter_applied=True,
+                    )
 
-    metadata_map: dict[str, dict[str, T.Any]] = {}
-    for row in effective_rows:
-        if isinstance(row, dict) and row.get("symbol"):
-            metadata_map[str(row["symbol"]).upper()] = row
+        if rows:
+            timeline_rows_map[timeline_key] = rows
+            _emit(f"{label}（{timeline_date}）共 {len(rows)} 个标的。")
+        elif timeline_key not in timeline_errors:
+            detail_message = f"{label}（{timeline_date}）无可用财报标的。"
+            timeline_errors[timeline_key] = detail_message
+            _emit(detail_message)
 
-    symbols: list[str] = []
-    source_rows = effective_rows if use_all_rows else selected_rows_list
-    for row in source_rows:
-        if isinstance(row, dict) and row.get("symbol"):
-            symbol = str(row["symbol"])
-            symbols.append(symbol)
-            metadata_map.setdefault(symbol.upper(), row)
+    timeline_metadata_map: dict[str, dict[str, dict[str, T.Any]]] = {}
+    aggregated_row_data: list[dict[str, T.Any]] = []
+    for key, rows in timeline_rows_map.items():
+        date_value = timeline_dates.get(key)
+        date_str = date_value.isoformat() if isinstance(date_value, dt.date) else ""
+        meta_map: dict[str, dict[str, T.Any]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            symbol = str(row.get("symbol") or "").upper()
+            if not symbol:
+                continue
+            enriched = dict(row)
+            enriched["timeline_key"] = key
+            enriched["timeline_date"] = date_str
+            meta_map[symbol] = enriched
+            aggregated_row_data.append(enriched)
+        timeline_metadata_map[key] = meta_map
 
-    if use_all_rows and not symbols and effective_rows:
-        for row in effective_rows:
-            if isinstance(row, dict) and row.get("symbol"):
-                symbol = str(row["symbol"])
-                symbols.append(symbol)
-                metadata_map.setdefault(symbol.upper(), row)
-
-    unique_symbols = list(dict.fromkeys([s.upper() for s in symbols if s]))
-    if not unique_symbols:
-        message = "自动任务尚未选择标的，请等待财报列表加载。" if use_all_rows else "未选择标的。"
-        if use_all_rows and not effective_rows:
-            failure_updates = []
-            for cfg in PREDICTION_TIMELINES:
-                task_id, name, offset_label = _describe_timeline_task(target_date, cfg)
-                failure_updates.append(
-                    {
-                        "id": task_id,
-                        "name": name,
-                        "status": "失败",
-                        "detail": f"未获取到财报列表，跳过 {offset_label}",
-                    }
-                )
-            task_state_local = _merge_task_updates(task_state_local, failure_updates, target_date=target_date_iso)
-            tasks_changed = True
-        log_output = log_entries if log_entries != initial_logs else no_update
-        task_output = task_state_local if tasks_changed else no_update
-        return (
-            {"results": [], "missing": [], "errors": [], "rl_snapshot": initial_snapshot},
-            message,
-            initial_snapshot,
-            task_output,
-            log_output,
-        )
-
-    timeline_summary: dict[str, dict[str, T.Any]] = {
-        str(cfg.get("key")): {"label": cfg.get("label"), "success": 0, "missing": 0, "error": 0}
-        for cfg in PREDICTION_TIMELINES
-    }
-
+    timeline_summary: dict[str, dict[str, T.Any]] = {}
     all_results: list[dict[str, T.Any]] = []
     all_missing: list[str] = []
     all_errors: list[str] = []
     timeline_reports: dict[str, str] = {}
     task_lookup: dict[str, tuple[str, str, str]] = {}
     progress_tracker: dict[str, dict[str, int]] = {}
+    timeline_symbol_counts: dict[str, int] = {
+        str(cfg.get("key") or ""): len(timeline_metadata_map.get(str(cfg.get("key") or ""), {}))
+        for cfg in PREDICTION_TIMELINES
+    }
 
     def _progress(symbol: str, timeline: dict[str, T.Any], stage: str, detail: str | None) -> None:
         nonlocal log_entries, task_state_local, tasks_changed
 
         label = str(timeline.get("label") or timeline.get("key") or "未知时点")
         key = str(timeline.get("key") or label)
+        timeline_date_value = timeline_dates.get(key)
+        date_str = timeline_date_value.isoformat() if isinstance(timeline_date_value, dt.date) else "-"
         message: str | None = None
         if stage == "start":
-            message = f"开始生成 {symbol} 的 {label} 预测。"
+            message = f"开始生成 {symbol} 的 {label} 预测（决策日 {date_str}）。"
         elif stage == "success":
             timeline_summary.setdefault(key, {"label": label, "success": 0, "missing": 0, "error": 0})
             timeline_summary[key]["success"] = timeline_summary[key].get("success", 0) + 1
@@ -2591,9 +2600,10 @@ def update_predictions(
             _emit(message)
 
         if stage in {"success", "missing", "error"}:
+            total_for_task = timeline_symbol_counts.get(key, 0)
             tracker = progress_tracker.setdefault(
                 key,
-                {"total": len(unique_symbols), "completed": 0, "processed": 0},
+                {"total": total_for_task, "completed": 0, "processed": 0},
             )
             if stage == "success":
                 tracker["completed"] = tracker.get("completed", 0) + 1
@@ -2609,10 +2619,11 @@ def update_predictions(
                     progress_parts.append(f"已处理 {tracker['processed']} 个")
                 if stage == "error" and detail:
                     progress_parts.append(f"最近错误：{detail}")
+                prefix = f"{lookup[2]}｜决策日 {date_str}"
                 update_payload = {
                     "id": lookup[0],
                     "name": lookup[1],
-                    "detail": f"{lookup[2]}：" + "，".join(progress_parts),
+                    "detail": f"{prefix}：" + "，".join(progress_parts),
                     "total_symbols": tracker["total"],
                     "completed_symbols": tracker["completed"],
                     "processed_symbols": tracker["processed"],
@@ -2626,13 +2637,64 @@ def update_predictions(
 
     for cfg in PREDICTION_TIMELINES:
         task_id, name, offset_label = _describe_timeline_task(target_date, cfg)
-        start_ts = dt.datetime.now(US_EASTERN).strftime("%H:%M:%S")
         timeline_key = str(cfg.get("key") or offset_label)
         task_lookup[timeline_key] = (task_id, name, offset_label)
-        progress_tracker.setdefault(
-            timeline_key,
-            {"total": len(unique_symbols), "completed": 0, "processed": 0},
-        )
+        timeline_date_value = timeline_dates.get(timeline_key)
+        timeline_date_str = timeline_date_value.isoformat() if isinstance(timeline_date_value, dt.date) else "-"
+        symbol_count = timeline_symbol_counts.get(timeline_key, 0)
+
+        if timeline_key in timeline_errors:
+            detail_text = f"{offset_label}｜决策日 {timeline_date_str}：{timeline_errors[timeline_key]}"
+            end_ts = dt.datetime.now(US_EASTERN).strftime("%H:%M:%S")
+            task_state_local = _merge_task_updates(
+                task_state_local,
+                [
+                    {
+                        "id": task_id,
+                        "name": name,
+                        "status": "失败",
+                        "detail": detail_text,
+                        "end_time": end_ts,
+                        "total_symbols": symbol_count,
+                        "completed_symbols": 0,
+                        "processed_symbols": 0,
+                    }
+                ],
+                target_date=target_date_iso,
+            )
+            tasks_changed = True
+            timeline_reports[timeline_key] = detail_text.split("：", 1)[-1]
+            continue
+
+        if symbol_count <= 0:
+            detail_text = f"{offset_label}｜决策日 {timeline_date_str}：无筛选标的"
+            end_ts = dt.datetime.now(US_EASTERN).strftime("%H:%M:%S")
+            task_state_local = _merge_task_updates(
+                task_state_local,
+                [
+                    {
+                        "id": task_id,
+                        "name": name,
+                        "status": "无数据",
+                        "detail": detail_text,
+                        "end_time": end_ts,
+                        "total_symbols": 0,
+                        "completed_symbols": 0,
+                        "processed_symbols": 0,
+                    }
+                ],
+                target_date=target_date_iso,
+            )
+            tasks_changed = True
+            timeline_reports[timeline_key] = detail_text.split("：", 1)[-1]
+            continue
+
+        start_ts = dt.datetime.now(US_EASTERN).strftime("%H:%M:%S")
+        progress_tracker[timeline_key] = {
+            "total": symbol_count,
+            "completed": 0,
+            "processed": 0,
+        }
         task_state_local = _merge_task_updates(
             task_state_local,
             [
@@ -2640,10 +2702,10 @@ def update_predictions(
                     "id": task_id,
                     "name": name,
                     "status": "进行中",
-                    "detail": f"正在处理 {len(unique_symbols)} 个标的 ({offset_label})",
+                    "detail": f"{offset_label}｜决策日 {timeline_date_str}：正在处理 {symbol_count} 个标的",
                     "start_time": start_ts,
                     "end_time": "",
-                    "total_symbols": len(unique_symbols),
+                    "total_symbols": symbol_count,
                     "completed_symbols": 0,
                     "processed_symbols": 0,
                 }
@@ -2651,10 +2713,12 @@ def update_predictions(
             target_date=target_date_iso,
         )
         tasks_changed = True
-        _emit(f"{name} 已开始。")
+        _emit(f"{name}（决策日 {timeline_date_str}）已开始。")
 
+        metadata_map = timeline_metadata_map.get(timeline_key, {})
+        symbols = list(metadata_map.keys())
         partial_results, partial_missing, partial_errors = _compute_dci_for_symbols(
-            unique_symbols,
+            symbols,
             metadata_map,
             progress_callback=_progress,
             timeline_configs=[cfg],
@@ -2664,8 +2728,7 @@ def update_predictions(
         all_missing.extend(partial_missing)
         all_errors.extend(partial_errors)
 
-        key = str(cfg.get("key"))
-        summary = timeline_summary.get(key) or {}
+        summary = timeline_summary.get(timeline_key) or {}
         success = int(summary.get("success", 0) or 0)
         missing_cnt = int(summary.get("missing", 0) or 0)
         error_cnt = int(summary.get("error", 0) or 0)
@@ -2676,23 +2739,11 @@ def update_predictions(
             parts.append(f"缺数据{missing_cnt}次")
         if error_cnt:
             parts.append(f"失败{error_cnt}次")
-        detail_text = f"{offset_label}：" + ("，".join(parts) if parts else "无数据")
-        tracker_final = progress_tracker.get(timeline_key)
-        total_symbols_for_task = (
-            tracker_final.get("total")
-            if isinstance(tracker_final, dict)
-            else len(unique_symbols)
-        )
-        completed_for_task = (
-            tracker_final.get("completed")
-            if isinstance(tracker_final, dict)
-            else success
-        )
-        processed_for_task = (
-            tracker_final.get("processed")
-            if isinstance(tracker_final, dict)
-            else success + missing_cnt + error_cnt
-        )
+        detail_text = f"{offset_label}｜决策日 {timeline_date_str}：" + ("，".join(parts) if parts else "无数据")
+        tracker_final = progress_tracker.get(timeline_key) or {}
+        total_symbols_for_task = tracker_final.get("total", symbol_count)
+        completed_for_task = tracker_final.get("completed", success)
+        processed_for_task = tracker_final.get("processed", success + missing_cnt + error_cnt)
         if total_symbols_for_task > 0:
             progress_phrase = f"{completed_for_task}/{total_symbols_for_task}"
         else:
@@ -2703,7 +2754,7 @@ def update_predictions(
             else ""
         )
         detail_text = f"{detail_text}｜进度：{progress_phrase}{progress_suffix}"
-        timeline_reports[key] = detail_text
+        timeline_reports[timeline_key] = detail_text.split("：", 1)[-1]
 
         if success:
             status_value = "已完成"
@@ -2733,51 +2784,57 @@ def update_predictions(
         _emit(f"{name} 完成：{detail_text}")
 
     results = sorted(all_results, key=lambda row: (row.get("symbol", ""), row.get("lookback_days", 0)))
-    missing = all_missing
-    errors = all_errors
-    snapshot = RL_MANAGER.snapshot() if RL_MANAGER is not None else None
+    missing = sorted(set(all_missing))
+    errors = sorted(set(all_errors))
 
-    lines = []
+    snapshot = RL_MANAGER.snapshot() if RL_MANAGER is not None else initial_snapshot
+
+    lines: list[str] = []
     if results:
         lines.append(f"已生成 {len(results)} 个预测结果（每个标的最多 {len(PREDICTION_TIMELINES)} 个时点）。")
     else:
-        lines.append("未生成有效预测，请检查 DCI 输入数据。")
+        lines.append("未生成新的预测结果。")
 
     if missing:
-        unique_missing = ", ".join(sorted(set(missing)))
-        lines.append(f"缺少 DCI 输入：{unique_missing}。")
-    if errors:
-        lines.append("计算时出现错误：" + "; ".join(errors))
+        preview_missing = "；".join(missing[:5])
+        if len(missing) > 5:
+            preview_missing += "……"
+        lines.append(f"缺少数据的条目：{preview_missing}")
 
+    if errors:
+        preview_errors = "；".join(errors[:5])
+        if len(errors) > 5:
+            preview_errors += "……"
+        lines.append(f"出现错误的条目：{preview_errors}")
+
+    summary_texts: list[str] = []
     if timeline_reports:
-        lines.append("各时点统计：")
         for cfg in PREDICTION_TIMELINES:
-            key = str(cfg.get("key"))
+            key = str(cfg.get("key") or "")
+            label = str(cfg.get("label") or key)
+            date_value = timeline_dates.get(key)
+            date_str = date_value.isoformat() if isinstance(date_value, dt.date) else "-"
             report = timeline_reports.get(key)
             if report:
-                label = cfg.get("label") or cfg.get("key")
-                lines.append(f"- {label}：{report.split('：', 1)[-1]}")
+                lines.append(f"- {label}（{date_str}）：{report}")
+                summary_texts.append(f"{label} -> {report}")
+    if summary_texts:
+        _emit("时点统计：" + "；".join(summary_texts))
 
     message = "\n".join(lines)
-
-    if timeline_reports:
-        ordered_reports = [timeline_reports.get(str(cfg.get("key"))) for cfg in PREDICTION_TIMELINES]
-        summary_texts = [
-            rep.replace("：", " -> ", 1)
-            for rep in ordered_reports
-            if rep
-        ]
-        if summary_texts:
-            _emit("时点统计：" + "；".join(summary_texts))
 
     log_output = log_entries if log_entries != initial_logs else no_update
 
     task_updates = task_state_local if tasks_changed else no_update
 
-    stored_row_data = effective_rows if isinstance(effective_rows, list) else []
-    _store_prediction_results(target_date, stored_row_data, results, message or "")
+    timeline_sources = {
+        key: value.isoformat() for key, value in timeline_dates.items() if isinstance(value, dt.date)
+    }
+
+    _store_prediction_results(target_date, aggregated_row_data, results, message or "", timeline_sources)
 
     archive_entry = _get_prediction_archive(target_date)
+
     if isinstance(archive_entry, dict):
         evaluation = archive_entry.get("evaluation")
         if isinstance(evaluation, dict):
@@ -2809,8 +2866,6 @@ def update_predictions(
         task_updates,
         log_output,
     )
-
-
 @app.callback(
     Output("prediction-table", "rowData"),
     Input("prediction-store", "data"),
