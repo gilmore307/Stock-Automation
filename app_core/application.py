@@ -150,6 +150,14 @@ def _prepare_unique_archive_path(directory: Path, base_name: str) -> Path:
     return directory / f"{base_name}-{suffix}.json"
 
 
+def _has_valid_ft_session(session_state: dict[str, T.Any] | None) -> bool:
+    if not isinstance(session_state, dict):
+        return False
+    sid = str(session_state.get("sid") or "").strip()
+    ftat = str(session_state.get("ftat") or "").strip()
+    return bool(sid and ftat)
+
+
 def _earnings_archive_file(date_value: dt.date) -> Path:
     return EARNINGS_ARCHIVE_DIR / f"{date_value.isoformat()}.json"
 
@@ -1918,6 +1926,7 @@ def run_login(n_clicks, username, password, twofa, log_state):  # noqa: D401
 def start_run(auto_intervals, selected_date, refresh_clicks, session_data, username, password, twofa, task_state):  # noqa: D401
     trigger = ctx.triggered_id
     session_state = session_data if isinstance(session_data, dict) else {}
+    logged_in = _has_valid_ft_session(session_state)
     manual_refresh = trigger == "earnings-refresh-btn"
     login_trigger = trigger == "ft-session-store"
     if trigger == "auto-run-trigger":
@@ -1934,6 +1943,11 @@ def start_run(auto_intervals, selected_date, refresh_clicks, session_data, usern
             return no_update, no_update, no_update, no_update, no_update, no_update
     else:
         return no_update, no_update, no_update, no_update, no_update, no_update
+
+    if not logged_in and not login_trigger:
+        message = "尚未登录 Firstrade，请先在连接页登录后再刷新财报列表。"
+        logs = append_log([], message)
+        return no_update, logs, message, [], True, no_update
 
     target_date = _coerce_date(selected_date) or us_eastern_today()
     today_limit = us_eastern_today()
@@ -2373,6 +2387,7 @@ def update_predictions(
     use_all_rows = triggered == "table.rowData"
 
     session_data = session_state if isinstance(session_state, dict) else {}
+    logged_in = _has_valid_ft_session(session_data)
     username = (username or "").strip()
     password = (password or "").strip()
     twofa = (twofa or "").strip()
@@ -2391,6 +2406,18 @@ def update_predictions(
         if not message:
             return
         log_entries = append_log(log_entries, message)
+
+    if not logged_in:
+        message = "尚未登录 Firstrade，无法执行预测任务。"
+        _emit(message)
+        log_output = log_entries if log_entries != initial_logs else no_update
+        return (
+            no_update,
+            message,
+            initial_snapshot,
+            no_update,
+            log_output,
+        )
 
     cached_entry = _get_cached_earnings(target_date)
     cached_rows: list[dict[str, T.Any]] = []
