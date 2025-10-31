@@ -1,0 +1,126 @@
+{
+  "AAPL": {
+    "snapshots": {
+      "minus14": {
+        "factors": {
+          "EPS_Rev_30d": 0.8,
+          "Sales_Rev_30d": 0.3,
+          "Guide_Drift": 0.1,
+          "Backlog_Bookings_Delta": 0.05,
+          "GM_YoY_Delta": 0.4,
+          "OPM_YoY_Delta": 0.35,
+          "FCF_Margin_Slope": 0.5,
+          "Ret20_rel": 0.6,
+          "Ret60_rel": 0.4,
+          "UDVol20": -0.15,
+          "Value_vs_Sector": -0.25,
+          "EarningsYield_vs_Sector": -0.05
+        },
+        "z_cons": 0.1,
+        "z_narr": -0.05,
+        "CI": 40,
+        "Q": 70,
+        "D": 0.3,
+        "EM_pct": 6.8,
+        "S_stab": 0.65,
+        "shock_flag": 0
+      },
+      "minus7": {
+        "factors": {
+          "EPS_Rev_30d": 0.95,
+          "Sales_Rev_30d": 0.45,
+          "Guide_Drift": 0.2,
+          "Backlog_Bookings_Delta": 0.08,
+          "GM_YoY_Delta": 0.45,
+          "OPM_YoY_Delta": 0.38,
+          "FCF_Margin_Slope": 0.55,
+          "Ret20_rel": 0.7,
+          "Ret60_rel": 0.42,
+          "UDVol20": -0.18,
+          "Value_vs_Sector": -0.28,
+          "EarningsYield_vs_Sector": -0.08
+        },
+        "z_cons": 0.18,
+        "z_narr": 0.05,
+        "CI": 44,
+        "Q": 71,
+        "D": 0.27,
+        "EM_pct": 6.6,
+        "S_stab": 0.7,
+        "shock_flag": 0
+      },
+      "minus3": {
+        "factors": {
+          "EPS_Rev_30d": 1.05,
+          "Sales_Rev_30d": 0.5,
+          "Guide_Drift": 0.28,
+          "Backlog_Bookings_Delta": 0.09,
+          "GM_YoY_Delta": 0.5,
+          "OPM_YoY_Delta": 0.42,
+          "FCF_Margin_Slope": 0.62,
+          "Ret20_rel": 0.78,
+          "Ret60_rel": 0.46,
+          "UDVol20": -0.22,
+          "Value_vs_Sector": -0.3,
+          "EarningsYield_vs_Sector": -0.1
+        },
+        "z_cons": 0.25,
+        "z_narr": 0.1,
+        "CI": 47,
+        "Q": 72,
+        "D": 0.24,
+        "EM_pct": 6.3,
+        "S_stab": 0.74,
+        "shock_flag": 0
+      },
+      "minus1": {
+        "factors": {
+          "EPS_Rev_30d": 1.1,
+          "Sales_Rev_30d": 0.52,
+          "Guide_Drift": 0.32,
+          "Backlog_Bookings_Delta": 0.1,
+          "GM_YoY_Delta": 0.55,
+          "OPM_YoY_Delta": 0.44,
+          "FCF_Margin_Slope": 0.68,
+          "Ret20_rel": 0.82,
+          "Ret60_rel": 0.5,
+          "UDVol20": -0.24,
+          "Value_vs_Sector": -0.32,
+          "EarningsYield_vs_Sector": -0.12
+        },
+        "z_cons": 0.32,
+        "z_narr": 0.12,
+        "CI": 49,
+        "Q": 73,
+        "D": 0.22,
+        "EM_pct": 6.0,
+        "S_stab": 0.78,
+        "shock_flag": 0
+      },
+      "decision_day": {
+        "factors": {
+          "EPS_Rev_30d": 1.2,
+          "Sales_Rev_30d": 0.55,
+          "Guide_Drift": 0.35,
+          "Backlog_Bookings_Delta": 0.12,
+          "GM_YoY_Delta": 0.6,
+          "OPM_YoY_Delta": 0.48,
+          "FCF_Margin_Slope": 0.7,
+          "Ret20_rel": 0.85,
+          "Ret60_rel": 0.52,
+          "UDVol20": -0.26,
+          "Value_vs_Sector": -0.33,
+          "EarningsYield_vs_Sector": -0.15
+        },
+        "z_cons": 0.4,
+        "z_narr": 0.2,
+        "CI": 48,
+        "Q": 72,
+        "D": 0.25,
+        "EM_pct": 6.5,
+        "S_stab": 0.75,
+        "shock_flag": 0
+      }
+    }
+  }
+}
