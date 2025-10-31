@@ -134,7 +134,7 @@ FACTOR_DESCRIPTIONS: dict[str, str] = {
     "EarningsYield_vs_Sector": "相对于行业的盈利收益率。",
 }
 
-TASK_ORDER = ["fetch"] + [f"predict::{cfg['key']}" for cfg in PREDICTION_TIMELINES]
+TASK_ORDER = [f"predict::{cfg['key']}" for cfg in PREDICTION_TIMELINES]
 
 VALIDATION_PARAMETER_SPECS: list[dict[str, T.Any]] = [
     {"label": "方向", "field": "direction", "fmt": "text", "actual_field": "actual_direction"},
@@ -347,9 +347,7 @@ def _build_validation_figures(
                 fig_prob.add_hline(y=move_value, line_dash="dot", line_color="firebrick", name="实际涨跌幅")
 
     return fig_dci, fig_prob
-TASK_TEMPLATES = {
-    "fetch": {"id": "fetch", "name": "获取财报列表"},
-}
+TASK_TEMPLATES: dict[str, dict[str, T.Any]] = {}
 for _timeline_cfg in PREDICTION_TIMELINES:
     _key = str(_timeline_cfg.get("key"))
     TASK_TEMPLATES[f"predict::{_key}"] = {
@@ -423,7 +421,7 @@ def _merge_task_updates(
             if previous.get("end_time") and not norm.get("end_time"):
                 norm["end_time"] = previous.get("end_time")
 
-        norm.setdefault("updated_at", now_ts)
+        norm["updated_at"] = now_ts
 
         current_map[task_id] = norm
 
@@ -1722,7 +1720,6 @@ def start_run(auto_intervals, selected_date, refresh_clicks, session_data, usern
     if target_date < min_allowed:
         target_date = min_allowed
 
-    fetch_name = f"{target_date.strftime('%m月%d日')} 的财报列表"
     target_date_iso = target_date.isoformat()
 
     cache_entry = _get_cached_earnings(target_date)
@@ -1778,15 +1775,7 @@ def start_run(auto_intervals, selected_date, refresh_clicks, session_data, usern
 
         tasks = _merge_task_updates(
             task_state,
-            [
-                {
-                    "id": "fetch",
-                    "name": fetch_name,
-                    "status": "已完成",
-                    "detail": f"命中 {target_date} 的本地缓存",
-                },
-                *timeline_updates,
-            ],
+            timeline_updates,
             target_date=target_date_iso,
         )
         return None, logs, status_out, row_data, True, tasks
@@ -1814,83 +1803,76 @@ def start_run(auto_intervals, selected_date, refresh_clicks, session_data, usern
         status_message = f"正在刷新 {target_date} 的财报列表……"
     else:
         status_message = f"开始获取 {target_date} 的数据……"
+    waiting_detail = "等待财报列表完成后执行"
+    if login_trigger and bypass_cache:
+        waiting_detail = f"检测到登录，重新筛选 {target_date} 的数据后执行"
+    elif manual_refresh:
+        waiting_detail = f"手动刷新 -> 正在获取 {target_date} 的数据"
+    else:
+        waiting_detail = f"正在获取 {target_date} 的数据"
+
     timeline_waiting = []
-    for cfg in PREDICTION_TIMELINES:
+    for idx, cfg in enumerate(PREDICTION_TIMELINES, start=1):
         task_id, name, offset_label = _describe_timeline_task(target_date, cfg)
+        detail_text = waiting_detail if idx == 1 else f"等待前序任务完成后执行 {offset_label}"
         timeline_waiting.append(
             {
                 "id": task_id,
                 "name": name,
                 "status": "等待",
-                "detail": f"等待财报列表完成后执行 {offset_label}",
+                "detail": detail_text,
             }
         )
 
-    if login_trigger and bypass_cache:
-        fetch_detail = f"检测到登录，重新筛选 {target_date} 的财报列表"
-    elif manual_refresh:
-        fetch_detail = f"手动刷新 -> 正在获取 {target_date} 的财报列表"
-    else:
-        fetch_detail = f"正在获取 {target_date} 的财报列表"
-
     tasks = _merge_task_updates(
         task_state,
-        [
-            {
-                "id": "fetch",
-                "name": fetch_name,
-                "status": "进行中",
-                "detail": fetch_detail,
-            },
-            *timeline_waiting,
-        ],
+        timeline_waiting,
         target_date=target_date_iso,
     )
     return run_id, [], status_message, [], False, tasks
 
 
-def _execute_run(
-    run_id: str,
+def _prepare_earnings_dataset(
+    target_date: dt.date,
+    session_state: dict[str, T.Any] | None,
     username: str,
     password: str,
     twofa: str,
-    session_state: dict[str, T.Any],
-    target_date: dt.date,
-) -> None:
+    logger: T.Callable[[str], None] | None = None,
+) -> tuple[list[dict[str, T.Any]], str | None, dict[str, T.Any] | None, bool, str | None]:
+    """获取并筛选指定日期的财报列表。"""
+
+    def _log(message: str) -> None:
+        if logger:
+            try:
+                logger(message)
+            except Exception:  # pragma: no cover - logging best effort
+                pass
+
     actual_today = us_eastern_today()
     tomorrow_target = next_trading_day(target_date)
     fri = this_friday(target_date)
-    _append_run_log(run_id, f"已开始获取 {target_date} 的数据。")
-    _update_run_state(run_id, status="正在请求 Nasdaq 财报数据……")
+    _log(f"已开始获取 {target_date} 的数据。")
 
     try:
         df = build_targets(target_date)
-        _append_run_log(run_id, f"从 Nasdaq API 获取到 {len(df)} 个标的。")
+        _log(f"从 Nasdaq API 获取到 {len(df)} 个标的。")
         for idx, row in df.iterrows():
-            _append_run_log(run_id, f"准备标的 #{idx + 1}：{row['symbol']}（{row['bucket']}）")
-        _update_run_state(run_id, status=f"已获取 {len(df)} 个标的，准备检查周度期权……")
+            _log(f"准备标的 #{idx + 1}：{row['symbol']}（{row['bucket']}）")
     except Exception as exc:  # pragma: no cover - network errors
-        _append_run_log(run_id, f"获取 Nasdaq 数据时出错：{exc}")
-        status_msg = f"【错误】获取 Nasdaq 数据失败：{exc}"
-        _update_run_state(
-            run_id,
-            rowData=[],
-            status=status_msg,
-            session_state=NO_UPDATE_SENTINEL,
-            completed=True,
-        )
-        return
+        _log(f"获取 Nasdaq 数据时出错：{exc}")
+        return [], None, session_state or {}, False, f"获取 Nasdaq 数据失败：{exc}"
 
     attempted_ft = False
     ft_ok = False
     ft_error: str | None = None
-    store_out: T.Any = NO_UPDATE_SENTINEL
+    store_out: dict[str, T.Any] | None = None
     session_state = session_state or {}
     options_filter_applied = False
 
-    if session_state:
+    if session_state and username and password:
         attempted_ft = True
-        _append_run_log(run_id, "使用已保存的 Firstrade 会话检查周度期权。")
+        _log("使用已保存的 Firstrade 会话检查周度期权。")
         try:
             ft = FTClient(
                 username=username,
@@ -1898,17 +1880,16 @@ def _execute_run(
                 twofa_code=(twofa or None),
                 session_state=session_state,
                 login=False,
-                logger=lambda message: _append_run_log(run_id, message),
+                logger=_log,
             )
             ft_ok = ft.enabled
             ft_error = ft.error
             if ft_ok:
-                _append_run_log(run_id, f"开始为 {len(df)} 个标的查询周度期权。")
+                _log(f"开始为 {len(df)} 个标的查询周度期权。")
                 weekly: list[T.Optional[bool]] = []
                 symbols = df["symbol"].tolist()
                 for idx, sym in enumerate(symbols, start=1):
-                    _append_run_log(run_id, f"检查标的 #{idx}：{sym} 是否有周五到期期权")
-                    _update_run_state(run_id, status=f"正在检查周度期权 {idx}/{len(symbols)}……")
+                    _log(f"检查标的 #{idx}：{sym} 是否有周五到期期权")
                     try:
                         has_w = ft.has_weekly_expiring_on(sym, fri)
                     except Exception:  # pragma: no cover - network errors
@@ -1919,31 +1900,31 @@ def _execute_run(
                     options_filter_applied = any(value is not None for value in weekly)
                 else:
                     options_filter_applied = True
-                _append_run_log(run_id, "周度期权查询完成。")
+                _log("周度期权查询完成。")
                 exported = ft.export_session_state() or session_state
-                store_out = exported if exported else NO_UPDATE_SENTINEL
+                store_out = exported if exported else session_state
             else:
                 df["weekly_exp_this_fri"] = None
-                _append_run_log(
-                    run_id,
-                    f"Firstrade 会话失效：{ft_error or '未知错误'}，已清除缓存。",
-                )
+                _log(f"Firstrade 会话失效：{ft_error or '未知错误'}，已清除缓存。")
                 store_out = {}
         except Exception as exc:  # pragma: no cover - network errors
             ft_error = str(exc)
             df["weekly_exp_this_fri"] = None
-            _append_run_log(run_id, f"查询 Firstrade 数据时出错：{ft_error}。")
+            _log(f"查询 Firstrade 数据时出错：{ft_error}。")
             store_out = {}
     else:
         df["weekly_exp_this_fri"] = None
-        _append_run_log(run_id, "未保存 Firstrade 会话，跳过周度期权检查。")
+        if session_state:
+            _log("检测到 Firstrade 会话但缺少凭证，跳过周度期权检查。")
+        else:
+            _log("未保存 Firstrade 会话，跳过周度期权检查。")
 
     if "weekly_exp_this_fri" in df.columns:
         before_count = len(df)
         df = df[df["weekly_exp_this_fri"].ne(False)].reset_index(drop=True)
         removed = before_count - len(df)
         if removed:
-            _append_run_log(run_id, f"过滤掉 {removed} 个无周五到期期权的标的。")
+            _log(f"过滤掉 {removed} 个无周五到期期权的标的。")
         df = df.drop(columns=["weekly_exp_this_fri"])
 
     status_lines = [
@@ -1964,18 +1945,55 @@ def _execute_run(
 
     row_records = df.to_dict("records")
     status_text = "\n".join(status_lines)
+
+    if store_out is None:
+        store_out = session_state
+
+    return row_records, status_text, store_out, options_filter_applied, None
+
+
+def _execute_run(
+    run_id: str,
+    username: str,
+    password: str,
+    twofa: str,
+    session_state: dict[str, T.Any],
+    target_date: dt.date,
+) -> None:
+    _update_run_state(run_id, status="正在请求 Nasdaq 财报数据……")
+
+    rows, status_text, session_out, options_filter_applied, error_msg = _prepare_earnings_dataset(
+        target_date,
+        session_state,
+        username,
+        password,
+        twofa,
+        logger=lambda message: _append_run_log(run_id, message),
+    )
+
+    if error_msg:
+        status_msg = f"【错误】{error_msg}"
+        _update_run_state(
+            run_id,
+            rowData=[],
+            status=status_msg,
+            session_state=NO_UPDATE_SENTINEL,
+            completed=True,
+        )
+        return
+
     _update_run_state(
         run_id,
-        rowData=row_records,
-        status=status_text,
-        session_state=store_out,
+        rowData=rows,
+        status=status_text or "",
+        session_state=session_out if session_out is not None else NO_UPDATE_SENTINEL,
         completed=True,
         options_filter_applied=options_filter_applied,
     )
     _store_cached_earnings(
         target_date,
-        row_records,
-        status_text,
+        rows,
+        status_text or "",
         options_filter_applied=options_filter_applied,
     )
 
@@ -2038,37 +2056,36 @@ def poll_run_state(n_intervals, run_id, existing_logs, current_rows, task_state)
     task_updates: list[dict[str, T.Any]] = []
     target_date = state.get("target_date")
     target_date_str = target_date.isoformat() if isinstance(target_date, dt.date) else None
-    fetch_name = None
-    if isinstance(target_date, dt.date):
-        fetch_name = f"{target_date.strftime('%m月%d日')} 的财报列表"
-
-    if isinstance(status, str) and "错误" in status:
-        task_updates.append({"id": "fetch", "name": fetch_name, "status": "失败", "detail": status})
-        if isinstance(target_date, dt.date):
-            for cfg in PREDICTION_TIMELINES:
-                task_id, name, offset_label = _describe_timeline_task(target_date, cfg)
-                task_updates.append(
-                    {
-                        "id": task_id,
-                        "name": name,
-                        "status": "失败",
-                        "detail": f"财报列表失败，无法执行 {offset_label}",
-                    }
-                )
-    if isinstance(row_data, list) and row_data != current_rows:
-        detail = f"共 {len(row_data)} 个标的"
-        task_updates.append({"id": "fetch", "name": fetch_name, "status": "已完成", "detail": detail})
-        if isinstance(target_date, dt.date):
-            for cfg in PREDICTION_TIMELINES:
-                task_id, name, offset_label = _describe_timeline_task(target_date, cfg)
-                task_updates.append(
-                    {
-                        "id": task_id,
-                        "name": name,
-                        "status": "进行中",
-                        "detail": f"准备生成 {offset_label} 预测 ({len(row_data)} 个标的)",
-                    }
-                )
+    if isinstance(status, str) and "错误" in status and isinstance(target_date, dt.date):
+        for cfg in PREDICTION_TIMELINES:
+            task_id, name, offset_label = _describe_timeline_task(target_date, cfg)
+            task_updates.append(
+                {
+                    "id": task_id,
+                    "name": name,
+                    "status": "失败",
+                    "detail": f"财报列表失败，无法执行 {offset_label}",
+                }
+            )
+    if isinstance(row_data, list) and row_data != current_rows and isinstance(target_date, dt.date):
+        options_flag = state.get("options_filter_applied")
+        base_detail = f"财报列表就绪，共 {len(row_data)} 个标的"
+        if options_flag is False:
+            base_detail += "（未进行周五期权筛选）"
+        for idx, cfg in enumerate(PREDICTION_TIMELINES, start=1):
+            task_id, name, offset_label = _describe_timeline_task(target_date, cfg)
+            if idx == 1:
+                detail_text = base_detail
+            else:
+                detail_text = f"等待前序任务完成后执行 {offset_label}"
+            task_updates.append(
+                {
+                    "id": task_id,
+                    "name": name,
+                    "status": "等待",
+                    "detail": detail_text,
+                }
+            )
 
     tasks_out = (
         _merge_task_updates(task_state, task_updates, target_date=target_date_str)
@@ -2090,51 +2107,164 @@ def poll_run_state(n_intervals, run_id, existing_logs, current_rows, task_state)
     State("task-store", "data"),
     State("earnings-date-picker", "date"),
     State("log-store", "data"),
+    State("ft-session-store", "data"),
+    State("ft-username", "value"),
+    State("ft-password", "value"),
+    State("ft-twofa", "value"),
     prevent_initial_call="initial_duplicate",
 )
-def update_predictions(selected_rows, row_data, task_state, picker_date, log_state):  # noqa: D401
+def update_predictions(
+    selected_rows,
+    row_data,
+    task_state,
+    picker_date,
+    log_state,
+    session_state,
+    username,
+    password,
+    twofa,
+):  # noqa: D401
     initial_snapshot = RL_MANAGER.snapshot() if RL_MANAGER is not None else None
     triggered = ctx.triggered_id
     task_state_local = task_state if isinstance(task_state, dict) else {"tasks": []}
+    tasks_changed = False
 
     if triggered == "table.selectedRows" and not selected_rows:
         return no_update, no_update, no_update, no_update, no_update
 
     use_all_rows = triggered == "table.rowData"
-    symbols: list[str] = []
-    metadata_map: dict[str, dict[str, T.Any]] = {}
 
-    if use_all_rows:
-        if isinstance(row_data, list):
-            for row in row_data:
-                if isinstance(row, dict) and row.get("symbol"):
-                    symbol = str(row["symbol"])
-                    symbols.append(symbol)
-                    metadata_map[symbol.upper()] = row
-    else:
-        if selected_rows:
-            for row in selected_rows:
-                if isinstance(row, dict) and row.get("symbol"):
-                    symbol = str(row["symbol"])
-                    symbols.append(symbol)
-                    metadata_map.setdefault(symbol.upper(), row)
+    session_data = session_state if isinstance(session_state, dict) else {}
+    username = (username or "").strip()
+    password = (password or "").strip()
+    twofa = (twofa or "").strip()
 
-    unique_symbols = list(dict.fromkeys([s.upper() for s in symbols if s]))
-    if not unique_symbols:
-        message = "自动任务尚未选择标的，请等待财报列表加载。" if use_all_rows else "未选择标的。"
-        return (
-            {"results": [], "missing": [], "errors": [], "rl_snapshot": initial_snapshot},
-            message,
-            initial_snapshot,
-            no_update,
-            no_update,
-        )
+    table_rows = row_data if isinstance(row_data, list) else []
+    selected_rows_list = selected_rows if isinstance(selected_rows, list) else []
 
     target_date = _coerce_date(picker_date) or us_eastern_today()
     target_date_iso = target_date.isoformat()
 
-    log_state = log_state if isinstance(log_state, list) else []
-    progress_messages: list[str] = []
+    initial_logs = log_state if isinstance(log_state, list) else []
+    log_entries = initial_logs
+
+    def _emit(message: str) -> None:
+        nonlocal log_entries
+        if not message:
+            return
+        log_entries = append_log(log_entries, message)
+
+    cached_entry = _get_cached_earnings(target_date)
+    cached_rows: list[dict[str, T.Any]] = []
+    cached_options_flag: bool | None = None
+    if isinstance(cached_entry, dict):
+        payload = cached_entry.get("rowData")
+        if isinstance(payload, list):
+            cached_rows = payload
+        cached_options_flag = cached_entry.get("options_filter_applied")
+
+    effective_rows = table_rows if table_rows else cached_rows
+
+    needs_refresh = False
+    if not effective_rows:
+        needs_refresh = True
+    elif cached_options_flag is False and session_data:
+        needs_refresh = True
+
+    if needs_refresh:
+        _emit(f"未找到已筛选的财报列表，自动刷新 {target_date} 的数据。")
+        fetched_rows, status_text, _, options_applied, error_message = _prepare_earnings_dataset(
+            target_date,
+            session_data,
+            username,
+            password,
+            twofa,
+            logger=_emit,
+        )
+        if error_message:
+            failure_detail = f"自动获取财报列表失败：{error_message}"
+            _emit(failure_detail)
+            failure_updates = []
+            for cfg in PREDICTION_TIMELINES:
+                task_id, name, offset_label = _describe_timeline_task(target_date, cfg)
+                failure_updates.append(
+                    {
+                        "id": task_id,
+                        "name": name,
+                        "status": "失败",
+                        "detail": f"财报列表异常，跳过 {offset_label}",
+                    }
+                )
+            task_state_local = _merge_task_updates(task_state_local, failure_updates, target_date=target_date_iso)
+            tasks_changed = True
+            log_output = log_entries if log_entries != initial_logs else no_update
+            return (
+                {"results": [], "missing": [], "errors": [], "rl_snapshot": initial_snapshot},
+                failure_detail,
+                initial_snapshot,
+                task_state_local,
+                log_output,
+            )
+        effective_rows = fetched_rows
+        cached_options_flag = options_applied
+        if status_text:
+            _emit(status_text)
+        _store_cached_earnings(
+            target_date,
+            fetched_rows,
+            status_text or "",
+            options_filter_applied=cached_options_flag,
+        )
+    elif use_all_rows and table_rows:
+        _emit(f"使用当前表格中的财报列表，共 {len(table_rows)} 个标的。")
+
+    metadata_map: dict[str, dict[str, T.Any]] = {}
+    for row in effective_rows:
+        if isinstance(row, dict) and row.get("symbol"):
+            metadata_map[str(row["symbol"]).upper()] = row
+
+    symbols: list[str] = []
+    source_rows = effective_rows if use_all_rows else selected_rows_list
+    for row in source_rows:
+        if isinstance(row, dict) and row.get("symbol"):
+            symbol = str(row["symbol"])
+            symbols.append(symbol)
+            metadata_map.setdefault(symbol.upper(), row)
+
+    if use_all_rows and not symbols and effective_rows:
+        for row in effective_rows:
+            if isinstance(row, dict) and row.get("symbol"):
+                symbol = str(row["symbol"])
+                symbols.append(symbol)
+                metadata_map.setdefault(symbol.upper(), row)
+
+    unique_symbols = list(dict.fromkeys([s.upper() for s in symbols if s]))
+    if not unique_symbols:
+        message = "自动任务尚未选择标的，请等待财报列表加载。" if use_all_rows else "未选择标的。"
+        if use_all_rows and not effective_rows:
+            failure_updates = []
+            for cfg in PREDICTION_TIMELINES:
+                task_id, name, offset_label = _describe_timeline_task(target_date, cfg)
+                failure_updates.append(
+                    {
+                        "id": task_id,
+                        "name": name,
+                        "status": "失败",
+                        "detail": f"未获取到财报列表，跳过 {offset_label}",
+                    }
+                )
+            task_state_local = _merge_task_updates(task_state_local, failure_updates, target_date=target_date_iso)
+            tasks_changed = True
+        log_output = log_entries if log_entries != initial_logs else no_update
+        task_output = task_state_local if tasks_changed else no_update
+        return (
+            {"results": [], "missing": [], "errors": [], "rl_snapshot": initial_snapshot},
+            message,
+            initial_snapshot,
+            task_output,
+            log_output,
+        )
+
     timeline_summary: dict[str, dict[str, T.Any]] = {
         str(cfg.get("key")): {"label": cfg.get("label"), "success": 0, "missing": 0, "error": 0}
         for cfg in PREDICTION_TIMELINES
@@ -2165,7 +2295,8 @@ def update_predictions(selected_rows, row_data, task_state, picker_date, log_sta
             detail_text = f"：{detail}" if detail else ""
             message = f"{symbol} 的 {label} 预测失败{detail_text}。"
         if message:
-            progress_messages.append(message)
+            _emit(message)
+
     for cfg in PREDICTION_TIMELINES:
         task_id, name, offset_label = _describe_timeline_task(target_date, cfg)
         start_ts = dt.datetime.now(US_EASTERN).strftime("%H:%M:%S")
@@ -2183,7 +2314,8 @@ def update_predictions(selected_rows, row_data, task_state, picker_date, log_sta
             ],
             target_date=target_date_iso,
         )
-        progress_messages.append(f"{name} 已开始。")
+        tasks_changed = True
+        _emit(f"{name} 已开始。")
 
         partial_results, partial_missing, partial_errors = _compute_dci_for_symbols(
             unique_symbols,
@@ -2232,7 +2364,8 @@ def update_predictions(selected_rows, row_data, task_state, picker_date, log_sta
             ],
             target_date=target_date_iso,
         )
-        progress_messages.append(f"{name} 完成：{detail_text}")
+        tasks_changed = True
+        _emit(f"{name} 完成：{detail_text}")
 
     results = sorted(all_results, key=lambda row: (row.get("symbol", ""), row.get("lookback_days", 0)))
     missing = all_missing
@@ -2270,19 +2403,13 @@ def update_predictions(selected_rows, row_data, task_state, picker_date, log_sta
             if rep
         ]
         if summary_texts:
-            progress_messages.append(
-                "时点统计：" + "；".join(summary_texts)
-            )
+            _emit("时点统计：" + "；".join(summary_texts))
 
-    new_logs = log_state
-    for text in progress_messages:
-        new_logs = append_log(new_logs, text)
-    log_output = new_logs if new_logs != log_state else no_update
+    log_output = log_entries if log_entries != initial_logs else no_update
 
-    task_updates = task_state_local
+    task_updates = task_state_local if tasks_changed else no_update
 
-    target_date = _coerce_date(picker_date) or us_eastern_today()
-    stored_row_data = row_data if isinstance(row_data, list) else []
+    stored_row_data = effective_rows if isinstance(effective_rows, list) else []
     _store_prediction_results(target_date, stored_row_data, results, message or "")
 
     archive_entry = _get_prediction_archive(target_date)
