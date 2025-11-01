@@ -2261,17 +2261,24 @@ def _prepare_earnings_dataset(
 
     option_cache: dict[str, tuple[T.Optional[bool], T.Optional[str], bool]] = {}
     option_notes: dict[str, dict[str, T.Any]] = {}
-    weekly_rows: list[dict[str, T.Any]] = []
-    fallback_rows: list[dict[str, T.Any]] = []
+    matched_rows: list[dict[str, T.Any]] = []
     error_message = ""
     options_checked = False
     selection_mode = "pending"
 
     if ft_client and ft_client.enabled:
-        expiry_date = this_friday(target_date)
+        decision_day, _ = _shift_weekend_to_monday(target_date)
+        reference_day = next_trading_day(decision_day)
+        expiry_date = this_friday(reference_day)
+        _log(
+            "Firstrade 周五筛选目标：%s（参考日：%s）。"
+            % (expiry_date.isoformat(), reference_day.isoformat())
+        )
         skipped_symbols: list[str] = []
         missing_symbols: list[str] = []
         non_weekly_symbols: list[str] = []
+        weekly_count = 0
+        non_weekly_count = 0
         for entry in base_rows:
             symbol = str(entry.get("symbol") or "").upper()
             if not symbol:
@@ -2289,19 +2296,19 @@ def _prepare_earnings_dataset(
             options_checked = True
 
             notes = option_notes.setdefault(symbol, {})
-            notes["weekly"] = bool(has_weekly)
-            if expiry_type:
-                notes["expiry_type"] = expiry_type
-
-            if has_weekly:
-                weekly_rows.append(entry)
-                continue
 
             if matched:
-                fallback_rows.append(entry)
-                label = f"{symbol}（类型 {expiry_type or '未知'}）"
-                if label not in non_weekly_symbols:
-                    non_weekly_symbols.append(label)
+                notes["weekly"] = bool(has_weekly)
+                if expiry_type:
+                    notes["expiry_type"] = expiry_type
+                matched_rows.append(entry)
+                if has_weekly:
+                    weekly_count += 1
+                else:
+                    non_weekly_count += 1
+                    label = f"{symbol}（类型 {expiry_type or '未知'}）"
+                    if label not in non_weekly_symbols:
+                        non_weekly_symbols.append(label)
             else:
                 if symbol not in missing_symbols:
                     missing_symbols.append(symbol)
@@ -2311,16 +2318,13 @@ def _prepare_earnings_dataset(
             suffix = "…" if len(skipped_symbols) > 5 else ""
             _log(f"部分标的缺少周五期权信息，已跳过：{preview}{suffix}。")
 
-        if weekly_rows:
-            selection_mode = "weekly"
-            _log(f"Firstrade 筛选完成，保留 {len(weekly_rows)} 条记录。")
-            base_rows = weekly_rows
-        elif fallback_rows:
-            selection_mode = "fallback"
+        if matched_rows:
+            selection_mode = "matched"
             _log(
-                f"目标日期未检测到周度期权，保留 {len(fallback_rows)} 条其他类型合约记录。"
+                "Firstrade 筛选完成，保留 %d 条记录（周度 %d，其他 %d）。"
+                % (len(matched_rows), weekly_count, non_weekly_count)
             )
-            base_rows = fallback_rows
+            base_rows = matched_rows
         else:
             base_rows = []
             if options_checked:
@@ -2349,13 +2353,9 @@ def _prepare_earnings_dataset(
         if selection_mode == "pending":
             status_text = f"{target_date.strftime('%Y-%m-%d')} 未完成 Firstrade 周五期权筛选。"
             return [], status_text, session_out, False, ""
-        if selection_mode == "weekly":
+        if selection_mode == "matched":
             status_text = (
                 f"{target_date.strftime('%Y-%m-%d')} 筛选周五期权后保留 {len(base_rows)} 个标的。"
-            )
-        elif selection_mode == "fallback":
-            status_text = (
-                f"{target_date.strftime('%Y-%m-%d')} 未找到周度期权，保留 {len(base_rows)} 个标的。"
             )
         else:
             status_text = f"{target_date.strftime('%Y-%m-%d')} 筛选后暂无符合条件的标的。"
@@ -2391,7 +2391,7 @@ def _prepare_earnings_dataset(
             row["sector"] = sector
         rows_out.append(row)
 
-    options_applied = selection_mode in {"weekly", "fallback", "empty"}
+    options_applied = selection_mode in {"matched", "empty"}
     return rows_out, status_text, session_out, options_applied, ""
 
 def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data, username, password, twofa, task_state):  # noqa: D401
