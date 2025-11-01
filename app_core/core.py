@@ -2103,6 +2103,189 @@ def _check_resource_connections(ft_session: dict[str, T.Any] | None) -> list[dic
     return statuses
 
 
+def _format_decimal(value: T.Any, digits: int = 4) -> str:
+    """Format numeric values with trimmed trailing zeros."""
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "—" if value in {None, ""} else str(value)
+
+    if math.isnan(number) or math.isinf(number):
+        return str(number)
+
+    formatted = f"{number:.{digits}f}".rstrip("0").rstrip(".")
+    return formatted or "0"
+
+
+def _extract_factor_source(
+    factor_payload: T.Any, symbol_payload: dict[str, T.Any]
+) -> str:
+    """Best-effort extraction of the data source tag for a factor."""
+
+    if isinstance(factor_payload, dict):
+        for key in ("source", "__source__", "provider"):
+            candidate = factor_payload.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+
+    for key in ("source", "__source__", "provider"):
+        candidate = symbol_payload.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+
+    return ""
+
+
+def _format_factor_value(payload: T.Any) -> str:
+    """Render the main numeric content for a factor payload."""
+
+    if isinstance(payload, dict):
+        parts: list[str] = []
+
+        if payload.get("z") is not None:
+            parts.append(f"z={_format_decimal(payload.get('z'))}")
+
+        value_present = payload.get("value") is not None
+        if value_present:
+            parts.append(f"value={_format_decimal(payload.get('value'))}")
+
+        median = payload.get("median")
+        mad = payload.get("mad")
+        extras: list[str] = []
+        if value_present and median is not None:
+            extras.append(f"median={_format_decimal(median)}")
+        if value_present and mad is not None:
+            extras.append(f"mad={_format_decimal(mad)}")
+        if extras:
+            parts.append(" / ".join(extras))
+
+        if not parts:
+            for key, candidate in payload.items():
+                if key in {"z", "value", "median", "mad"}:
+                    continue
+                if isinstance(candidate, (int, float)):
+                    parts.append(f"{key}={_format_decimal(candidate)}")
+            if not parts and payload:
+                parts.append(str(payload))
+
+        return "；".join(parts) if parts else "—"
+
+    if isinstance(payload, (int, float)):
+        return _format_decimal(payload)
+
+    if payload in {None, ""}:
+        return "—"
+
+    return str(payload)
+
+
+def _collect_factor_source_rows() -> tuple[list[dict[str, str]], str | None]:
+    """Return rows describing factor values and their origins."""
+
+    payloads = _load_dci_payloads()
+    factor_names = list(BASE_FACTOR_WEIGHTS.keys())
+
+    if not payloads:
+        rows = [
+            {"factor": name, "value": "—", "source": "未载入数据"}
+            for name in factor_names
+        ]
+        return rows, "未载入任何 DCI 输入数据，显示占位结果。"
+
+    sorted_payloads = sorted(payloads.items(), key=lambda item: str(item[0]))
+    rows: list[dict[str, str]] = []
+    missing: list[str] = []
+
+    for factor_name in factor_names:
+        best_with_source: dict[str, str] | None = None
+        fallback_entry: dict[str, str] | None = None
+
+        for symbol, symbol_payload in sorted_payloads:
+            if not isinstance(symbol_payload, dict):
+                continue
+            factors = symbol_payload.get("factors")
+            if not isinstance(factors, dict):
+                continue
+            factor_payload = factors.get(factor_name)
+            if factor_payload is None:
+                continue
+
+            source = _extract_factor_source(factor_payload, symbol_payload)
+            value_text = _format_factor_value(factor_payload)
+            if symbol:
+                value_text = f"{value_text}｜{symbol}"
+
+            entry = {
+                "factor": factor_name,
+                "value": value_text,
+                "source": source or "—",
+            }
+
+            if source:
+                best_with_source = entry
+                break
+            if fallback_entry is None:
+                fallback_entry = entry
+
+        if best_with_source:
+            rows.append(best_with_source)
+        elif fallback_entry:
+            rows.append(fallback_entry)
+        else:
+            rows.append({"factor": factor_name, "value": "—", "source": "—"})
+            missing.append(factor_name)
+
+    note: str | None = None
+    if missing:
+        missing_text = "，".join(missing)
+        note = f"以下因子未找到数据：{missing_text}"
+
+    return rows, note
+
+
+def _render_factor_preview_table(rows: list[dict[str, str]]) -> html.Div:
+    """Split rows into three columns of tables for compact display."""
+
+    columns: list[list[dict[str, str]]] = [[], [], []]
+    for idx, row in enumerate(rows):
+        columns[idx % 3].append(row)
+
+    column_components: list[dbc.Col] = []
+    for col_rows in columns:
+        if not col_rows:
+            continue
+        table_rows = [
+            html.Tr(
+                [
+                    html.Td(entry.get("factor", "")),
+                    html.Td(entry.get("value", "")),
+                    html.Td(entry.get("source", "")),
+                ]
+            )
+            for entry in col_rows
+        ]
+        table = dbc.Table(
+            [
+                html.Thead(
+                    html.Tr([
+                        html.Th("因子"),
+                        html.Th("数值"),
+                        html.Th("数据源"),
+                    ])
+                ),
+                html.Tbody(table_rows),
+            ],
+            bordered=True,
+            hover=True,
+            size="sm",
+            className="mb-3",
+        )
+        column_components.append(dbc.Col(table, width=12, lg=4))
+
+    return dbc.Row(column_components, className="g-2")
+
+
 def _render_connection_statuses(
     statuses: list[dict[str, T.Any]], checked_at: str | None = None
 ) -> T.Union[str, dbc.Table, html.Div]:
@@ -2160,6 +2343,31 @@ def _render_connection_statuses(
     if timestamp_block:
         content.append(timestamp_block)
     content.append(table)
+
+    factor_rows, factor_note = _collect_factor_source_rows()
+    if factor_rows:
+        content.append(html.Hr())
+        content.append(
+            html.H5("因子数据提取预览", style={"marginTop": "12px", "fontWeight": "bold"})
+        )
+        if factor_note:
+            content.append(
+                html.Div(
+                    factor_note,
+                    className="text-muted",
+                    style={"marginBottom": "8px"},
+                )
+            )
+        content.append(_render_factor_preview_table(factor_rows))
+    elif factor_note:
+        content.append(html.Hr())
+        content.append(
+            html.Div(
+                factor_note,
+                className="text-muted",
+                style={"marginTop": "12px"},
+            )
+        )
     return html.Div(content)
 
 
