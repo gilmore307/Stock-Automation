@@ -7,6 +7,7 @@ import datetime as dt
 import uuid
 import copy
 import math
+import traceback
 from collections import deque
 from pathlib import Path
 from urllib.parse import urlparse
@@ -3296,6 +3297,11 @@ def _prediction_thread_worker(
             if key and not _timeline_state_is_done(existing_statuses.get(key)):
                 pending_set.add(key)
 
+    try:
+        pending_preview = ", ".join(sorted(pending_set)) or "无待处理时点"
+    except TypeError:  # pragma: no cover - defensive
+        pending_preview = "无待处理时点"
+
     row_groups_existing = _group_rowdata_by_timeline(archive_snapshot.get("rowData"))
     result_groups_existing = _group_results_by_timeline(archive_snapshot.get("results"))
     timeline_sources_snapshot = (
@@ -3348,6 +3354,14 @@ def _prediction_thread_worker(
     run_identifier = uuid.uuid4().hex
 
     try:
+        _emit(
+            "预测线程已启动，准备执行关键步骤……",
+            task_label="预测任务",
+        )
+        _emit(
+            f"目标日期：{target_date_iso}，待处理时点：{pending_preview}",
+            task_label="预测任务",
+        )
         if triggered == "ft-session-store":
             summary_msg = (
                 f"{target_date.strftime('%m月%d日')} 的预测序列已启动，共 {len(PREDICTION_TIMELINES)} 个时点。"
@@ -3460,6 +3474,17 @@ def _prediction_thread_worker(
             timeline_date_str = timeline_date.isoformat()
             existing_meta_map = row_groups_existing.get(timeline_key, {})
             should_process = timeline_key in pending_set
+
+            if should_process:
+                _emit(
+                    f"开始准备 {label}（决策日 {timeline_date_str}）的预测任务。",
+                    task_label=label,
+                )
+            else:
+                _emit(
+                    f"{label}（决策日 {timeline_date_str}）已存在记录，将检查是否需要复用。",
+                    task_label=label,
+                )
 
             if not should_process:
                 meta_map = {symbol: dict(data) for symbol, data in existing_meta_map.items()}
@@ -3784,6 +3809,10 @@ def _prediction_thread_worker(
             success = int(summary.get("success", 0) or 0)
             missing_cnt = int(summary.get("missing", 0) or 0)
             error_cnt = int(summary.get("error", 0) or 0)
+            _emit(
+                f"{label}（{timeline_date_str}）DCI 处理完成：成功 {success}，缺数据 {missing_cnt}，失败 {error_cnt}。",
+                task_label=label,
+            )
             parts: list[str] = []
             if success:
                 parts.append(f"完成{success}次")
@@ -3905,6 +3934,11 @@ def _prediction_thread_worker(
 
         message = "\n".join(lines)
 
+        _emit(
+            f"预测汇总：结果 {len(results)} 条，缺数据 {len(missing)} 条，错误 {len(errors)} 条。",
+            task_label="预测任务",
+        )
+
         if lines:
             _emit("预测任务总结：", task_label="预测汇总")
             for line in lines:
@@ -3975,6 +4009,10 @@ def _prediction_thread_worker(
     except Exception as exc:  # pragma: no cover - defensive guard
         error_message = f"预测任务失败：{exc}"
         _emit(error_message, task_label="预测任务")
+        tb_text = traceback.format_exc()
+        if tb_text:
+            for line in tb_text.strip().splitlines():
+                _emit(line, task_label="预测任务")
         fallback_store = {
             "results": [],
             "missing": [],
