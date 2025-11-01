@@ -54,6 +54,7 @@ LOG_MAX_FILES = 20
 LOG_FILE_LOCK = threading.Lock()
 CURRENT_LOG_FILE: Path | None = None
 CURRENT_LOG_LINE_COUNT = 0
+PROCESS_ID = os.getpid()
 
 
 def us_eastern_today() -> dt.date:
@@ -236,7 +237,7 @@ def _reset_log_rotation_state() -> None:
 def _enforce_log_rotation() -> None:
     try:
         files = sorted(
-            LOG_ARCHIVE_DIR.glob("log-*.txt"),
+            LOG_ARCHIVE_DIR.glob(f"log-{PROCESS_ID}-*.txt"),
             key=lambda path: path.stat().st_mtime,
         )
     except OSError:
@@ -263,7 +264,7 @@ def _persist_log_entry(entry: str) -> None:
             if needs_new_file:
                 stamp = dt.datetime.now(US_EASTERN).strftime("%Y%m%d-%H%M%S")
                 suffix = uuid.uuid4().hex[:6]
-                CURRENT_LOG_FILE = LOG_ARCHIVE_DIR / f"log-{stamp}-{suffix}.txt"
+                CURRENT_LOG_FILE = LOG_ARCHIVE_DIR / f"log-{PROCESS_ID}-{stamp}-{suffix}.txt"
                 CURRENT_LOG_LINE_COUNT = 0
             with CURRENT_LOG_FILE.open("a", encoding="utf-8") as fh:
                 fh.write(entry + "\n")
@@ -278,7 +279,7 @@ def load_recent_logs(max_entries: int = 500) -> list[str]:
 
     try:
         files = sorted(
-            LOG_ARCHIVE_DIR.glob("log-*.txt"),
+            LOG_ARCHIVE_DIR.glob(f"log-{PROCESS_ID}-*.txt"),
             key=lambda path: path.stat().st_mtime,
         )
     except OSError:
@@ -3796,9 +3797,24 @@ def _prediction_thread_worker(
                     continue
                 all_missing_set.add(str(item))
             if isinstance(partial_missing_detail, dict):
+                grouped_missing_detail: dict[str, list[str]] = {}
                 for miss_key, miss_reason in partial_missing_detail.items():
-                    if miss_key:
-                        missing_reason_lookup[miss_key] = miss_reason
+                    if not miss_key:
+                        continue
+                    reason_text = str(miss_reason or "原因未明")
+                    key_text = str(miss_key)
+                    missing_reason_lookup[key_text] = reason_text
+                    grouped_missing_detail.setdefault(reason_text, []).append(key_text)
+                for reason_text, miss_entries in grouped_missing_detail.items():
+                    if not miss_entries:
+                        continue
+                    sample_text = "；".join(miss_entries[:5])
+                    if len(miss_entries) > 5:
+                        sample_text += "……"
+                    _emit(
+                        f"{label} 缺数据原因（{reason_text}）：{len(miss_entries)} 条（{sample_text}）",
+                        task_label=label,
+                    )
 
             for item in partial_errors:
                 if item is None:
