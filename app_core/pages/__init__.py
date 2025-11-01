@@ -13,7 +13,6 @@ from . import (
     f_predictions,
     g_validation,
     h_reinforcement,
-    login,
 )
 
 __all__ = ["register_all_callbacks"]
@@ -22,7 +21,6 @@ __all__ = ["register_all_callbacks"]
 def register_all_callbacks(app: Dash) -> None:
     """Register callbacks for every 页面模块。"""
 
-    login.register_callbacks(app)
     a_root.register_callbacks(app)
     b_connections.register_callbacks(app)
     c_overview.register_callbacks(app)
