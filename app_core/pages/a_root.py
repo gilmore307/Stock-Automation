@@ -179,7 +179,12 @@ def build_layout(config: LayoutConfig) -> html.Div:
                 max_intervals=1,
                 disabled=True,
             ),
-            dcc.Interval(id="post-open-eval", interval=300000, n_intervals=0),
+            dcc.Interval(
+                id="post-open-eval",
+                interval=300000,
+                n_intervals=0,
+                disabled=True,
+            ),
             html.Div(
                 build_login_panel(config),
                 id="login-shell",
@@ -298,6 +303,7 @@ def register_callbacks(app: Dash) -> None:
         Output("auto-run-trigger", "disabled"),
         Output("prediction-poller", "disabled"),
         Output("connection-poller", "disabled"),
+        Output("post-open-eval", "disabled"),
         Input("ft-session-store", "data"),
     )
     def _toggle_gate(session_state):
@@ -312,6 +318,7 @@ def register_callbacks(app: Dash) -> None:
         return (
             login_style,
             app_style,
+            disable_intervals,
             disable_intervals,
             disable_intervals,
             disable_intervals,

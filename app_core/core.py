@@ -839,6 +839,10 @@ def _store_prediction_results(
     status: str,
     timeline_sources: dict[str, str] | None = None,
     run_identifier: str | None = None,
+    *,
+    missing: list[str] | None = None,
+    errors: list[str] | None = None,
+    timeline_statuses: dict[str, dict[str, T.Any]] | None = None,
 ) -> None:
     key = target_date.isoformat()
     generated_at = dt.datetime.now(US_EASTERN).isoformat()
@@ -861,6 +865,10 @@ def _store_prediction_results(
     }
     if timeline_sources:
         payload["timeline_sources"] = timeline_sources
+    payload["missing"] = _json_safe(list(missing or []))
+    payload["errors"] = _json_safe(list(errors or []))
+    if timeline_statuses:
+        payload["timeline_statuses"] = _json_safe(timeline_statuses)
     with PREDICTION_LOCK:
         archive_file = _prediction_archive_file(target_date)
         payload_to_write = payload
@@ -967,6 +975,212 @@ def _store_prediction_results(
                 json.dump(archive, fh, ensure_ascii=False, indent=2)
         except OSError:
             pass
+
+
+def _group_rowdata_by_timeline(
+    row_data: T.Any,
+) -> dict[str, dict[str, dict[str, T.Any]]]:
+    grouped: dict[str, dict[str, dict[str, T.Any]]] = {}
+    if not isinstance(row_data, list):
+        return grouped
+    for entry in row_data:
+        if not isinstance(entry, dict):
+            continue
+        timeline_key = str(entry.get("timeline_key") or "")
+        symbol = str(entry.get("symbol") or "").upper()
+        if not timeline_key or not symbol:
+            continue
+        grouped.setdefault(timeline_key, {})[symbol] = dict(entry)
+    return grouped
+
+
+def _group_results_by_timeline(
+    results: T.Any,
+) -> dict[str, list[dict[str, T.Any]]]:
+    grouped: dict[str, list[dict[str, T.Any]]] = {}
+    if not isinstance(results, list):
+        return grouped
+    for entry in results:
+        if not isinstance(entry, dict):
+            continue
+        timeline_key = str(entry.get("timeline_key") or "")
+        if not timeline_key:
+            continue
+        grouped.setdefault(timeline_key, []).append(dict(entry))
+    return grouped
+
+
+def _extract_timeline_statuses(
+    archive_entry: dict[str, T.Any] | None,
+) -> dict[str, dict[str, T.Any]]:
+    statuses: dict[str, dict[str, T.Any]] = {}
+    if not isinstance(archive_entry, dict):
+        return statuses
+
+    raw_statuses = archive_entry.get("timeline_statuses")
+    if isinstance(raw_statuses, dict):
+        for key, payload in raw_statuses.items():
+            if not isinstance(payload, dict):
+                continue
+            state = str(payload.get("state") or "").lower()
+            if not state:
+                continue
+            detail = str(payload.get("detail") or "")
+            symbol_count = payload.get("symbol_count")
+            try:
+                symbol_count_int = int(symbol_count) if symbol_count is not None else 0
+            except (TypeError, ValueError):
+                symbol_count_int = 0
+            statuses[str(key)] = {
+                "state": state,
+                "detail": detail,
+                "symbol_count": symbol_count_int,
+                "source_date": str(payload.get("source_date") or ""),
+                "updated_at": str(payload.get("updated_at") or ""),
+            }
+
+    timeline_sources = archive_entry.get("timeline_sources")
+    row_groups = _group_rowdata_by_timeline(archive_entry.get("rowData"))
+    result_groups = _group_results_by_timeline(archive_entry.get("results"))
+
+    for cfg in PREDICTION_TIMELINES:
+        key = str(cfg.get("key") or "")
+        if not key:
+            continue
+        entry = statuses.get(key)
+        source_date = ""
+        if isinstance(timeline_sources, dict):
+            source_date = str(timeline_sources.get(key) or "")
+
+        symbol_count = len(row_groups.get(key, {}))
+        result_count = len(result_groups.get(key, []))
+
+        if entry is None and result_count > 0:
+            statuses[key] = {
+                "state": "completed",
+                "detail": f"存档中已有 {result_count} 条预测结果",
+                "symbol_count": symbol_count or result_count,
+                "source_date": source_date,
+                "updated_at": "",
+            }
+            entry = statuses[key]
+
+        if entry is None and source_date:
+            statuses[key] = {
+                "state": "empty",
+                "detail": "存档标记为已运行但无有效预测",
+                "symbol_count": symbol_count,
+                "source_date": source_date,
+                "updated_at": "",
+            }
+            entry = statuses[key]
+
+        if entry is not None and not entry.get("detail"):
+            if entry.get("state") == "completed":
+                entry["detail"] = "存档中已有预测结果"
+            elif entry.get("state") == "empty":
+                entry["detail"] = "存档中记录为空结果"
+
+    return statuses
+
+
+def _timeline_state_is_done(status: dict[str, T.Any] | None) -> bool:
+    if not isinstance(status, dict):
+        return False
+    state = str(status.get("state") or "").lower()
+    return state in {"completed", "empty"}
+
+
+def _build_task_updates_from_statuses(
+    target_date: dt.date,
+    status_map: dict[str, dict[str, T.Any]],
+) -> list[dict[str, T.Any]]:
+    updates: list[dict[str, T.Any]] = []
+    for cfg in PREDICTION_TIMELINES:
+        timeline_key = str(cfg.get("key") or "")
+        if not timeline_key:
+            continue
+        status_info = status_map.get(timeline_key)
+        if not status_info:
+            continue
+        state = str(status_info.get("state") or "").lower()
+        if state not in {"completed", "empty", "failed"}:
+            continue
+        offset_days = _resolve_timeline_offset_days(cfg)
+        timeline_date = target_date + dt.timedelta(days=offset_days)
+        offset_label = str(cfg.get("label") or cfg.get("key") or "未知时点")
+        detail_body = status_info.get("detail") or (
+            "存档中已有预测结果" if state == "completed" else "存档中无可用预测"
+        )
+        detail_text = f"{offset_label}｜决策日 {timeline_date.isoformat()}：{detail_body}"
+        task_id, name, _ = _describe_timeline_task(target_date, cfg)
+        symbol_count = int(status_info.get("symbol_count") or 0)
+        if state == "completed":
+            status_label = "已完成"
+            completed_symbols = symbol_count
+        elif state == "empty":
+            status_label = "无数据"
+            completed_symbols = 0
+        else:
+            status_label = "失败"
+            completed_symbols = 0
+        updates.append(
+            {
+                "id": task_id,
+                "name": name,
+                "status": status_label,
+                "detail": detail_text,
+                "total_symbols": symbol_count,
+                "completed_symbols": completed_symbols,
+                "processed_symbols": completed_symbols,
+                "end_time": status_info.get("updated_at") or "",
+                "start_time": "",
+            }
+        )
+    for entry in updates:
+        entry.setdefault("detail", "")
+        entry.setdefault("total_symbols", 0)
+        entry.setdefault("completed_symbols", 0)
+        entry.setdefault("processed_symbols", 0)
+    return updates
+
+
+def _build_prediction_store_from_archive(
+    archive_entry: dict[str, T.Any] | None,
+    snapshot: T.Any,
+) -> dict[str, T.Any] | None:
+    if not isinstance(archive_entry, dict):
+        return None
+
+    results: list[dict[str, T.Any]] = []
+    raw_results = archive_entry.get("results")
+    if isinstance(raw_results, list):
+        for item in raw_results:
+            if isinstance(item, dict):
+                results.append(item)
+
+    missing_set: set[str] = set()
+    raw_missing = archive_entry.get("missing")
+    if isinstance(raw_missing, list):
+        for entry in raw_missing:
+            if entry is None:
+                continue
+            missing_set.add(str(entry))
+
+    errors_set: set[str] = set()
+    raw_errors = archive_entry.get("errors")
+    if isinstance(raw_errors, list):
+        for entry in raw_errors:
+            if entry is None:
+                continue
+            errors_set.add(str(entry))
+
+    return {
+        "results": results,
+        "missing": sorted(missing_set),
+        "errors": sorted(errors_set),
+        "rl_snapshot": snapshot,
+    }
 
 
 def _store_prediction_evaluation(target_date: dt.date, evaluation: dict[str, T.Any]) -> None:
@@ -2470,31 +2684,36 @@ def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data,
         status_out = (cached_status + "\n" + extra) if cached_status else extra
         row_data = list(cached_rows)
         archive_entry = _get_prediction_archive(target_date)
-        timeline_has_results: set[str] = set()
-        if isinstance(archive_entry, dict):
-            raw_results = archive_entry.get("results")
-            if isinstance(raw_results, list):
-                for item in raw_results:
-                    if not isinstance(item, dict):
-                        continue
-                    timeline_key = str(item.get("timeline_key") or "")
-                    if timeline_key:
-                        timeline_has_results.add(timeline_key)
+        timeline_statuses = _extract_timeline_statuses(archive_entry)
         timeline_updates = []
         for cfg in PREDICTION_TIMELINES:
             task_id, name, offset_label = _describe_timeline_task(target_date, cfg)
             timeline_key = str(cfg.get("key") or "")
-            has_result = timeline_key in timeline_has_results
+            status_info = timeline_statuses.get(timeline_key)
+            if status_info:
+                state = str(status_info.get("state") or "").lower()
+                detail_core = status_info.get("detail") or ""
+                if state == "completed":
+                    status_value = "已完成"
+                    detail_core = detail_core or f"{offset_label} 预测已完成"
+                elif state == "empty":
+                    status_value = "无数据"
+                    detail_core = detail_core or f"{offset_label} 无可用预测"
+                elif state in {"failed", "error"}:
+                    status_value = "失败"
+                    detail_core = detail_core or f"{offset_label} 上次执行失败"
+                else:
+                    status_value = "等待"
+                    detail_core = detail_core or f"{offset_label} 预测待运行"
+            else:
+                status_value = "等待"
+                detail_core = f"{offset_label} 预测待运行"
             timeline_updates.append(
                 {
                     "id": task_id,
                     "name": name,
-                    "status": "已完成" if has_result else "等待",
-                    "detail": (
-                        f"缓存数据 -> {offset_label} 预测已完成"
-                        if has_result
-                        else f"缓存数据 -> {offset_label} 预测待运行"
-                    ),
+                    "status": status_value,
+                    "detail": f"缓存数据 -> {detail_core}",
                 }
             )
 
@@ -2675,11 +2894,61 @@ def update_predictions_logic(
             no_update,
         )
 
-    run_id = uuid.uuid4().hex
     base_task_state = copy.deepcopy(task_state) if isinstance(task_state, dict) else {"tasks": []}
+    archive_entry = _get_prediction_archive(target_date)
+    timeline_statuses = _extract_timeline_statuses(archive_entry)
+    existing_updates = (
+        _build_task_updates_from_statuses(target_date, timeline_statuses)
+        if timeline_statuses
+        else []
+    )
+    if existing_updates:
+        base_task_state = _merge_task_updates(
+            base_task_state,
+            existing_updates,
+            target_date=target_date.isoformat(),
+        )
+
+    pending_keys: list[str] = []
+    for cfg in PREDICTION_TIMELINES:
+        timeline_key = str(cfg.get("key") or "")
+        if not timeline_key:
+            continue
+        status_info = timeline_statuses.get(timeline_key)
+        if _timeline_state_is_done(status_info):
+            continue
+        pending_keys.append(timeline_key)
 
     if weekend_note:
         log_entries = append_log(log_entries, weekend_note, task_label="预测任务")
+
+    if not pending_keys:
+        summary_message = "今日预测已完成。"
+        if isinstance(archive_entry, dict):
+            summary_message = str(archive_entry.get("status") or summary_message)
+        status_lines = []
+        if weekend_note:
+            status_lines.append(weekend_note)
+        status_lines.append(summary_message)
+        status_message = "\n".join(line for line in status_lines if line)
+        log_entries = append_log(log_entries, summary_message, task_label="预测任务")
+
+        store_payload = _build_prediction_store_from_archive(archive_entry, initial_snapshot)
+        task_out = base_task_state if base_task_state != task_state else no_update
+        log_output = log_entries if log_entries != initial_logs else no_update
+        store_out = store_payload if store_payload is not None else no_update
+
+        return (
+            store_out,
+            status_message,
+            no_update,
+            task_out,
+            log_output,
+            None,
+            True,
+        )
+
+    run_id = uuid.uuid4().hex
 
     status_lines = []
     if weekend_note:
@@ -2702,6 +2971,8 @@ def update_predictions_logic(
             initial_snapshot,
             copy.deepcopy(base_task_state),
             list(log_entries),
+            copy.deepcopy(archive_entry) if isinstance(archive_entry, dict) else None,
+            tuple(pending_keys),
         ),
         daemon=True,
     )
@@ -2731,6 +3002,8 @@ def _prediction_thread_worker(
     initial_snapshot: T.Any,
     initial_task_state: dict[str, T.Any],
     initial_logs: list[str],
+    archive_entry: dict[str, T.Any] | None,
+    pending_timelines: tuple[str, ...] | None,
 ) -> None:
     log_entries = list(initial_logs or [])
     task_state_local = (
@@ -2740,6 +3013,49 @@ def _prediction_thread_worker(
     )
     session_local = copy.deepcopy(session_data) if isinstance(session_data, dict) else {}
     target_date_iso = target_date.isoformat()
+
+    archive_snapshot = archive_entry if isinstance(archive_entry, dict) else {}
+    existing_statuses = _extract_timeline_statuses(archive_snapshot)
+    pending_set: set[str] = {str(key) for key in (pending_timelines or ()) if key}
+    if not pending_set:
+        for cfg in PREDICTION_TIMELINES:
+            key = str(cfg.get("key") or "")
+            if key and not _timeline_state_is_done(existing_statuses.get(key)):
+                pending_set.add(key)
+
+    row_groups_existing = _group_rowdata_by_timeline(archive_snapshot.get("rowData"))
+    result_groups_existing = _group_results_by_timeline(archive_snapshot.get("results"))
+    timeline_sources_snapshot = (
+        archive_snapshot.get("timeline_sources")
+        if isinstance(archive_snapshot.get("timeline_sources"), dict)
+        else {}
+    )
+
+    result_lookup: dict[tuple[str, str], dict[str, T.Any]] = {}
+    for timeline_key_init, entries in result_groups_existing.items():
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            symbol = str(entry.get("symbol") or "").upper()
+            if not symbol:
+                continue
+            result_lookup[(symbol, timeline_key_init)] = dict(entry)
+
+    missing_existing: set[str] = set()
+    raw_missing = archive_snapshot.get("missing") if isinstance(archive_snapshot, dict) else None
+    if isinstance(raw_missing, list):
+        for item in raw_missing:
+            if item is None:
+                continue
+            missing_existing.add(str(item))
+
+    errors_existing: set[str] = set()
+    raw_errors = archive_snapshot.get("errors") if isinstance(archive_snapshot, dict) else None
+    if isinstance(raw_errors, list):
+        for item in raw_errors:
+            if item is None:
+                continue
+            errors_existing.add(str(item))
 
     def _emit(message: str, task_label: str | None = None) -> None:
         nonlocal log_entries
@@ -2771,10 +3087,10 @@ def _prediction_thread_worker(
         timeline_symbol_counts: dict[str, int] = {}
         timeline_metadata_map: dict[str, dict[str, dict[str, T.Any]]] = {}
         timeline_status_notes: dict[str, tuple[str, str]] = {}
+        timeline_final_statuses: dict[str, dict[str, T.Any]] = {}
         aggregated_row_data: list[dict[str, T.Any]] = []
-        all_results: list[dict[str, T.Any]] = []
-        all_missing: list[str] = []
-        all_errors: list[str] = []
+        all_missing_set: set[str] = set(missing_existing)
+        all_errors_set: set[str] = set(errors_existing)
 
         def _progress(symbol: str, timeline: dict[str, T.Any], stage: str, detail: str | None) -> None:
             nonlocal log_entries
@@ -2862,8 +3178,71 @@ def _prediction_thread_worker(
             timeline_metadata_map[timeline_key] = {}
             timeline_symbol_counts[timeline_key] = 0
             timeline_status_notes.setdefault(timeline_key, ("", ""))
+            timeline_final_statuses.setdefault(timeline_key, {})
 
             timeline_date_str = timeline_date.isoformat()
+            existing_meta_map = row_groups_existing.get(timeline_key, {})
+            should_process = timeline_key in pending_set
+
+            if not should_process:
+                meta_map = {symbol: dict(data) for symbol, data in existing_meta_map.items()}
+                timeline_metadata_map[timeline_key] = meta_map
+                timeline_symbol_counts[timeline_key] = len(meta_map)
+                state_info = existing_statuses.get(timeline_key) or {}
+                state_value = str(
+                    state_info.get("state") or ("completed" if meta_map else "empty")
+                ).lower()
+                if state_value not in {"completed", "empty"}:
+                    state_value = "completed" if meta_map else "empty"
+                detail_body = state_info.get("detail") or (
+                    "存档中已有预测结果" if state_value == "completed" else "存档记录为空结果"
+                )
+                detail_text = f"{offset_label}｜决策日 {timeline_date_str}：{detail_body}"
+                status_flag = "ok" if state_value == "completed" else "empty"
+                timeline_status_notes[timeline_key] = (status_flag, detail_body)
+                timeline_reports[timeline_key] = detail_body
+                source_date = state_info.get("source_date") or str(
+                    timeline_sources_snapshot.get(timeline_key) or timeline_date_str
+                )
+                timeline_final_statuses[timeline_key] = {
+                    "state": state_value,
+                    "detail": detail_body,
+                    "symbol_count": len(meta_map),
+                    "source_date": source_date,
+                    "updated_at": state_info.get("updated_at")
+                    or dt.datetime.now(US_EASTERN).isoformat(),
+                }
+                status_label = "已完成" if state_value == "completed" else "无数据"
+                end_ts = dt.datetime.now(US_EASTERN).strftime("%H:%M:%S")
+                update_state = _merge_task_updates(
+                    task_state_local,
+                    [
+                        {
+                            "id": task_id,
+                            "name": name,
+                            "status": status_label,
+                            "detail": detail_text,
+                            "end_time": end_ts,
+                            "total_symbols": len(meta_map),
+                            "completed_symbols": len(meta_map) if state_value == "completed" else 0,
+                            "processed_symbols": len(meta_map),
+                        }
+                    ],
+                    target_date=target_date_iso,
+                )
+                _set_tasks(update_state)
+                message = (
+                    f"{name}（决策日 {timeline_date_str}）已在存档中完成，跳过重新计算。"
+                    if state_value == "completed"
+                    else f"{name}（决策日 {timeline_date_str}）存档为空，跳过重新计算。"
+                )
+                _emit(message, task_label=label)
+                continue
+
+            for result_key in list(result_lookup.keys()):
+                if result_key[1] == timeline_key:
+                    result_lookup.pop(result_key, None)
+
             fetch_update = _merge_task_updates(
                 task_state_local,
                 [
@@ -2950,7 +3329,6 @@ def _prediction_thread_worker(
                     enriched.setdefault("timeline_key", timeline_key)
                     enriched.setdefault("timeline_date", timeline_date_str)
                     meta_map[symbol] = enriched
-                    aggregated_row_data.append(enriched)
                 timeline_metadata_map[timeline_key] = meta_map
                 timeline_symbol_counts[timeline_key] = len(meta_map)
                 _emit(
@@ -2995,6 +3373,13 @@ def _prediction_thread_worker(
                 _set_tasks(updated_state)
                 _emit(f"{name} 失败：{status_note}", task_label=label)
                 timeline_reports[timeline_key] = detail_text.split("：", 1)[-1]
+                timeline_final_statuses[timeline_key] = {
+                    "state": "failed",
+                    "detail": detail_text.split("：", 1)[-1],
+                    "symbol_count": symbol_count,
+                    "source_date": timeline_date_str,
+                    "updated_at": dt.datetime.now(US_EASTERN).isoformat(),
+                }
                 continue
 
             if symbol_count <= 0:
@@ -3019,6 +3404,13 @@ def _prediction_thread_worker(
                 )
                 _set_tasks(updated_state)
                 timeline_reports[timeline_key] = detail_text.split("：", 1)[-1]
+                timeline_final_statuses[timeline_key] = {
+                    "state": "empty",
+                    "detail": detail_text.split("：", 1)[-1],
+                    "symbol_count": 0,
+                    "source_date": timeline_date_str,
+                    "updated_at": dt.datetime.now(US_EASTERN).isoformat(),
+                }
                 continue
 
             progress_tracker[timeline_key] = {
@@ -3056,9 +3448,24 @@ def _prediction_thread_worker(
                 timeline_configs=[cfg],
             )
 
-            all_results.extend(partial_results)
-            all_missing.extend(partial_missing)
-            all_errors.extend(partial_errors)
+            for entry in partial_results:
+                if not isinstance(entry, dict):
+                    continue
+                symbol = str(entry.get("symbol") or "").upper()
+                timeline_label = str(entry.get("timeline_key") or timeline_key)
+                if not symbol or not timeline_label:
+                    continue
+                result_lookup[(symbol, timeline_label)] = entry
+
+            for item in partial_missing:
+                if item is None:
+                    continue
+                all_missing_set.add(str(item))
+
+            for item in partial_errors:
+                if item is None:
+                    continue
+                all_errors_set.add(str(item))
 
             summary = timeline_summary.get(timeline_key) or {}
             success = int(summary.get("success", 0) or 0)
@@ -3086,14 +3493,29 @@ def _prediction_thread_worker(
                 else ""
             )
             detail_text = f"{detail_text}｜进度：{progress_phrase}{progress_suffix}"
-            timeline_reports[timeline_key] = detail_text.split("：", 1)[-1]
+            detail_body = detail_text.split("：", 1)[-1]
+            timeline_reports[timeline_key] = detail_body
 
             if success:
-                status_value = "已完成"
+                final_state = "completed"
             elif error_cnt:
-                status_value = "失败"
+                final_state = "failed"
             else:
-                status_value = "无数据"
+                final_state = "empty"
+
+            status_value = {
+                "completed": "已完成",
+                "failed": "失败",
+                "empty": "无数据",
+            }[final_state]
+
+            timeline_final_statuses[timeline_key] = {
+                "state": final_state,
+                "detail": detail_body,
+                "symbol_count": total_symbols_for_task,
+                "source_date": timeline_date_str,
+                "updated_at": dt.datetime.now(US_EASTERN).isoformat(),
+            }
 
             end_ts = dt.datetime.now(US_EASTERN).strftime("%H:%M:%S")
             final_update = _merge_task_updates(
@@ -3114,9 +3536,16 @@ def _prediction_thread_worker(
             )
             _set_tasks(final_update)
             _emit(f"{name} 完成：{detail_text}", task_label=label)
-        results = sorted(all_results, key=lambda row: (row.get("symbol", ""), row.get("lookback_days", 0)))
-        missing = sorted(set(all_missing))
-        errors = sorted(set(all_errors))
+        aggregated_row_data = []
+        for meta_map in timeline_metadata_map.values():
+            aggregated_row_data.extend(meta_map.values())
+
+        results = sorted(
+            list(result_lookup.values()),
+            key=lambda row: (row.get("symbol", ""), row.get("lookback_days", 0)),
+        )
+        missing = sorted(all_missing_set)
+        errors = sorted(all_errors_set)
 
         snapshot = RL_MANAGER.snapshot() if RL_MANAGER is not None else initial_snapshot
 
@@ -3165,6 +3594,9 @@ def _prediction_thread_worker(
             message or "",
             timeline_sources,
             run_identifier=run_identifier,
+            missing=missing,
+            errors=errors,
+            timeline_statuses=timeline_final_statuses,
         )
 
         archive_entry = _get_prediction_archive(target_date)
