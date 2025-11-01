@@ -2244,7 +2244,9 @@ def _prepare_earnings_dataset(
 
     if ft_client and ft_client.enabled:
         expiry_date = this_friday(target_date)
-        options_applied = True
+        evaluated = 0
+        skipped_symbols: list[str] = []
+        options_applied = False
         for entry in base_rows:
             symbol = str(entry.get("symbol") or "").upper()
             if not symbol:
@@ -2252,14 +2254,21 @@ def _prepare_earnings_dataset(
             if symbol not in weekly_map:
                 result = ft_client.has_weekly_expiring_on(symbol, expiry_date)
                 if result is None:
-                    options_applied = False
-                    if ft_client.error:
-                        error_message = ft_client.error
+                    skipped_symbols.append(symbol)
                     _log(f"无法确认 {symbol} 的周五期权信息。")
-                    break
+                    continue
                 weekly_map[symbol] = bool(result)
+            evaluated += 1
             if weekly_map.get(symbol):
                 filtered_rows.append(entry)
+
+        if evaluated:
+            options_applied = True
+
+        if skipped_symbols:
+            preview = "，".join(skipped_symbols[:5])
+            suffix = "…" if len(skipped_symbols) > 5 else ""
+            _log(f"部分标的缺少周五期权信息，已跳过：{preview}{suffix}。")
 
         if options_applied and ft_client.enabled:
             _log(f"Firstrade 筛选完成，保留 {len(filtered_rows)} 条记录。")
