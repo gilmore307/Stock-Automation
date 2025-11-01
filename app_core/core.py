@@ -1617,20 +1617,13 @@ def _compute_dci_for_symbols(
             continue
         data = payloads.get(symbol)
         if not data:
-            reason = "未找到该标的的 DCI 输入数据"
             if progress_callback:
                 for timeline in timelines:
                     try:
-                        progress_callback(
-                            symbol,
-                            timeline,
-                            "missing",
-                            reason,
-                        )
+                        progress_callback(symbol, timeline, "missing", None)
                     except Exception:  # pragma: no cover - logging best effort
                         pass
             missing.append(symbol)
-            missing_detail_map[symbol] = reason
             continue
 
         meta_entry = metadata_map.get(symbol) if isinstance(metadata_map, dict) else None
@@ -3402,8 +3395,11 @@ def _prediction_thread_worker(
             elif stage == "missing":
                 timeline_summary.setdefault(key, {"label": label, "success": 0, "missing": 0, "error": 0})
                 timeline_summary[key]["missing"] = timeline_summary[key].get("missing", 0) + 1
-                detail_note = f"（{detail}）" if detail else ""
-                message = f"{symbol} 的 {label} 输入缺失，跳过该时点{bucket_part}{detail_note}。"
+                if detail:
+                    detail_note = f"（{detail}）"
+                    message = f"{symbol} 的 {label} 输入缺失，跳过该时点{bucket_part}{detail_note}。"
+                else:
+                    message = None
             elif stage == "error":
                 timeline_summary.setdefault(key, {"label": label, "success": 0, "missing": 0, "error": 0})
                 timeline_summary[key]["error"] = timeline_summary[key].get("error", 0) + 1
@@ -3750,7 +3746,7 @@ def _prediction_thread_worker(
                 sample = "，".join(missing_symbols[:6])
                 more = "……" if len(missing_symbols) > 6 else ""
                 summary_parts.append(
-                    f"缺少 {len(missing_symbols)} 个标的的 DCI 输入（{sample}{more}）"
+                    f"数据源未覆盖 {len(missing_symbols)} 个标的（{sample}{more}）"
                 )
 
             if summary_parts:
@@ -3790,7 +3786,9 @@ def _prediction_thread_worker(
                 for miss_key, miss_reason in partial_missing_detail.items():
                     if not miss_key:
                         continue
-                    reason_text = str(miss_reason or "原因未明")
+                    if not miss_reason:
+                        continue
+                    reason_text = str(miss_reason)
                     key_text = str(miss_key)
                     missing_reason_lookup[key_text] = reason_text
                     grouped_missing_detail.setdefault(reason_text, []).append(key_text)
@@ -3909,7 +3907,9 @@ def _prediction_thread_worker(
             lines.append(f"缺少数据的条目：{preview_missing}")
             grouped_missing: dict[str, list[str]] = {}
             for miss_key in missing:
-                reason_text = missing_reason_lookup.get(miss_key) or "原因未明"
+                reason_text = missing_reason_lookup.get(miss_key)
+                if not reason_text:
+                    continue
                 grouped_missing.setdefault(reason_text, []).append(miss_key)
             for reason_text, miss_entries in grouped_missing.items():
                 sample_text = "；".join(miss_entries[:5])

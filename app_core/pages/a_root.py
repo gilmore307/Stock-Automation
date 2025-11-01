@@ -216,11 +216,22 @@ def build_layout(config: LayoutConfig) -> html.Div:
                     dcc.Tabs(
                         [
                             dcc.Tab(
-                                label="数据连接", children=[build_connections_tab(config)]
+                                label="数据与预测预览",
+                                children=[
+                                    html.Div(
+                                        [
+                                            html.Div(
+                                                build_connections_tab(config),
+                                                className="mb-4",
+                                            ),
+                                            html.Div(build_overview_tab(config)),
+                                        ],
+                                        className="p-3",
+                                    )
+                                ],
                             ),
-                            dcc.Tab(label="预测概览", children=[build_overview_tab(config)]),
-                            dcc.Tab(label="财报日程", children=[build_earnings_tab(config)]),
                             dcc.Tab(label="任务中心", children=[build_tasks_tab(config)]),
+                            dcc.Tab(label="财报日程", children=[build_earnings_tab(config)]),
                             dcc.Tab(label="预测明细", children=[build_predictions_tab(config)]),
                             dcc.Tab(label="验证回顾", children=[build_validation_tab(config)]),
                             dcc.Tab(label="强化模型", children=[build_reinforcement_tab(config)]),
