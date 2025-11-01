@@ -1568,6 +1568,17 @@ def _compute_dci_for_symbols(
             continue
         data = payloads.get(symbol)
         if not data:
+            if progress_callback:
+                for timeline in timelines:
+                    try:
+                        progress_callback(
+                            symbol,
+                            timeline,
+                            "missing",
+                            "缺少 DCI 输入数据",
+                        )
+                    except Exception:  # pragma: no cover - logging best effort
+                        pass
             missing.append(symbol)
             continue
 
@@ -3290,7 +3301,8 @@ def _prediction_thread_worker(
             elif stage == "missing":
                 timeline_summary.setdefault(key, {"label": label, "success": 0, "missing": 0, "error": 0})
                 timeline_summary[key]["missing"] = timeline_summary[key].get("missing", 0) + 1
-                message = f"{symbol} 的 {label} 输入缺失，跳过该时点{bucket_part}。"
+                detail_note = f"（{detail}）" if detail else ""
+                message = f"{symbol} 的 {label} 输入缺失，跳过该时点{bucket_part}{detail_note}。"
             elif stage == "error":
                 timeline_summary.setdefault(key, {"label": label, "success": 0, "missing": 0, "error": 0})
                 timeline_summary[key]["error"] = timeline_summary[key].get("error", 0) + 1
