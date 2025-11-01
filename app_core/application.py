@@ -8,8 +8,8 @@ import dash_bootstrap_components as dbc
 from dash import Dash
 
 from . import core
-from .layout import LayoutConfig, build_layout
 from .pages import register_all_callbacks
+from .pages.a_root import LayoutConfig, build_layout
 
 AG_GRID_STYLES = [
     "https://cdn.jsdelivr.net/npm/ag-grid-community/styles/ag-grid.css",
