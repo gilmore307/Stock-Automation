@@ -35,10 +35,6 @@ except Exception:  # pragma: no cover
 
 US_EASTERN = ZoneInfo("America/New_York")
 
-RUN_LOCK = threading.Lock()
-RUN_STATES: dict[str, dict[str, T.Any]] = {}
-NO_UPDATE_SENTINEL = object()
-
 ARCHIVE_ROOT = Path(__file__).with_name("archives")
 CACHE_ROOT = ARCHIVE_ROOT / "cache"
 
@@ -1632,47 +1628,6 @@ def _render_connection_statuses(
     return html.Div(content)
 
 
-def _init_run_state(run_id: str, target_date: dt.date) -> None:
-    with RUN_LOCK:
-        RUN_STATES[run_id] = {
-            "logs": [],
-            "rowData": None,
-            "status": "",
-            "session_state": NO_UPDATE_SENTINEL,
-            "completed": False,
-            "target_date": target_date,
-        }
-
-
-def _get_run_state(run_id: str) -> dict[str, T.Any] | None:
-    with RUN_LOCK:
-        state = RUN_STATES.get(run_id)
-        if not state:
-            return None
-        out = dict(state)
-        out["logs"] = list(state.get("logs", []))
-        return out
-
-
-def _append_run_log(run_id: str, message: str) -> None:
-    stamp = dt.datetime.now(US_EASTERN).strftime("%H:%M:%S")
-    entry = f"[{stamp}] {message}"
-    _persist_log_entry(entry)
-    with RUN_LOCK:
-        state = RUN_STATES.get(run_id)
-        if not state:
-            return
-        state.setdefault("logs", []).append(entry)
-
-
-def _update_run_state(run_id: str, **kwargs: T.Any) -> None:
-    with RUN_LOCK:
-        state = RUN_STATES.get(run_id)
-        if not state:
-            return
-        state.update(kwargs)
-
-
 PREDICTION_RUN_LOCK = threading.Lock()
 PREDICTION_RUN_STATES: dict[str, dict[str, T.Any]] = {}
 
@@ -2131,7 +2086,7 @@ class FTClient:
     def has_weekly_expiring_on(
         self, symbol: str, expiry: dt.date
     ) -> tuple[T.Optional[bool], T.Optional[str], bool]:
-        """Check whether a symbol has a weekly option expiring on the given date.
+        """Check whether a symbol lists the target Friday contract in Firstrade.
 
         Returns a tuple ``(has_weekly, expiry_type, matched)`` where:
 
@@ -2208,7 +2163,7 @@ def _prepare_earnings_dataset(
     *,
     logger: T.Optional[T.Callable[[str], None]] = None,
 ) -> tuple[list[dict[str, T.Any]], str, dict[str, T.Any] | None, bool, str]:
-    """Fetch Nasdaq earnings and filter to symbols backed by weekly options."""
+    """Fetch Nasdaq earnings and keep symbols with contracts on the target Friday."""
 
     def _log(message: str) -> None:
         if logger:
@@ -2394,7 +2349,7 @@ def _prepare_earnings_dataset(
     options_applied = selection_mode in {"matched", "empty"}
     return rows_out, status_text, session_out, options_applied, ""
 
-def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data, username, password, twofa, task_state):  # noqa: D401
+def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data, task_state):  # noqa: D401
     trigger = ctx.triggered_id
     session_state = session_data if isinstance(session_data, dict) else {}
     logged_in = _has_valid_ft_session(session_state)
@@ -2402,31 +2357,31 @@ def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data,
     login_trigger = trigger == "ft-session-store"
     if trigger == "auto-run-trigger":
         if auto_intervals is None:
-            return no_update, no_update, no_update, no_update, no_update, no_update
+            return no_update, no_update, no_update, no_update
     elif trigger == "earnings-date-picker":
         if not selected_date:
-            return no_update, no_update, no_update, no_update, no_update, no_update
+            return no_update, no_update, no_update, no_update
     elif manual_refresh:
         if not refresh_clicks:
-            return no_update, no_update, no_update, no_update, no_update, no_update
+            return no_update, no_update, no_update, no_update
     elif login_trigger:
         if not session_state:
-            return no_update, no_update, no_update, no_update, no_update, no_update
+            return no_update, no_update, no_update, no_update
     else:
-        return no_update, no_update, no_update, no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update
 
     if not logged_in:
         if login_trigger:
             message = "检测到无效的 Firstrade 会话，请重新登录。"
             logs = append_log([], message, task_label="财报日程")
-            return no_update, logs, message, [], True, no_update
+            return logs, message, [], no_update
 
         if manual_refresh or trigger == "earnings-date-picker":
             message = "尚未登录 Firstrade，请先在连接页登录后再刷新财报列表。"
             logs = append_log([], message, task_label="财报日程")
-            return no_update, logs, message, [], True, no_update
+            return logs, message, [], no_update
 
-        return no_update, no_update, no_update, no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update
 
     target_date = _coerce_date(selected_date) or us_eastern_today()
     today_limit = us_eastern_today()
@@ -2485,11 +2440,9 @@ def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data,
             logs_list = append_log(logs_list, weekend_note, task_label="财报日程")
         logs = append_log(logs_list, status_message, task_label="财报日程")
         return (
-            no_update,
             logs,
             status_message,
             [],
-            True,
             tasks,
         )
 
@@ -2550,7 +2503,7 @@ def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data,
             timeline_updates,
             target_date=target_date_iso,
         )
-        return None, logs, status_out, row_data, True, tasks
+        return logs, status_out, row_data, tasks
 
     if cached_rows and bypass_cache:
         status_lines: list[str] = []
@@ -2568,7 +2521,7 @@ def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data,
             status_lines.append(cached_line)
         status_message = "\n".join(line for line in status_lines if line)
         logs = append_log(logs_list, manual_note, task_label="财报日程")
-        return None, logs, status_message, list(cached_rows), True, no_update
+        return logs, status_message, list(cached_rows), no_update
 
     status_lines: list[str] = []
     logs_list: list[str] = []
@@ -2622,149 +2575,9 @@ def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data,
         target_date=target_date_iso,
     )
     table_out = list(cached_rows) if manual_refresh and cached_rows else []
-    return None, logs, status_message, table_out, True, tasks
+    return logs, status_message, table_out, tasks
 
 
-def _execute_run(
-    run_id: str,
-    username: str,
-    password: str,
-    twofa: str,
-    session_state: dict[str, T.Any] | None,
-    target_date: dt.date,
-) -> None:
-    """Background worker that refreshes and filters the earnings list."""
-
-    def _log(message: str) -> None:
-        _append_run_log(run_id, message)
-
-    try:
-        _log(f"开始刷新 {target_date.strftime('%Y-%m-%d')} 的财报列表。")
-        rows, status_text, session_out, options_applied, error_message = _prepare_earnings_dataset(
-            target_date,
-            session_state,
-            username,
-            password,
-            twofa,
-            logger=_log,
-        )
-        if error_message:
-            status = f"财报列表失败：{error_message}"
-            _log(status)
-            session_payload = session_out if isinstance(session_out, dict) else NO_UPDATE_SENTINEL
-            _update_run_state(
-                run_id,
-                rowData=[],
-                status=status,
-                completed=True,
-                session_state=session_payload,
-                options_filter_applied=False,
-            )
-            return
-
-        session_payload = session_out if isinstance(session_out, dict) else NO_UPDATE_SENTINEL
-        if options_applied:
-            try:
-                _store_cached_earnings(target_date, rows, status_text or "", options_filter_applied=True)
-            except Exception:  # pragma: no cover - cache best effort
-                _log("写入本地缓存时出现问题，已忽略。")
-
-        if not status_text:
-            status_text = f"{target_date.strftime('%Y-%m-%d')} 财报刷新完成。"
-
-        _update_run_state(
-            run_id,
-            rowData=rows,
-            status=status_text,
-            completed=True,
-            session_state=session_payload,
-            options_filter_applied=bool(options_applied),
-        )
-    except Exception as exc:  # pragma: no cover - defensive guard
-        _log(f"刷新过程中出现异常：{exc}")
-        _update_run_state(
-            run_id,
-            rowData=[],
-            status=f"发生错误：{exc}",
-            completed=True,
-            session_state=NO_UPDATE_SENTINEL,
-            options_filter_applied=False,
-        )
-
-def poll_run_state_logic(n_intervals, run_id, existing_logs, current_rows, task_state):  # noqa: D401
-    del n_intervals
-    if not run_id:
-        return no_update, no_update, no_update, no_update, True, no_update
-
-    existing_logs = existing_logs or []
-    current_rows = current_rows or []
-
-    state = _get_run_state(run_id)
-    if not state:
-        return no_update, no_update, no_update, no_update, True, no_update
-
-    logs = state.get("logs", [])
-    row_data = state.get("rowData")
-    status = state.get("status")
-    completed = state.get("completed", False)
-    session_state = state.get("session_state", NO_UPDATE_SENTINEL)
-
-    logs_out = logs if logs != existing_logs else no_update
-    table_out = row_data if row_data is not None and row_data != current_rows else no_update
-    status_out = status if status else no_update
-    if session_state is NO_UPDATE_SENTINEL:
-        session_out = no_update
-    else:
-        session_out = session_state
-
-    task_updates: list[dict[str, T.Any]] = []
-    target_date = state.get("target_date")
-    target_date_str = target_date.isoformat() if isinstance(target_date, dt.date) else None
-    if isinstance(status, str) and "错误" in status and isinstance(target_date, dt.date):
-        for cfg in PREDICTION_TIMELINES:
-            task_id, name, offset_label = _describe_timeline_task(target_date, cfg)
-            task_updates.append(
-                {
-                    "id": task_id,
-                    "name": name,
-                    "status": "失败",
-                    "detail": f"财报列表失败，无法执行 {offset_label}",
-                }
-            )
-    if isinstance(row_data, list) and row_data != current_rows and isinstance(target_date, dt.date):
-        options_flag = state.get("options_filter_applied")
-        if options_flag is False:
-            base_detail = "财报列表未完成周五期权筛选，请登录 Firstrade 并刷新。"
-        else:
-            base_detail = f"财报列表就绪，共 {len(row_data)} 个标的"
-        for idx, cfg in enumerate(PREDICTION_TIMELINES, start=1):
-            task_id, name, offset_label = _describe_timeline_task(target_date, cfg)
-            if options_flag is False:
-                if idx == 1:
-                    status_value = "失败"
-                    detail_text = base_detail
-                else:
-                    status_value = "等待"
-                    detail_text = f"等待周五期权筛选完成后执行 {offset_label}"
-            else:
-                status_value = "等待"
-                detail_text = base_detail if idx == 1 else f"等待前序任务完成后执行 {offset_label}"
-            task_updates.append(
-                {
-                    "id": task_id,
-                    "name": name,
-                    "status": status_value,
-                    "detail": detail_text,
-                }
-            )
-
-    tasks_out = (
-        _merge_task_updates(task_state, task_updates, target_date=target_date_str)
-        if task_updates
-        else no_update
-    )
-
-    return logs_out, table_out, status_out, session_out, bool(completed), tasks_out
 
 def update_predictions_logic(
     selected_rows,

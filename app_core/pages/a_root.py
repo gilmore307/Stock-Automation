@@ -47,7 +47,6 @@ def build_layout(config: LayoutConfig) -> html.Div:
             dcc.Store(id="ft-session-store", storage_type="memory"),
             dcc.Store(id="log-store", storage_type="memory", data=[]),
             dcc.Store(id="log-autoscroll", storage_type="memory"),
-            dcc.Store(id="run-id-store", storage_type="memory"),
             dcc.Store(id="task-store", storage_type="memory", data={"tasks": []}),
             dcc.Store(
                 id="prediction-store",
@@ -67,7 +66,6 @@ def build_layout(config: LayoutConfig) -> html.Div:
                 data={"global": {"last": {}, "changes": []}, "sectors": {}},
             ),
             dcc.Store(id="evaluation-store", storage_type="memory", data={}),
-            dcc.Interval(id="log-poller", interval=1000, disabled=True),
             dcc.Interval(id="prediction-poller", interval=1000, disabled=True),
             dcc.Interval(id="connection-poller", interval=60000, n_intervals=0),
             dcc.Interval(id="auto-run-trigger", interval=1500, n_intervals=0, max_intervals=1),
