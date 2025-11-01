@@ -162,8 +162,6 @@ EARNINGS_CACHE_PATH = CACHE_ROOT / "earnings.json"
 EARNINGS_ARCHIVE_DIR = ARCHIVE_ROOT / "earnings"
 CACHE_LOCK = threading.Lock()
 
-PARAMETER_ARCHIVE_DIR = ARCHIVE_ROOT / "parameter_changes"
-
 
 def _load_archive_directory(directory: Path) -> dict[str, T.Any]:
     result: dict[str, T.Any] = {}
@@ -213,23 +211,6 @@ def _json_safe(value: T.Any) -> T.Any:
     if isinstance(value, dict):
         return {str(key): _json_safe(val) for key, val in value.items()}
     return value
-
-
-def _safe_timestamp_to_filename(timestamp: str) -> str:
-    safe = timestamp.strip().replace(" ", "T").replace(":", "-")
-    safe = "".join(ch for ch in safe if ch.isalnum() or ch in {"-", "_", "T"})
-    if not safe:
-        safe = dt.datetime.now(US_EASTERN).strftime("%Y%m%dT%H%M%S")
-    return safe
-
-
-def _prepare_unique_archive_path(directory: Path, base_name: str) -> Path:
-    directory.mkdir(parents=True, exist_ok=True)
-    candidate = directory / f"{base_name}.json"
-    if not candidate.exists():
-        return candidate
-    suffix = uuid.uuid4().hex[:6]
-    return directory / f"{base_name}-{suffix}.json"
 
 
 def _reset_log_rotation_state() -> None:
@@ -345,16 +326,6 @@ def _prediction_symbol_file(date_value: dt.date, symbol: str) -> Path:
     )
     safe_symbol = safe_symbol or "symbol"
     return _prediction_symbol_dir(date_value) / f"{safe_symbol}.json"
-
-
-def _persist_parameter_snapshot(timestamp: str, snapshot: dict[str, T.Any]) -> None:
-    base_name = _safe_timestamp_to_filename(timestamp)
-    path = _prepare_unique_archive_path(PARAMETER_ARCHIVE_DIR, base_name)
-    try:
-        with path.open("w", encoding="utf-8") as fh:
-            json.dump(snapshot, fh, ensure_ascii=False, indent=2)
-    except OSError:
-        pass
 
 
 def _describe_timeline_task(target_date: dt.date, timeline_cfg: dict[str, T.Any]) -> tuple[str, str, str]:
@@ -5224,14 +5195,6 @@ def update_parameter_history_logic(agent_data, history_state, log_state):  # noq
         entry["last"] = {}
 
     if recorded_global_changes or recorded_sector_changes:
-        snapshot_payload = {
-            "timestamp": timestamp,
-            "global_changes": recorded_global_changes,
-            "sector_changes": recorded_sector_changes,
-            "state": copy.deepcopy(history),
-        }
-        _persist_parameter_snapshot(timestamp, snapshot_payload)
-
         summary_bits: list[str] = []
         if recorded_global_changes:
             summary_bits.append(f"全局参数变更 {len(recorded_global_changes)} 项")
