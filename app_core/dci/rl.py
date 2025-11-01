@@ -22,6 +22,32 @@ from . import (
     set_factor_weights,
 )
 
+
+CORE_FEATURE_DEFAULTS: Dict[str, float] = {
+    "bias": 0.0,
+    "base_score": 0.0,
+    "p_up_offset": 0.0,
+    "dci_final": 0.0,
+    "dci_penalised": 0.0,
+    "position_weight": 0.0,
+    "certainty": 0.0,
+}
+
+SHRINK_FEATURE_DEFAULTS: Dict[str, float] = {
+    f"shrink_{name}": 0.0
+    for name in ("shrink_EG", "shrink_CI", "disagreement", "shock")
+}
+
+FACTOR_FEATURE_DEFAULTS: Dict[str, float] = {
+    f"factor_{name}": 0.0 for name in BASE_FACTOR_WEIGHTS
+}
+
+DEFAULT_AGENT_WEIGHTS: Dict[str, float] = {
+    **CORE_FEATURE_DEFAULTS,
+    **SHRINK_FEATURE_DEFAULTS,
+    **FACTOR_FEATURE_DEFAULTS,
+}
+
 DEFAULT_STATE_FILE = Path(__file__).with_name("dci_rl_state.json")
 LEGACY_STATE_PATH = Path(os.getenv("DCI_RL_STATE_PATH", str(DEFAULT_STATE_FILE)))
 DEFAULT_STATE_DIR = Path(__file__).resolve().parent.parent / "archives" / "rl_models"
@@ -83,7 +109,7 @@ class DCIRLAgent:
         self.learning_rate = learning_rate
         self.gamma = gamma
         self.adjustment_scale = adjustment_scale
-        self.weights: Dict[str, float] = {}
+        self.weights: Dict[str, float] = dict(DEFAULT_AGENT_WEIGHTS)
         self.bias: float = 0.0
         self.baseline: float = 0.0
         self.pending: Dict[str, List[PendingPrediction]] = {}
@@ -116,6 +142,16 @@ class DCIRLAgent:
     def _ensure_feature_keys(self, features: Dict[str, float]) -> None:
         for key in features:
             self.weights.setdefault(key, 0.0)
+
+    def ensure_default_weights(self) -> bool:
+        """Ensure all known default feature weights exist on the agent."""
+
+        modified = False
+        for key, value in DEFAULT_AGENT_WEIGHTS.items():
+            if key not in self.weights:
+                self.weights[key] = float(value)
+                modified = True
+        return modified
 
     def record_prediction(self, result: DCIResult) -> RLPrediction:
         """Store a prediction to await feedback and return adjusted probability."""
@@ -290,6 +326,8 @@ class DCIRLAgent:
         if isinstance(weights, dict):
             agent.weights = {str(k): float(v) for k, v in weights.items()}
 
+        agent.ensure_default_weights()
+
         pending_payload = payload.get("pending")
         if isinstance(pending_payload, list):
             for entry in pending_payload:
@@ -351,13 +389,21 @@ class RLAgentManager:
         self._last_saved_models: Dict[str, Dict[str, object]] = {}
         self._factor_history_cache: List[Dict[str, object]] = []
         self._last_saved_factor_weights: Dict[str, float] = {}
-        self._load_state()
+        state_loaded = self._load_state()
+        defaults_applied = self._agent.ensure_default_weights()
+        for agent in self._sector_agents.values():
+            if agent.ensure_default_weights():
+                defaults_applied = True
         # Ensure the DCI module sees the persisted weights when the manager starts.
         set_factor_weights(self._factor_weights)
         self._model_history_cache.setdefault("global", [])
-        if "global" not in self._last_saved_models:
+        if state_loaded and "global" not in self._last_saved_models:
             self._last_saved_models["global"] = copy.deepcopy(self._agent.to_dict())
-        if not self._last_saved_factor_weights:
+        if state_loaded and not self._last_saved_factor_weights:
+            self._last_saved_factor_weights = dict(self._factor_weights)
+        if not state_loaded or defaults_applied:
+            self._save_state()
+        elif not self._last_saved_factor_weights:
             self._last_saved_factor_weights = dict(self._factor_weights)
 
     @staticmethod
@@ -503,10 +549,18 @@ class RLAgentManager:
         with self.legacy_state_path.open("w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
 
-    def _load_state(self) -> None:
+    def _load_state(self) -> bool:
         if self._load_from_directory():
-            return
+            return True
+
+        previous_models = bool(self._last_saved_models)
+        previous_weights = dict(self._factor_weights)
         self._load_legacy_state()
+
+        if self._last_saved_models and not previous_models:
+            return True
+
+        return self._factor_weights != previous_weights
 
     def _load_from_directory(self) -> bool:
         if not self.state_dir.exists():
@@ -676,6 +730,7 @@ class RLAgentManager:
         if agent is None:
             agent = DCIRLAgent()
             self._sector_agents[key] = agent
+        agent.ensure_default_weights()
         return agent
 
     def record_prediction(self, result: DCIResult, sector: Optional[str] = None) -> RLPrediction:
