@@ -29,6 +29,17 @@ __all__ = [
 
 DEFAULT_INTERVAL = getattr(Interval, "in_1_minute", "1m")
 
+# ---------------------------------------------------------------------------
+# Default credentials
+# ---------------------------------------------------------------------------
+# The service that backs :mod:`tvDatafeed` requires an authenticated TradingView
+# session.  In private deployments where environment variables are not
+# configured we fall back to the project owner's TradingView credentials so the
+# data pipeline remains functional out of the box.  The environment variables
+# still take precedence to allow overrides in other environments.
+DEFAULT_USERNAME = "sunchentong.999@gmail.com"
+DEFAULT_PASSWORD = "Sct_960924qwe"
+
 
 class TVDataError(RuntimeError):
     """Raised when tvDatafeed is unavailable or returns invalid data."""
@@ -49,9 +60,12 @@ _CLIENT: Optional[TvDatafeed] = None
 def _get_credentials() -> tuple[Optional[str], Optional[str]]:
     """Return the tvDatafeed credentials from the environment."""
 
-    username = os.getenv("TVDATAFEED_USERNAME")
-    password = os.getenv("TVDATAFEED_PASSWORD")
-    return username or None, password or None
+    username = os.getenv("TVDATAFEED_USERNAME", "")
+    password = os.getenv("TVDATAFEED_PASSWORD", "")
+
+    username = username.strip() or DEFAULT_USERNAME
+    password = password.strip() or DEFAULT_PASSWORD
+    return username, password
 
 
 def is_available() -> bool:
