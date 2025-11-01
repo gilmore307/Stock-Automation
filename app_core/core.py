@@ -22,7 +22,7 @@ from dash import dcc, html, ctx, no_update
 
 from .dci import BASE_FACTOR_WEIGHTS, build_inputs, compute_dci, get_factor_weights
 from .dci.providers import load_dci_payloads
-from .data import tv as tv_data
+from .data import finnhub, fred, nasdaq, openfigi, tv as tv_data
 
 try:
     from .dci.rl import RLAgentManager, get_global_manager
@@ -63,19 +63,6 @@ def us_eastern_today() -> dt.date:
     """Return today's date in US Eastern timezone."""
 
     return dt.datetime.now(US_EASTERN).date()
-
-FINNHUB_API_KEY = os.getenv(
-    "FINNHUB_API_KEY",
-    "d3ifbshr01qn6oiodof0d3ifbshr01qn6oiodofg",
-)
-OPENFIGI_API_KEY = os.getenv(
-    "OPENFIGI_API_KEY",
-    "9e242491-ee71-47c0-9e04-49d2e952c15c",
-)
-FRED_API_KEY = os.getenv(
-    "FRED_API_KEY",
-    "5c9129e297742bb633b85e498edf83fa",
-)
 
 TV_DEFAULT_EXCHANGE = os.getenv("TVDATAFEED_DEFAULT_EXCHANGE", "").upper().strip()
 TV_OPTION_EXCHANGE = os.getenv("TVDATAFEED_OPTION_EXCHANGE", "CBOE").upper().strip()
@@ -1481,32 +1468,7 @@ def _persist_symbol_meta_cache(cache: dict[str, dict[str, T.Any]]) -> None:
 
 
 def _fetch_symbol_profile(symbol: str) -> dict[str, T.Any] | None:
-    url = "https://finnhub.io/api/v1/stock/profile2"
-    try:
-        resp = requests.get(
-            url,
-            params={"symbol": symbol.upper(), "token": FINNHUB_API_KEY},
-            timeout=10,
-        )
-        if not resp.ok:
-            return None
-        data = resp.json()
-    except (requests.RequestException, ValueError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    sector = str(data.get("finnhubIndustry") or data.get("sector") or "").strip()
-    industry = str(data.get("industry") or data.get("gicsSector") or "").strip()
-    name = str(data.get("name") or data.get("ticker") or "").strip()
-    exchange = str(data.get("exchange") or data.get("exchangeSymbol") or "").strip()
-    return {
-        "sector": sector,
-        "industry": industry,
-        "name": name,
-        "exchange": exchange,
-        "source": "finnhub",
-        "last_updated": dt.datetime.now(US_EASTERN).isoformat(),
-    }
+    return finnhub.fetch_company_profile(symbol)
 
 
 def _get_symbol_metadata(symbol: str) -> dict[str, T.Any]:
@@ -1922,200 +1884,28 @@ def _check_resource_connections(ft_session: dict[str, T.Any] | None) -> list[dic
 
     # Nasdaq earnings API
     def _check_nasdaq_once() -> tuple[bool, str]:
-        try:
-            resp = requests.get(
-                NASDAQ_API,
-                params={"date": today_str},
-                headers=HEADERS,
-                timeout=5,
-            )
-            if resp.ok:
-                try:
-                    payload = resp.json()
-                except ValueError:
-                    payload = None
-                rows_data = None
-                if isinstance(payload, dict):
-                    data_block = payload.get("data") if isinstance(payload.get("data"), dict) else None
-                    calendar_block = (
-                        data_block.get("calendar")
-                        if isinstance((data_block or {}).get("calendar"), dict)
-                        else None
-                    )
-                    if isinstance(calendar_block, dict):
-                        rows_data = calendar_block.get("rows")
-                    if rows_data is None and isinstance(data_block, dict):
-                        rows_data = data_block.get("rows")
-                    if rows_data is None:
-                        rows_data = payload.get("rows")
-                rows = rows_data if isinstance(rows_data, list) else []
-                if rows:
-                    sample = rows[0]
-                    symbol = (
-                        sample.get("symbol")
-                        or sample.get("Symbol")
-                        or sample.get("companyTickerSymbol")
-                        or ""
-                    )
-                    time_field = (
-                        sample.get("time")
-                        or sample.get("Time")
-                        or sample.get("EPSTime")
-                        or sample.get("timeStatus")
-                        or sample.get("when")
-                        or ""
-                    )
-                    symbol = str(symbol).strip().upper()
-                    time_field = str(time_field).strip() or "未提供时间"
-                    if symbol:
-                        ok = True
-                        detail = f"示例：{symbol}｜{time_field}"
-                    else:
-                        ok = False
-                        detail = "返回行缺少代码字段"
-                else:
-                    ok = False
-                    detail = "缺少财报行数据"
-            else:
-                ok = False
-                detail = f"HTTP {resp.status_code}"
-        except requests.RequestException as exc:
-            ok = False
-            detail = f"请求异常：{exc}"[:160]
-        return ok, detail
+        return nasdaq.check_status(today_str)
 
     ok, detail = run_with_retry(_check_nasdaq_once)
     add_status("Nasdaq 财报 API", "财报列表（代码/时间段）", ok, detail)
 
     # Finnhub API
     def _check_finnhub_once() -> tuple[bool, str]:
-        try:
-            resp = requests.get(
-                "https://finnhub.io/api/v1/quote",
-                params={"symbol": "AAPL", "token": FINNHUB_API_KEY},
-                timeout=5,
-            )
-            if resp.ok:
-                try:
-                    payload = resp.json()
-                except ValueError:
-                    payload = None
-                if isinstance(payload, dict):
-                    price = payload.get("c")
-                    prev_close = payload.get("pc")
-                    timestamp = payload.get("t")
-                    if price is not None and prev_close is not None and timestamp:
-                        ok = True
-                        detail = f"现价 {price}｜昨收 {prev_close}"
-                    else:
-                        ok = False
-                        detail = "缺少现价/昨收数据"
-                else:
-                    ok = False
-                    detail = "返回内容异常"
-            else:
-                ok = False
-                detail = f"HTTP {resp.status_code}"
-        except requests.RequestException as exc:
-            ok = False
-            detail = f"请求异常：{exc}"[:160]
-        return ok, detail
+        return finnhub.check_status("AAPL")
 
     ok, detail = run_with_retry(_check_finnhub_once)
     add_status("Finnhub API", "实时行情（现价/昨收）", ok, detail)
 
     # OpenFIGI API
     def _check_openfigi_once() -> tuple[bool, str]:
-        try:
-            resp = requests.post(
-                "https://api.openfigi.com/v3/mapping",
-                headers={
-                    "Content-Type": "application/json",
-                    "X-OPENFIGI-APIKEY": OPENFIGI_API_KEY,
-                },
-                json=[{"idType": "TICKER", "idValue": "AAPL"}],
-                timeout=5,
-            )
-            if resp.ok:
-                try:
-                    payload = resp.json()
-                except ValueError:
-                    payload = None
-                if isinstance(payload, list) and payload:
-                    entry = payload[0]
-                    data_rows = entry.get("data") if isinstance(entry, dict) else None
-                    if isinstance(data_rows, list) and data_rows:
-                        mapping = data_rows[0]
-                        figi = (mapping or {}).get("figi")
-                        name = (mapping or {}).get("name") or (mapping or {}).get("securityName")
-                        if figi:
-                            ok = True
-                            name_part = f"｜{name}" if name else ""
-                            detail = f"AAPL → {figi}{name_part}"
-                        else:
-                            ok = False
-                            detail = "缺少 FIGI 字段"
-                    else:
-                        ok = False
-                        detail = "缺少映射条目"
-                else:
-                    ok = False
-                    detail = "返回内容异常"
-            else:
-                ok = False
-                detail = f"HTTP {resp.status_code}"
-        except requests.RequestException as exc:
-            ok = False
-            detail = f"请求异常：{exc}"[:160]
-        return ok, detail
+        return openfigi.check_status("AAPL")
 
     ok, detail = run_with_retry(_check_openfigi_once)
     add_status("OpenFIGI API", "Ticker → FIGI 映射", ok, detail)
 
     # FRED API
     def _check_fred_once() -> tuple[bool, str]:
-        try:
-            resp = requests.get(
-                "https://api.stlouisfed.org/fred/series/observations",
-                params={
-                    "series_id": "DGS3MO",
-                    "api_key": FRED_API_KEY,
-                    "file_type": "json",
-                    "sort_order": "desc",
-                    "limit": 1,
-                },
-                timeout=5,
-            )
-            if resp.ok:
-                try:
-                    payload = resp.json()
-                except ValueError:
-                    payload = None
-                observations = (
-                    payload.get("observations")
-                    if isinstance(payload, dict)
-                    else None
-                )
-                if isinstance(observations, list) and observations:
-                    latest = observations[0]
-                    value = (latest or {}).get("value")
-                    date_text = (latest or {}).get("date")
-                    if value and value != ".":
-                        ok = True
-                        detail = f"{date_text} → {value}"
-                    else:
-                        ok = False
-                        detail = "观测值缺失"
-                else:
-                    ok = False
-                    detail = "缺少观测数据"
-            else:
-                ok = False
-                detail = f"HTTP {resp.status_code}"
-        except requests.RequestException as exc:
-            ok = False
-            detail = f"请求异常：{exc}"[:160]
-        return ok, detail
+        return fred.check_status("DGS3MO")
 
     ok, detail = run_with_retry(_check_fred_once)
     add_status("FRED API", "DGS3MO 系列（最新观测值）", ok, detail)
@@ -2462,17 +2252,6 @@ def _clear_prediction_run_state(run_id: str) -> None:
         PREDICTION_RUN_STATES.pop(run_id, None)
 
 # ---------- Nasdaq API ----------
-NASDAQ_API = "https://api.nasdaq.com/api/calendar/earnings"
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/plain, */*",
-    "Origin": "https://www.nasdaq.com",
-    "Referer": "https://www.nasdaq.com/market-activity/earnings",
-}
 def this_friday(base_date: dt.date) -> dt.date:
     wd = base_date.isoweekday()  # Mon=1 ... Sun=7
     if wd <= 5:
@@ -2512,40 +2291,10 @@ def previous_trading_day(base_date: dt.date) -> dt.date:
 
 
 def fetch_earnings_by_date(d: dt.date) -> T.List[dict]:
-    for _ in range(2):  # simple retry
-        r = requests.get(NASDAQ_API, params={"date": d.strftime("%Y-%m-%d")},
-                         headers=HEADERS, timeout=20)
-        r.raise_for_status()
-        try:
-            j = r.json()
-        except json.JSONDecodeError:
-            time.sleep(1)
-            continue
-
-        data = j.get("data") if isinstance(j, dict) else None
-        rows = None
-        if isinstance(data, dict):
-            cal = data.get("calendar") if isinstance(data.get("calendar"), dict) else None
-            rows = (cal or data).get("rows") if isinstance((cal or data), dict) else None
-        if rows is None and isinstance(j, dict):
-            rows = j.get("rows")
-        if not rows:
-            return []
-
-        out = []
-        for row in rows:
-            symbol = (row.get("symbol") or row.get("Symbol") or row.get("companyTickerSymbol") or "").strip()
-            time_field = (row.get("time") or row.get("Time") or row.get("EPSTime") or row.get("timeStatus") or row.get("when") or "").strip()
-            name = (row.get("companyName") or row.get("name") or row.get("Company") or "").strip()
-            if symbol:
-                out.append({
-                    "symbol": symbol.upper(),
-                    "company": name,
-                    "time": time_field,
-                    "raw": row,
-                })
-        return out
-    return []
+    try:
+        return nasdaq.fetch_earnings(d)
+    except requests.RequestException:
+        return []
 
 
 # ---------- Time bucket filters ----------
