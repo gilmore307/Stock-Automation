@@ -1547,6 +1547,30 @@ def _extract_timeline_payload(
     return None, ""
 
 
+def _summarise_dci_payloads(
+    symbols: list[str],
+    payloads: dict[str, dict[str, T.Any]] | None,
+) -> tuple[list[str], list[str]]:
+    """根据已载入的 DCI 输入区分可用与缺失的标的。"""
+
+    available: list[str] = []
+    missing: list[str] = []
+
+    if not isinstance(payloads, dict):
+        payloads = {}
+
+    for raw_symbol in symbols:
+        symbol = (raw_symbol or "").upper()
+        if not symbol:
+            continue
+        if isinstance(payloads.get(symbol), dict):
+            available.append(symbol)
+        else:
+            missing.append(symbol)
+
+    return available, missing
+
+
 def _compute_dci_for_symbols(
     symbols: list[str],
     metadata_map: dict[str, dict[str, T.Any]] | None = None,
@@ -1554,8 +1578,10 @@ def _compute_dci_for_symbols(
         T.Callable[[str, dict[str, T.Any], str, T.Optional[str]], None]
     ] = None,
     timeline_configs: list[dict[str, T.Any]] | None = None,
+    payloads: dict[str, dict[str, T.Any]] | None = None,
 ) -> tuple[list[dict[str, T.Any]], list[str], list[str]]:
-    payloads = _load_dci_payloads()
+    if not isinstance(payloads, dict):
+        payloads = _load_dci_payloads()
     results: list[dict[str, T.Any]] = []
     missing: list[str] = []
     errors: list[str] = []
@@ -3621,11 +3647,38 @@ def _prediction_thread_worker(
 
             metadata_map = timeline_metadata_map.get(timeline_key, {})
             symbols = list(metadata_map.keys())
+            dci_payloads = _load_dci_payloads()
+            available_symbols, missing_symbols = _summarise_dci_payloads(
+                symbols,
+                dci_payloads,
+            )
+
+            summary_parts: list[str] = []
+            if available_symbols:
+                sample = "，".join(available_symbols[:6])
+                more = "……" if len(available_symbols) > 6 else ""
+                summary_parts.append(
+                    f"命中 {len(available_symbols)} 个标的（{sample}{more}）"
+                )
+            if missing_symbols:
+                sample = "，".join(missing_symbols[:6])
+                more = "……" if len(missing_symbols) > 6 else ""
+                summary_parts.append(
+                    f"缺少 {len(missing_symbols)} 个标的的 DCI 输入（{sample}{more}）"
+                )
+
+            if summary_parts:
+                _emit(
+                    f"已加载 {label} 的 DCI 输入：" + "；".join(summary_parts),
+                    task_label=label,
+                )
+
             partial_results, partial_missing, partial_errors = _compute_dci_for_symbols(
                 symbols,
                 metadata_map,
                 progress_callback=_progress,
                 timeline_configs=[cfg],
+                payloads=dci_payloads,
             )
 
             for entry in partial_results:
