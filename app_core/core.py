@@ -6,6 +6,7 @@ import typing as T
 import datetime as dt
 import uuid
 import copy
+import math
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -3170,6 +3171,108 @@ def render_model_details_logic(agent_data):  # noqa: D401
                     )
 
     return rows
+
+
+def _normalise_history_value(value: T.Any) -> T.Any:
+    """Normalise RL parameter values for stable change detection."""
+
+    if value is None or isinstance(value, bool):
+        return value
+
+    if isinstance(value, (dt.datetime, dt.date)):
+        return value.isoformat()
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return value
+        if math.isnan(number) or math.isinf(number):
+            return None
+        if isinstance(value, int):
+            return int(number)
+        return round(number, 6)
+
+    if isinstance(value, (list, tuple, set)):
+        return [_normalise_history_value(item) for item in value]
+
+    if isinstance(value, dict):
+        return {
+            str(key): _normalise_history_value(val)
+            for key, val in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+
+    return _json_safe(value)
+
+
+def _extract_global_trackable(agent_data: dict[str, T.Any]) -> dict[str, T.Any]:
+    """Extract comparable global RL parameters from the agent snapshot."""
+
+    if not isinstance(agent_data, dict):
+        return {}
+
+    global_data = agent_data.get("global")
+    if not isinstance(global_data, dict):
+        global_data = agent_data if isinstance(agent_data, dict) else {}
+
+    trackable: dict[str, T.Any] = {}
+    scalar_keys = (
+        "learning_rate",
+        "gamma",
+        "adjustment_scale",
+        "bias",
+        "baseline",
+        "update_count",
+    )
+    for key in scalar_keys:
+        if key in global_data:
+            trackable[key] = global_data.get(key)
+
+    if "total_predictions" in global_data:
+        trackable["total_predictions"] = global_data.get("total_predictions")
+    elif "prediction_count" in global_data:
+        trackable["total_predictions"] = global_data.get("prediction_count")
+
+    weights = global_data.get("weights")
+    if isinstance(weights, dict):
+        for feature, weight in sorted(weights.items(), key=lambda item: str(item[0])):
+            trackable[f"weight::{feature}"] = weight
+
+    factor_weights = agent_data.get("factor_weights")
+    if isinstance(factor_weights, dict):
+        for factor, weight in sorted(factor_weights.items(), key=lambda item: str(item[0])):
+            trackable[f"factor::{factor}"] = weight
+
+    return trackable
+
+
+def _extract_sector_trackable(agent_data: dict[str, T.Any]) -> dict[str, dict[str, T.Any]]:
+    """Extract comparable sector-specific RL parameters from the agent snapshot."""
+
+    sectors_payload = agent_data.get("sectors") if isinstance(agent_data, dict) else None
+    if not isinstance(sectors_payload, dict):
+        return {}
+
+    result: dict[str, dict[str, T.Any]] = {}
+    for sector_name, payload in sectors_payload.items():
+        if not isinstance(payload, dict):
+            continue
+
+        sector_entry: dict[str, T.Any] = {}
+        for key in ("baseline", "update_count", "total_predictions", "prediction_count"):
+            if key in payload:
+                sector_entry[key] = payload.get(key)
+
+        weights = payload.get("weights")
+        if isinstance(weights, dict):
+            for feature, weight in sorted(weights.items(), key=lambda item: str(item[0])):
+                sector_entry[f"weight::{feature}"] = weight
+
+        if sector_entry:
+            result[str(sector_name)] = sector_entry
+
+    return result
+
 
 def update_parameter_history_logic(agent_data, history_state, log_state):  # noqa: D401
     base_history: dict[str, T.Any]
