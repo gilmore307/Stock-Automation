@@ -1579,12 +1579,18 @@ def _compute_dci_for_symbols(
     ] = None,
     timeline_configs: list[dict[str, T.Any]] | None = None,
     payloads: dict[str, dict[str, T.Any]] | None = None,
-) -> tuple[list[dict[str, T.Any]], list[str], list[str]]:
+) -> tuple[
+    list[dict[str, T.Any]],
+    list[str],
+    list[str],
+    dict[str, str],
+]:
     if not isinstance(payloads, dict):
         payloads = _load_dci_payloads()
     results: list[dict[str, T.Any]] = []
     missing: list[str] = []
     errors: list[str] = []
+    missing_detail_map: dict[str, str] = {}
 
     timelines = timeline_configs or PREDICTION_TIMELINES
 
@@ -1594,6 +1600,7 @@ def _compute_dci_for_symbols(
             continue
         data = payloads.get(symbol)
         if not data:
+            reason = "未找到该标的的 DCI 输入文件"
             if progress_callback:
                 for timeline in timelines:
                     try:
@@ -1601,11 +1608,12 @@ def _compute_dci_for_symbols(
                             symbol,
                             timeline,
                             "missing",
-                            "缺少 DCI 输入数据",
+                            reason,
                         )
                     except Exception:  # pragma: no cover - logging best effort
                         pass
             missing.append(symbol)
+            missing_detail_map[symbol] = reason
             continue
 
         meta_entry = metadata_map.get(symbol) if isinstance(metadata_map, dict) else None
@@ -1625,12 +1633,38 @@ def _compute_dci_for_symbols(
 
             payload, alias = _extract_timeline_payload(data, timeline)
             if not payload:
+                label = str(timeline.get("label") or timeline.get("key") or "未知时点")
+                aliases = [str(timeline.get("key") or "")] + [
+                    str(item)
+                    for item in (timeline.get("aliases") or [])
+                    if item
+                ]
+                alias_part = "，".join([item for item in aliases if item]) or "无"
+                available_keys: list[str] = []
+                snapshots = data.get("snapshots")
+                if isinstance(snapshots, dict):
+                    for snap_key, snap_val in snapshots.items():
+                        if isinstance(snap_key, str) and isinstance(snap_val, dict):
+                            available_keys.append(snap_key)
+                for direct_key, direct_val in data.items():
+                    if isinstance(direct_key, str) and isinstance(direct_val, dict):
+                        available_keys.append(direct_key)
+                available_keys = sorted({key for key in available_keys if key})
+                sample_available = "，".join(available_keys[:6])
+                if len(available_keys) > 6:
+                    sample_available += "……"
+                available_part = sample_available or "无"
+                reason = (
+                    f"缺少 {label} 的输入快照（尝试：{alias_part}；已有：{available_part}）"
+                )
                 if progress_callback:
                     try:
-                        progress_callback(symbol, timeline, "missing", None)
+                        progress_callback(symbol, timeline, "missing", reason)
                     except Exception:  # pragma: no cover - logging best effort
                         pass
-                missing.append(f"{symbol}({timeline.get('label')})")
+                identifier = f"{symbol}({label})"
+                missing.append(identifier)
+                missing_detail_map[identifier] = reason
                 continue
 
             try:
@@ -1739,7 +1773,7 @@ def _compute_dci_for_symbols(
                         pass
 
     results.sort(key=lambda row: (row.get("symbol", ""), row.get("lookback_days", 0)))
-    return results, missing, errors
+    return results, missing, errors, missing_detail_map
 
 
 def _check_resource_connections(ft_session: dict[str, T.Any] | None) -> list[dict[str, T.Any]]:
@@ -3247,12 +3281,15 @@ def _prediction_thread_worker(
             result_lookup[(symbol, timeline_key_init)] = dict(entry)
 
     missing_existing: set[str] = set()
+    missing_reason_lookup: dict[str, str] = {}
     raw_missing = archive_snapshot.get("missing") if isinstance(archive_snapshot, dict) else None
     if isinstance(raw_missing, list):
         for item in raw_missing:
             if item is None:
                 continue
-            missing_existing.add(str(item))
+            key = str(item)
+            missing_existing.add(key)
+            missing_reason_lookup[key] = "历史存档标记为缺失"
 
     errors_existing: set[str] = set()
     raw_errors = archive_snapshot.get("errors") if isinstance(archive_snapshot, dict) else None
@@ -3673,7 +3710,12 @@ def _prediction_thread_worker(
                     task_label=label,
                 )
 
-            partial_results, partial_missing, partial_errors = _compute_dci_for_symbols(
+            (
+                partial_results,
+                partial_missing,
+                partial_errors,
+                partial_missing_detail,
+            ) = _compute_dci_for_symbols(
                 symbols,
                 metadata_map,
                 progress_callback=_progress,
@@ -3694,6 +3736,10 @@ def _prediction_thread_worker(
                 if item is None:
                     continue
                 all_missing_set.add(str(item))
+            if isinstance(partial_missing_detail, dict):
+                for miss_key, miss_reason in partial_missing_detail.items():
+                    if miss_key:
+                        missing_reason_lookup[miss_key] = miss_reason
 
             for item in partial_errors:
                 if item is None:
@@ -3793,6 +3839,15 @@ def _prediction_thread_worker(
             if len(missing) > 5:
                 preview_missing += "……"
             lines.append(f"缺少数据的条目：{preview_missing}")
+            grouped_missing: dict[str, list[str]] = {}
+            for miss_key in missing:
+                reason_text = missing_reason_lookup.get(miss_key) or "原因未明"
+                grouped_missing.setdefault(reason_text, []).append(miss_key)
+            for reason_text, miss_entries in grouped_missing.items():
+                sample_text = "；".join(miss_entries[:5])
+                if len(miss_entries) > 5:
+                    sample_text += "……"
+                lines.append(f"{reason_text}：{sample_text}")
 
         if errors:
             preview_errors = "；".join(errors[:5])
