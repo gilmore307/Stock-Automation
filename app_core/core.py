@@ -51,7 +51,7 @@ SYMBOL_META_PATH = CACHE_ROOT / "symbol_metadata.json"
 SYMBOL_META_CACHE: dict[str, dict[str, T.Any]] = {}
 
 LOG_ARCHIVE_DIR = ARCHIVE_ROOT / "logs"
-LOG_LINES_PER_FILE = 200
+LOG_LINES_PER_FILE = 2000
 LOG_MAX_FILES = 20
 LOG_FILE_LOCK = threading.Lock()
 CURRENT_LOG_FILE: Path | None = None
@@ -278,6 +278,14 @@ def _prediction_archive_file(date_value: dt.date) -> Path:
 
 def _prediction_symbol_dir(date_value: dt.date) -> Path:
     return PREDICTION_ARCHIVE_DIR / date_value.isoformat()
+
+
+def _prediction_symbol_file(date_value: dt.date, symbol: str) -> Path:
+    safe_symbol = "".join(
+        ch for ch in symbol if ch.isalnum() or ch in {"-", "_", "."}
+    )
+    safe_symbol = safe_symbol or "symbol"
+    return _prediction_symbol_dir(date_value) / f"{safe_symbol}.json"
 
 
 def _persist_parameter_snapshot(timestamp: str, snapshot: dict[str, T.Any]) -> None:
@@ -889,12 +897,21 @@ def _store_prediction_results(
         if symbol_groups:
             symbol_dir.mkdir(parents=True, exist_ok=True)
             for symbol, entries in symbol_groups.items():
-                file_path = symbol_dir / f"{key}_{symbol}.json"
-                try:
-                    with file_path.open("r", encoding="utf-8") as fh:
-                        existing_payload = json.load(fh)
-                except (OSError, json.JSONDecodeError):
-                    existing_payload = {}
+                file_path = _prediction_symbol_file(target_date, symbol)
+                legacy_path = symbol_dir / f"{key}_{symbol}.json"
+
+                existing_payload: dict[str, T.Any] = {}
+                legacy_source_used = False
+                for candidate in (file_path, legacy_path):
+                    try:
+                        with candidate.open("r", encoding="utf-8") as fh:
+                            payload_candidate = json.load(fh)
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                    if isinstance(payload_candidate, dict):
+                        existing_payload = payload_candidate
+                        legacy_source_used = candidate == legacy_path
+                        break
 
                 history = existing_payload.get("history")
                 if not isinstance(history, list):
@@ -938,6 +955,12 @@ def _store_prediction_results(
                         per_symbol_payload[preserved_key] = existing_payload[preserved_key]
 
                 _write_archive_file(file_path, per_symbol_payload)
+
+                if legacy_source_used and legacy_path.exists() and legacy_path != file_path:
+                    try:
+                        legacy_path.unlink()
+                    except OSError:
+                        pass
 
         archive = _load_prediction_archive_raw()
         archive[key] = payload_to_write
