@@ -2128,9 +2128,24 @@ class FTClient:
         if accounts:
             self.account_ids = accounts
 
-    def has_weekly_expiring_on(self, symbol: str, expiry: dt.date) -> T.Optional[bool]:
+    def has_weekly_expiring_on(
+        self, symbol: str, expiry: dt.date
+    ) -> tuple[T.Optional[bool], T.Optional[str], bool]:
+        """Check whether a symbol has a weekly option expiring on the given date.
+
+        Returns a tuple ``(has_weekly, expiry_type, matched)`` where:
+
+        - ``has_weekly`` is ``True`` if a weekly option matches the target expiry,
+          ``False`` if a non-weekly contract matches, and ``None`` when the lookup
+          fails.
+        - ``expiry_type`` surfaces the matched ``exp_type`` (such as ``"W"`` or
+          ``"M"``) when available.
+        - ``matched`` indicates whether Firstrade reported a contract for the
+          target expiry regardless of the option type.
+        """
+
         if not self.enabled or not self.session:
-            return None
+            return None, None, False
 
         try:
             self._log(f"正在请求 {symbol.upper()} 的周度期权到期日。")
@@ -2144,17 +2159,17 @@ class FTClient:
                 self.enabled = False
                 self.error = "Firstrade 会话已过期"
                 self._log("查询期权时 Firstrade 会话已过期（HTTP 401）。")
-                return None
+                return None, None, False
             if resp.status_code != 200 or not isinstance(data, dict):
                 self._log(f"查询 {symbol.upper()} 的期权失败，HTTP {resp.status_code}。")
-                return None
+                return None, None, False
             err_msg = str(data.get("error") or "").strip()
             if err_msg:
                 self._log(f"查询 {symbol.upper()} 的期权返回错误：{err_msg}")
-                return None
+                return None, None, False
             items = data.get("items")
             if not isinstance(items, list):
-                return None
+                return None, None, False
 
             target = expiry.strftime("%Y%m%d")
             for entry in items:
@@ -2165,15 +2180,20 @@ class FTClient:
                     continue
                 exp_type = str(entry.get("exp_type", "")).upper()
                 # exp_type "W" => weekly, "M" => monthly, other codes possible
+                if exp_type == "W":
+                    self._log(
+                        f"找到 {symbol.upper()} 在 {target} 的到期日 {exp_date}（类型 {exp_type}）。"
+                    )
+                    return True, exp_type, True
                 self._log(
-                    f"找到 {symbol.upper()} 在 {target} 的到期日 {exp_date}（类型 {exp_type}）。"
+                    f"找到 {symbol.upper()} 在 {target} 的到期日 {exp_date}（类型 {exp_type}，非周度期权）。"
                 )
-                return exp_type == "W"
+                return False, exp_type or None, True
             self._log(f"未找到 {symbol.upper()} 在 {target} 的匹配到期日。")
-            return False
+            return False, None, False
         except Exception:
             self._log(f"获取 {symbol.upper()} 期权到期日时出现异常。")
-            return None
+            return None, None, False
 
 
 
@@ -2239,46 +2259,85 @@ def _prepare_earnings_dataset(
         _log(error)
         return [], "", None, False, error
 
-    weekly_map: dict[str, bool] = {}
-    filtered_rows: list[dict[str, T.Any]] = []
-    options_applied = False
+    option_cache: dict[str, tuple[T.Optional[bool], T.Optional[str], bool]] = {}
+    option_notes: dict[str, dict[str, T.Any]] = {}
+    weekly_rows: list[dict[str, T.Any]] = []
+    fallback_rows: list[dict[str, T.Any]] = []
     error_message = ""
+    options_checked = False
+    selection_mode = "pending"
 
     if ft_client and ft_client.enabled:
         expiry_date = this_friday(target_date)
-        evaluated = 0
         skipped_symbols: list[str] = []
-        options_applied = False
+        missing_symbols: list[str] = []
+        non_weekly_symbols: list[str] = []
         for entry in base_rows:
             symbol = str(entry.get("symbol") or "").upper()
             if not symbol:
                 continue
-            if symbol not in weekly_map:
-                result = ft_client.has_weekly_expiring_on(symbol, expiry_date)
-                if result is None:
+            cached = option_cache.get(symbol)
+            if cached is None:
+                cached = ft_client.has_weekly_expiring_on(symbol, expiry_date)
+                option_cache[symbol] = cached
+            has_weekly, expiry_type, matched = cached
+            if has_weekly is None:
+                if symbol not in skipped_symbols:
                     skipped_symbols.append(symbol)
                     _log(f"无法确认 {symbol} 的周五期权信息。")
-                    continue
-                weekly_map[symbol] = bool(result)
-            evaluated += 1
-            if weekly_map.get(symbol):
-                filtered_rows.append(entry)
+                continue
+            options_checked = True
 
-        if evaluated:
-            options_applied = True
+            notes = option_notes.setdefault(symbol, {})
+            notes["weekly"] = bool(has_weekly)
+            if expiry_type:
+                notes["expiry_type"] = expiry_type
+
+            if has_weekly:
+                weekly_rows.append(entry)
+                continue
+
+            if matched:
+                fallback_rows.append(entry)
+                label = f"{symbol}（类型 {expiry_type or '未知'}）"
+                if label not in non_weekly_symbols:
+                    non_weekly_symbols.append(label)
+            else:
+                if symbol not in missing_symbols:
+                    missing_symbols.append(symbol)
 
         if skipped_symbols:
             preview = "，".join(skipped_symbols[:5])
             suffix = "…" if len(skipped_symbols) > 5 else ""
             _log(f"部分标的缺少周五期权信息，已跳过：{preview}{suffix}。")
 
-        if options_applied and ft_client.enabled:
-            _log(f"Firstrade 筛选完成，保留 {len(filtered_rows)} 条记录。")
-            base_rows = filtered_rows
+        if weekly_rows:
+            selection_mode = "weekly"
+            _log(f"Firstrade 筛选完成，保留 {len(weekly_rows)} 条记录。")
+            base_rows = weekly_rows
+        elif fallback_rows:
+            selection_mode = "fallback"
+            _log(
+                f"目标日期未检测到周度期权，保留 {len(fallback_rows)} 条其他类型合约记录。"
+            )
+            base_rows = fallback_rows
         else:
             base_rows = []
-            if not error_message:
+            if options_checked:
+                selection_mode = "empty"
+                _log("Firstrade 筛选后暂无符合条件的标的。")
+            elif not error_message:
                 error_message = "Firstrade 筛选未完成"
+
+        if non_weekly_symbols:
+            preview = "，".join(non_weekly_symbols[:5])
+            suffix = "…" if len(non_weekly_symbols) > 5 else ""
+            _log(f"以下标的非周度期权：{preview}{suffix}。")
+
+        if missing_symbols:
+            preview = "，".join(missing_symbols[:5])
+            suffix = "…" if len(missing_symbols) > 5 else ""
+            _log(f"未找到以下标的的目标到期日：{preview}{suffix}。")
     else:  # pragma: no cover - guarded above
         return [], "", session_out, False, ft_client.error if ft_client else ""
 
@@ -2286,16 +2345,23 @@ def _prepare_earnings_dataset(
         _log(f"Firstrade 会话失效：{error_message}")
         return [], "", session_out, False, error_message
 
-    if not options_applied:
+    if ft_client and ft_client.enabled:
+        if selection_mode == "pending":
+            status_text = f"{target_date.strftime('%Y-%m-%d')} 未完成 Firstrade 周五期权筛选。"
+            return [], status_text, session_out, False, ""
+        if selection_mode == "weekly":
+            status_text = (
+                f"{target_date.strftime('%Y-%m-%d')} 筛选周五期权后保留 {len(base_rows)} 个标的。"
+            )
+        elif selection_mode == "fallback":
+            status_text = (
+                f"{target_date.strftime('%Y-%m-%d')} 未找到周度期权，保留 {len(base_rows)} 个标的。"
+            )
+        else:
+            status_text = f"{target_date.strftime('%Y-%m-%d')} 筛选后暂无符合条件的标的。"
+    else:
         status_text = f"{target_date.strftime('%Y-%m-%d')} 未完成 Firstrade 周五期权筛选。"
         return [], status_text, session_out, False, ""
-
-    if not base_rows:
-        status_text = f"{target_date.strftime('%Y-%m-%d')} 筛选后暂无符合条件的标的。"
-    else:
-        status_text = (
-            f"{target_date.strftime('%Y-%m-%d')} 筛选周五期权后保留 {len(base_rows)} 个标的。"
-        )
 
     rows_out: list[dict[str, T.Any]] = []
     for entry in base_rows:
@@ -2309,8 +2375,14 @@ def _prepare_earnings_dataset(
             "bucket": _describe_time_bucket(entry.get("time")),
             "decision_date": target_date.isoformat(),
             "timeline_date": target_date.isoformat(),
-            "weekly_exp_this_fri": True,
         }
+        note = option_notes.get(symbol)
+        if note:
+            row["weekly_exp_this_fri"] = bool(note.get("weekly"))
+            if note.get("expiry_type"):
+                row["expiry_type"] = str(note.get("expiry_type")).upper()
+        else:
+            row["weekly_exp_this_fri"] = True
         raw_payload = entry.get("raw")
         if raw_payload is not None:
             row["raw"] = raw_payload
@@ -2319,7 +2391,8 @@ def _prepare_earnings_dataset(
             row["sector"] = sector
         rows_out.append(row)
 
-    return rows_out, status_text, session_out, True, ""
+    options_applied = selection_mode in {"weekly", "fallback", "empty"}
+    return rows_out, status_text, session_out, options_applied, ""
 
 def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data, username, password, twofa, task_state):  # noqa: D401
     trigger = ctx.triggered_id
