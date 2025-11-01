@@ -81,12 +81,12 @@ def register_callbacks(app: Dash) -> None:
     """Register 预测页相关回调。"""
 
     @app.callback(
-        Output("prediction-store", "data"),
-        Output("prediction-status", "children"),
-        Output("rl-agent-store", "data"),
+        Output("prediction-store", "data", allow_duplicate=True),
+        Output("prediction-status", "children", allow_duplicate=True),
+        Output("rl-agent-store", "data", allow_duplicate=True),
         Output("task-store", "data", allow_duplicate=True),
         Output("log-store", "data", allow_duplicate=True),
-        Output("prediction-run-id-store", "data"),
+        Output("prediction-run-id-store", "data", allow_duplicate=True),
         Output("prediction-poller", "disabled", allow_duplicate=True),
         Input("table", "selectedRows"),
         Input("table", "rowData"),

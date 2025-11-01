@@ -22,6 +22,7 @@ from dash import dcc, html, ctx, no_update
 
 from .dci import BASE_FACTOR_WEIGHTS, build_inputs, compute_dci, get_factor_weights
 from .dci.providers import load_dci_payloads
+from .data import finnhub, fred, nasdaq, openfigi, tv as tv_data
 
 try:
     from .dci.rl import RLAgentManager, get_global_manager
@@ -63,18 +64,29 @@ def us_eastern_today() -> dt.date:
 
     return dt.datetime.now(US_EASTERN).date()
 
-FINNHUB_API_KEY = os.getenv(
-    "FINNHUB_API_KEY",
-    "d3ifbshr01qn6oiodof0d3ifbshr01qn6oiodofg",
+TV_DEFAULT_EXCHANGE = os.getenv("TVDATAFEED_DEFAULT_EXCHANGE", "").upper().strip()
+TV_OPTION_EXCHANGE = os.getenv("TVDATAFEED_OPTION_EXCHANGE", "CBOE").upper().strip()
+TV_PRICE_TOLERANCE_MINUTES = max(
+    1,
+    int(os.getenv("TVDATAFEED_PRICE_TOLERANCE_MINUTES", "5") or 5),
 )
-OPENFIGI_API_KEY = os.getenv(
-    "OPENFIGI_API_KEY",
-    "9e242491-ee71-47c0-9e04-49d2e952c15c",
+TV_OPTION_TOLERANCE_MINUTES = max(
+    1,
+    int(os.getenv("TVDATAFEED_OPTION_TOLERANCE_MINUTES", "5") or 5),
 )
-FRED_API_KEY = os.getenv(
-    "FRED_API_KEY",
-    "5c9129e297742bb633b85e498edf83fa",
-)
+
+TV_EXCHANGE_ALIASES = {
+    "NASDAQ": "NASDAQ",
+    "NASDAQ NMS": "NASDAQ",
+    "NASDAQ GLOBAL SELECT": "NASDAQ",
+    "NYSE": "NYSE",
+    "NEW YORK STOCK EXCHANGE": "NYSE",
+    "NYSE ARCA": "NYSEARCA",
+    "ARCA": "NYSEARCA",
+    "NYSEMKT": "AMEX",
+    "AMEX": "AMEX",
+    "BATS": "BATS",
+}
 
 PREDICTION_TIMELINES = [
     {
@@ -162,8 +174,6 @@ EARNINGS_CACHE_PATH = CACHE_ROOT / "earnings.json"
 EARNINGS_ARCHIVE_DIR = ARCHIVE_ROOT / "earnings"
 CACHE_LOCK = threading.Lock()
 
-PARAMETER_ARCHIVE_DIR = ARCHIVE_ROOT / "parameter_changes"
-
 
 def _load_archive_directory(directory: Path) -> dict[str, T.Any]:
     result: dict[str, T.Any] = {}
@@ -213,23 +223,6 @@ def _json_safe(value: T.Any) -> T.Any:
     if isinstance(value, dict):
         return {str(key): _json_safe(val) for key, val in value.items()}
     return value
-
-
-def _safe_timestamp_to_filename(timestamp: str) -> str:
-    safe = timestamp.strip().replace(" ", "T").replace(":", "-")
-    safe = "".join(ch for ch in safe if ch.isalnum() or ch in {"-", "_", "T"})
-    if not safe:
-        safe = dt.datetime.now(US_EASTERN).strftime("%Y%m%dT%H%M%S")
-    return safe
-
-
-def _prepare_unique_archive_path(directory: Path, base_name: str) -> Path:
-    directory.mkdir(parents=True, exist_ok=True)
-    candidate = directory / f"{base_name}.json"
-    if not candidate.exists():
-        return candidate
-    suffix = uuid.uuid4().hex[:6]
-    return directory / f"{base_name}-{suffix}.json"
 
 
 def _reset_log_rotation_state() -> None:
@@ -345,16 +338,6 @@ def _prediction_symbol_file(date_value: dt.date, symbol: str) -> Path:
     )
     safe_symbol = safe_symbol or "symbol"
     return _prediction_symbol_dir(date_value) / f"{safe_symbol}.json"
-
-
-def _persist_parameter_snapshot(timestamp: str, snapshot: dict[str, T.Any]) -> None:
-    base_name = _safe_timestamp_to_filename(timestamp)
-    path = _prepare_unique_archive_path(PARAMETER_ARCHIVE_DIR, base_name)
-    try:
-        with path.open("w", encoding="utf-8") as fh:
-            json.dump(snapshot, fh, ensure_ascii=False, indent=2)
-    except OSError:
-        pass
 
 
 def _describe_timeline_task(target_date: dt.date, timeline_cfg: dict[str, T.Any]) -> tuple[str, str, str]:
@@ -1485,32 +1468,7 @@ def _persist_symbol_meta_cache(cache: dict[str, dict[str, T.Any]]) -> None:
 
 
 def _fetch_symbol_profile(symbol: str) -> dict[str, T.Any] | None:
-    url = "https://finnhub.io/api/v1/stock/profile2"
-    try:
-        resp = requests.get(
-            url,
-            params={"symbol": symbol.upper(), "token": FINNHUB_API_KEY},
-            timeout=10,
-        )
-        if not resp.ok:
-            return None
-        data = resp.json()
-    except (requests.RequestException, ValueError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    sector = str(data.get("finnhubIndustry") or data.get("sector") or "").strip()
-    industry = str(data.get("industry") or data.get("gicsSector") or "").strip()
-    name = str(data.get("name") or data.get("ticker") or "").strip()
-    exchange = str(data.get("exchange") or data.get("exchangeSymbol") or "").strip()
-    return {
-        "sector": sector,
-        "industry": industry,
-        "name": name,
-        "exchange": exchange,
-        "source": "finnhub",
-        "last_updated": dt.datetime.now(US_EASTERN).isoformat(),
-    }
+    return finnhub.fetch_company_profile(symbol)
 
 
 def _get_symbol_metadata(symbol: str) -> dict[str, T.Any]:
@@ -1779,19 +1737,24 @@ def _compute_dci_for_symbols(
                 inputs = build_inputs(symbol, payload)
                 dci_result = compute_dci(inputs)
 
-                rl_direction = ""
+                should_trade = dci_result.dci_final >= 60.0
+                base_direction = "放弃"
+                if should_trade:
+                    base_direction = "多" if dci_result.direction > 0 else "空"
+
+                rl_direction = "放弃" if not should_trade else ""
                 rl_p_up_pct: float | None = None
                 rl_delta_pct: float | None = None
                 rl_prediction_id = ""
                 selection_value = f"{symbol}::{timeline.get('key')}"
 
-                if RL_MANAGER is not None:
+                if should_trade and RL_MANAGER is not None:
                     try:
                         rl_pred = RL_MANAGER.record_prediction(
                             dci_result,
                             sector=sector_key,
                         )
-                        rl_direction = "买入" if rl_pred.direction > 0 else "卖出"
+                        rl_direction = "多" if rl_pred.direction > 0 else "空"
                         rl_p_up_pct = round(rl_pred.adjusted_probability * 100.0, 2)
                         rl_delta_pct = round((rl_pred.adjusted_probability - dci_result.p_up) * 100.0, 2)
                         rl_prediction_id = rl_pred.prediction_id
@@ -1835,7 +1798,7 @@ def _compute_dci_for_symbols(
                         "bucket": bucket,
                         "company": company_name,
                         "sector": sector_value or "未知",
-                        "direction": "买入" if dci_result.direction > 0 else "卖出",
+                        "direction": base_direction,
                         "p_up_pct": round(dci_result.p_up * 100.0, 2),
                         "dci_base": round(dci_result.dci_base, 2),
                         "dci_penalised": round(dci_result.dci_penalised, 2),
@@ -1921,200 +1884,28 @@ def _check_resource_connections(ft_session: dict[str, T.Any] | None) -> list[dic
 
     # Nasdaq earnings API
     def _check_nasdaq_once() -> tuple[bool, str]:
-        try:
-            resp = requests.get(
-                NASDAQ_API,
-                params={"date": today_str},
-                headers=HEADERS,
-                timeout=5,
-            )
-            if resp.ok:
-                try:
-                    payload = resp.json()
-                except ValueError:
-                    payload = None
-                rows_data = None
-                if isinstance(payload, dict):
-                    data_block = payload.get("data") if isinstance(payload.get("data"), dict) else None
-                    calendar_block = (
-                        data_block.get("calendar")
-                        if isinstance((data_block or {}).get("calendar"), dict)
-                        else None
-                    )
-                    if isinstance(calendar_block, dict):
-                        rows_data = calendar_block.get("rows")
-                    if rows_data is None and isinstance(data_block, dict):
-                        rows_data = data_block.get("rows")
-                    if rows_data is None:
-                        rows_data = payload.get("rows")
-                rows = rows_data if isinstance(rows_data, list) else []
-                if rows:
-                    sample = rows[0]
-                    symbol = (
-                        sample.get("symbol")
-                        or sample.get("Symbol")
-                        or sample.get("companyTickerSymbol")
-                        or ""
-                    )
-                    time_field = (
-                        sample.get("time")
-                        or sample.get("Time")
-                        or sample.get("EPSTime")
-                        or sample.get("timeStatus")
-                        or sample.get("when")
-                        or ""
-                    )
-                    symbol = str(symbol).strip().upper()
-                    time_field = str(time_field).strip() or "未提供时间"
-                    if symbol:
-                        ok = True
-                        detail = f"示例：{symbol}｜{time_field}"
-                    else:
-                        ok = False
-                        detail = "返回行缺少代码字段"
-                else:
-                    ok = False
-                    detail = "缺少财报行数据"
-            else:
-                ok = False
-                detail = f"HTTP {resp.status_code}"
-        except requests.RequestException as exc:
-            ok = False
-            detail = f"请求异常：{exc}"[:160]
-        return ok, detail
+        return nasdaq.check_status(today_str)
 
     ok, detail = run_with_retry(_check_nasdaq_once)
     add_status("Nasdaq 财报 API", "财报列表（代码/时间段）", ok, detail)
 
     # Finnhub API
     def _check_finnhub_once() -> tuple[bool, str]:
-        try:
-            resp = requests.get(
-                "https://finnhub.io/api/v1/quote",
-                params={"symbol": "AAPL", "token": FINNHUB_API_KEY},
-                timeout=5,
-            )
-            if resp.ok:
-                try:
-                    payload = resp.json()
-                except ValueError:
-                    payload = None
-                if isinstance(payload, dict):
-                    price = payload.get("c")
-                    prev_close = payload.get("pc")
-                    timestamp = payload.get("t")
-                    if price is not None and prev_close is not None and timestamp:
-                        ok = True
-                        detail = f"现价 {price}｜昨收 {prev_close}"
-                    else:
-                        ok = False
-                        detail = "缺少现价/昨收数据"
-                else:
-                    ok = False
-                    detail = "返回内容异常"
-            else:
-                ok = False
-                detail = f"HTTP {resp.status_code}"
-        except requests.RequestException as exc:
-            ok = False
-            detail = f"请求异常：{exc}"[:160]
-        return ok, detail
+        return finnhub.check_status("AAPL")
 
     ok, detail = run_with_retry(_check_finnhub_once)
     add_status("Finnhub API", "实时行情（现价/昨收）", ok, detail)
 
     # OpenFIGI API
     def _check_openfigi_once() -> tuple[bool, str]:
-        try:
-            resp = requests.post(
-                "https://api.openfigi.com/v3/mapping",
-                headers={
-                    "Content-Type": "application/json",
-                    "X-OPENFIGI-APIKEY": OPENFIGI_API_KEY,
-                },
-                json=[{"idType": "TICKER", "idValue": "AAPL"}],
-                timeout=5,
-            )
-            if resp.ok:
-                try:
-                    payload = resp.json()
-                except ValueError:
-                    payload = None
-                if isinstance(payload, list) and payload:
-                    entry = payload[0]
-                    data_rows = entry.get("data") if isinstance(entry, dict) else None
-                    if isinstance(data_rows, list) and data_rows:
-                        mapping = data_rows[0]
-                        figi = (mapping or {}).get("figi")
-                        name = (mapping or {}).get("name") or (mapping or {}).get("securityName")
-                        if figi:
-                            ok = True
-                            name_part = f"｜{name}" if name else ""
-                            detail = f"AAPL → {figi}{name_part}"
-                        else:
-                            ok = False
-                            detail = "缺少 FIGI 字段"
-                    else:
-                        ok = False
-                        detail = "缺少映射条目"
-                else:
-                    ok = False
-                    detail = "返回内容异常"
-            else:
-                ok = False
-                detail = f"HTTP {resp.status_code}"
-        except requests.RequestException as exc:
-            ok = False
-            detail = f"请求异常：{exc}"[:160]
-        return ok, detail
+        return openfigi.check_status("AAPL")
 
     ok, detail = run_with_retry(_check_openfigi_once)
     add_status("OpenFIGI API", "Ticker → FIGI 映射", ok, detail)
 
     # FRED API
     def _check_fred_once() -> tuple[bool, str]:
-        try:
-            resp = requests.get(
-                "https://api.stlouisfed.org/fred/series/observations",
-                params={
-                    "series_id": "DGS3MO",
-                    "api_key": FRED_API_KEY,
-                    "file_type": "json",
-                    "sort_order": "desc",
-                    "limit": 1,
-                },
-                timeout=5,
-            )
-            if resp.ok:
-                try:
-                    payload = resp.json()
-                except ValueError:
-                    payload = None
-                observations = (
-                    payload.get("observations")
-                    if isinstance(payload, dict)
-                    else None
-                )
-                if isinstance(observations, list) and observations:
-                    latest = observations[0]
-                    value = (latest or {}).get("value")
-                    date_text = (latest or {}).get("date")
-                    if value and value != ".":
-                        ok = True
-                        detail = f"{date_text} → {value}"
-                    else:
-                        ok = False
-                        detail = "观测值缺失"
-                else:
-                    ok = False
-                    detail = "缺少观测数据"
-            else:
-                ok = False
-                detail = f"HTTP {resp.status_code}"
-        except requests.RequestException as exc:
-            ok = False
-            detail = f"请求异常：{exc}"[:160]
-        return ok, detail
+        return fred.check_status("DGS3MO")
 
     ok, detail = run_with_retry(_check_fred_once)
     add_status("FRED API", "DGS3MO 系列（最新观测值）", ok, detail)
@@ -2130,6 +1921,189 @@ def _check_resource_connections(ft_session: dict[str, T.Any] | None) -> list[dic
     add_status("Firstrade 会话", "周五期权筛选凭证", ok, detail)
 
     return statuses
+
+
+def _format_decimal(value: T.Any, digits: int = 4) -> str:
+    """Format numeric values with trimmed trailing zeros."""
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "—" if value in {None, ""} else str(value)
+
+    if math.isnan(number) or math.isinf(number):
+        return str(number)
+
+    formatted = f"{number:.{digits}f}".rstrip("0").rstrip(".")
+    return formatted or "0"
+
+
+def _extract_factor_source(
+    factor_payload: T.Any, symbol_payload: dict[str, T.Any]
+) -> str:
+    """Best-effort extraction of the data source tag for a factor."""
+
+    if isinstance(factor_payload, dict):
+        for key in ("source", "__source__", "provider"):
+            candidate = factor_payload.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+
+    for key in ("source", "__source__", "provider"):
+        candidate = symbol_payload.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+
+    return ""
+
+
+def _format_factor_value(payload: T.Any) -> str:
+    """Render the main numeric content for a factor payload."""
+
+    if isinstance(payload, dict):
+        parts: list[str] = []
+
+        if payload.get("z") is not None:
+            parts.append(f"z={_format_decimal(payload.get('z'))}")
+
+        value_present = payload.get("value") is not None
+        if value_present:
+            parts.append(f"value={_format_decimal(payload.get('value'))}")
+
+        median = payload.get("median")
+        mad = payload.get("mad")
+        extras: list[str] = []
+        if value_present and median is not None:
+            extras.append(f"median={_format_decimal(median)}")
+        if value_present and mad is not None:
+            extras.append(f"mad={_format_decimal(mad)}")
+        if extras:
+            parts.append(" / ".join(extras))
+
+        if not parts:
+            for key, candidate in payload.items():
+                if key in {"z", "value", "median", "mad"}:
+                    continue
+                if isinstance(candidate, (int, float)):
+                    parts.append(f"{key}={_format_decimal(candidate)}")
+            if not parts and payload:
+                parts.append(str(payload))
+
+        return "；".join(parts) if parts else "—"
+
+    if isinstance(payload, (int, float)):
+        return _format_decimal(payload)
+
+    if payload in {None, ""}:
+        return "—"
+
+    return str(payload)
+
+
+def _collect_factor_source_rows() -> tuple[list[dict[str, str]], str | None]:
+    """Return rows describing factor values and their origins."""
+
+    payloads = _load_dci_payloads()
+    factor_names = list(BASE_FACTOR_WEIGHTS.keys())
+
+    if not payloads:
+        rows = [
+            {"factor": name, "value": "—", "source": "未载入数据"}
+            for name in factor_names
+        ]
+        return rows, "未载入任何 DCI 输入数据，显示占位结果。"
+
+    sorted_payloads = sorted(payloads.items(), key=lambda item: str(item[0]))
+    rows: list[dict[str, str]] = []
+    missing: list[str] = []
+
+    for factor_name in factor_names:
+        best_with_source: dict[str, str] | None = None
+        fallback_entry: dict[str, str] | None = None
+
+        for symbol, symbol_payload in sorted_payloads:
+            if not isinstance(symbol_payload, dict):
+                continue
+            factors = symbol_payload.get("factors")
+            if not isinstance(factors, dict):
+                continue
+            factor_payload = factors.get(factor_name)
+            if factor_payload is None:
+                continue
+
+            source = _extract_factor_source(factor_payload, symbol_payload)
+            value_text = _format_factor_value(factor_payload)
+            if symbol:
+                value_text = f"{value_text}｜{symbol}"
+
+            entry = {
+                "factor": factor_name,
+                "value": value_text,
+                "source": source or "—",
+            }
+
+            if source:
+                best_with_source = entry
+                break
+            if fallback_entry is None:
+                fallback_entry = entry
+
+        if best_with_source:
+            rows.append(best_with_source)
+        elif fallback_entry:
+            rows.append(fallback_entry)
+        else:
+            rows.append({"factor": factor_name, "value": "—", "source": "—"})
+            missing.append(factor_name)
+
+    note: str | None = None
+    if missing:
+        missing_text = "，".join(missing)
+        note = f"以下因子未找到数据：{missing_text}"
+
+    return rows, note
+
+
+def _render_factor_preview_table(rows: list[dict[str, str]]) -> html.Div:
+    """Split rows into three columns of tables for compact display."""
+
+    columns: list[list[dict[str, str]]] = [[], [], []]
+    for idx, row in enumerate(rows):
+        columns[idx % 3].append(row)
+
+    column_components: list[dbc.Col] = []
+    for col_rows in columns:
+        if not col_rows:
+            continue
+        table_rows = [
+            html.Tr(
+                [
+                    html.Td(entry.get("factor", "")),
+                    html.Td(entry.get("value", "")),
+                    html.Td(entry.get("source", "")),
+                ]
+            )
+            for entry in col_rows
+        ]
+        table = dbc.Table(
+            [
+                html.Thead(
+                    html.Tr([
+                        html.Th("因子"),
+                        html.Th("数值"),
+                        html.Th("数据源"),
+                    ])
+                ),
+                html.Tbody(table_rows),
+            ],
+            bordered=True,
+            hover=True,
+            size="sm",
+            className="mb-3",
+        )
+        column_components.append(dbc.Col(table, width=12, lg=4))
+
+    return dbc.Row(column_components, className="g-2")
 
 
 def _render_connection_statuses(
@@ -2189,6 +2163,31 @@ def _render_connection_statuses(
     if timestamp_block:
         content.append(timestamp_block)
     content.append(table)
+
+    factor_rows, factor_note = _collect_factor_source_rows()
+    if factor_rows:
+        content.append(html.Hr())
+        content.append(
+            html.H5("因子数据提取预览", style={"marginTop": "12px", "fontWeight": "bold"})
+        )
+        if factor_note:
+            content.append(
+                html.Div(
+                    factor_note,
+                    className="text-muted",
+                    style={"marginBottom": "8px"},
+                )
+            )
+        content.append(_render_factor_preview_table(factor_rows))
+    elif factor_note:
+        content.append(html.Hr())
+        content.append(
+            html.Div(
+                factor_note,
+                className="text-muted",
+                style={"marginTop": "12px"},
+            )
+        )
     return html.Div(content)
 
 
@@ -2253,17 +2252,6 @@ def _clear_prediction_run_state(run_id: str) -> None:
         PREDICTION_RUN_STATES.pop(run_id, None)
 
 # ---------- Nasdaq API ----------
-NASDAQ_API = "https://api.nasdaq.com/api/calendar/earnings"
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/plain, */*",
-    "Origin": "https://www.nasdaq.com",
-    "Referer": "https://www.nasdaq.com/market-activity/earnings",
-}
 def this_friday(base_date: dt.date) -> dt.date:
     wd = base_date.isoweekday()  # Mon=1 ... Sun=7
     if wd <= 5:
@@ -2303,40 +2291,10 @@ def previous_trading_day(base_date: dt.date) -> dt.date:
 
 
 def fetch_earnings_by_date(d: dt.date) -> T.List[dict]:
-    for _ in range(2):  # simple retry
-        r = requests.get(NASDAQ_API, params={"date": d.strftime("%Y-%m-%d")},
-                         headers=HEADERS, timeout=20)
-        r.raise_for_status()
-        try:
-            j = r.json()
-        except json.JSONDecodeError:
-            time.sleep(1)
-            continue
-
-        data = j.get("data") if isinstance(j, dict) else None
-        rows = None
-        if isinstance(data, dict):
-            cal = data.get("calendar") if isinstance(data.get("calendar"), dict) else None
-            rows = (cal or data).get("rows") if isinstance((cal or data), dict) else None
-        if rows is None and isinstance(j, dict):
-            rows = j.get("rows")
-        if not rows:
-            return []
-
-        out = []
-        for row in rows:
-            symbol = (row.get("symbol") or row.get("Symbol") or row.get("companyTickerSymbol") or "").strip()
-            time_field = (row.get("time") or row.get("Time") or row.get("EPSTime") or row.get("timeStatus") or row.get("when") or "").strip()
-            name = (row.get("companyName") or row.get("name") or row.get("Company") or "").strip()
-            if symbol:
-                out.append({
-                    "symbol": symbol.upper(),
-                    "company": name,
-                    "time": time_field,
-                    "raw": row,
-                })
-        return out
-    return []
+    try:
+        return nasdaq.fetch_earnings(d)
+    except requests.RequestException:
+        return []
 
 
 # ---------- Time bucket filters ----------
@@ -4307,78 +4265,292 @@ def _find_validation_target(start_date: dt.date) -> tuple[dt.date | None, bool]:
     return None, False
 
 
-def _date_to_utc_timestamp(date_value: dt.date) -> int:
-    """Convert a date to a UTC midnight timestamp accepted by Finnhub APIs."""
+def _resolve_tradingview_exchange(
+    symbol: str, row_meta: dict[str, T.Any] | None = None
+) -> str | None:
+    """Guess the TradingView exchange code for the given symbol."""
 
-    as_utc = dt.datetime(date_value.year, date_value.month, date_value.day, tzinfo=dt.timezone.utc)
-    return int(as_utc.timestamp())
+    raw_exchange = ""
+    if isinstance(row_meta, dict):
+        raw_exchange = str(row_meta.get("exchange") or "")
+        if not raw_exchange:
+            raw_payload = row_meta.get("raw")
+            if isinstance(raw_payload, dict):
+                raw_exchange = str(
+                    raw_payload.get("exchange")
+                    or raw_payload.get("exchangeName")
+                    or raw_payload.get("exchange_code")
+                    or ""
+                )
+
+    if not raw_exchange:
+        metadata = _get_symbol_metadata(symbol)
+        if isinstance(metadata, dict):
+            raw_exchange = str(metadata.get("exchange") or "")
+
+    raw_upper = raw_exchange.upper().strip()
+    for key, mapped in TV_EXCHANGE_ALIASES.items():
+        if key in raw_upper:
+            return mapped
+
+    if TV_DEFAULT_EXCHANGE:
+        return TV_DEFAULT_EXCHANGE
+
+    return raw_upper or None
 
 
-def _fetch_t_plus_one_closes(symbol: str, decision_day: dt.date) -> tuple[float | None, float | None, str | None]:
-    """Fetch the T and T+1 closing prices for the given symbol.
+def _compute_trade_window(decision_day: dt.date) -> tuple[dt.datetime, dt.datetime]:
+    """Return the entry (15:00) and exit (次日09:40) timestamps in US Eastern."""
 
-    Returns (decision_close, next_close, error). Only daily closes up to the next
-    trading day are considered to avoid using future information.
-    """
+    entry_time = dt.datetime.combine(decision_day, dt.time(15, 0), tzinfo=US_EASTERN)
+    exit_day = next_trading_day(decision_day)
+    exit_time = dt.datetime.combine(exit_day, dt.time(9, 40), tzinfo=US_EASTERN)
+    return entry_time, exit_time
 
-    next_day = next_trading_day(decision_day)
-    from_ts = _date_to_utc_timestamp(decision_day)
-    # Add one extra day to ensure the next trading day's candle is included.
-    to_ts = _date_to_utc_timestamp(next_day + dt.timedelta(days=1))
+
+def _round_option_strike(price: float) -> float:
+    """Round the underlying price to a representative ATM strike."""
+
+    if not math.isfinite(price) or price <= 0:
+        return 0.0
+    if price < 25:
+        step = 0.5
+    elif price < 200:
+        step = 1.0
+    elif price < 500:
+        step = 5.0
+    else:
+        step = 10.0
+    return round(price / step) * step
+
+
+def _determine_option_expiry(
+    decision_day: dt.date, row_meta: dict[str, T.Any] | None = None
+) -> dt.date:
+    """Choose an expiry date for the ATM option used in validation."""
+
+    candidate: dt.date | None = None
+
+    if isinstance(row_meta, dict):
+        for key in ("option_expiry", "expiry_date", "expiration", "expiration_date"):
+            value = row_meta.get(key)
+            if isinstance(value, str):
+                try:
+                    candidate = dt.date.fromisoformat(value[:10])
+                except ValueError:
+                    continue
+                else:
+                    break
+        if candidate is None:
+            raw_payload = row_meta.get("raw")
+            if isinstance(raw_payload, dict):
+                for key in ("expiryDate", "expirationDate", "expDate"):
+                    value = raw_payload.get(key)
+                    if isinstance(value, str):
+                        try:
+                            candidate = dt.date.fromisoformat(value[:10])
+                        except ValueError:
+                            continue
+                        else:
+                            break
+
+    if candidate is None and isinstance(row_meta, dict):
+        weekly_flag = row_meta.get("weekly_exp_this_fri")
+        if weekly_flag in {True, "True", "true", 1}:
+            candidate = this_friday(decision_day)
+
+    if candidate is None:
+        candidate = this_friday(decision_day)
+
+    return candidate
+
+
+def _build_option_symbol_variants(
+    symbol: str, expiry: dt.date, option_type: str, strike: float
+) -> list[str]:
+    """Return plausible TradingView option symbols for the given contract."""
+
+    base = symbol.upper()
+    occ_value = int(round(strike * 1000))
+    occ_part = f"{occ_value:08d}"
+    if math.isclose(strike, round(strike)):
+        strike_simple = f"{int(round(strike))}"
+    else:
+        strike_simple = f"{strike:.2f}".rstrip("0").rstrip(".")
+
+    candidates = [
+        f"{base}{expiry:%y%m%d}{option_type}{occ_part}",
+        f"{base}{expiry:%y%m%d}{option_type}{strike_simple}",
+        f"{base}{expiry:%y%m%d}{option_type}{strike_simple.replace('.', '')}",
+    ]
+    seen: set[str] = set()
+    variants: list[str] = []
+    for item in candidates:
+        if item and item not in seen:
+            variants.append(item)
+            seen.add(item)
+    return variants
+
+
+def _fetch_underlying_trade_points(
+    symbol: str,
+    exchange: str,
+    entry_time: dt.datetime,
+    exit_time: dt.datetime,
+) -> tuple[tv_data.PricePoint | None, tv_data.PricePoint | None, list[str]]:
+    """Fetch entry/exit minute prices for the underlying symbol."""
+
+    errors: list[str] = []
+    window_start = entry_time - dt.timedelta(hours=8)
+    window_end = exit_time + dt.timedelta(hours=4)
 
     try:
-        resp = requests.get(
-            "https://finnhub.io/api/v1/stock/candle",
-            params={
-                "symbol": symbol,
-                "resolution": "D",
-                "from": from_ts,
-                "to": to_ts,
-                "token": FINNHUB_API_KEY,
-            },
-            timeout=10,
+        data = tv_data.fetch_hist(
+            symbol,
+            exchange,
+            start=window_start,
+            end=window_end,
+            interval=tv_data.DEFAULT_INTERVAL,
         )
-    except requests.RequestException as exc:
-        return None, None, str(exc)
+    except tv_data.TVDataError as exc:
+        errors.append(str(exc))
+        return None, None, errors
 
-    if not resp.ok:
-        return None, None, f"HTTP {resp.status_code}"
+    entry_point = tv_data.fetch_price_point(
+        data,
+        entry_time,
+        tolerance=dt.timedelta(minutes=TV_PRICE_TOLERANCE_MINUTES),
+    )
+    exit_point = tv_data.fetch_price_point(
+        data,
+        exit_time,
+        tolerance=dt.timedelta(minutes=TV_PRICE_TOLERANCE_MINUTES),
+    )
 
-    try:
-        payload = resp.json()
-    except ValueError:
-        return None, None, "响应非 JSON 数据"
+    if entry_point is None:
+        errors.append("缺少 15:00 的现货报价")
+    if exit_point is None:
+        errors.append("缺少 次日09:40 的现货报价")
 
-    if not isinstance(payload, dict) or payload.get("s") != "ok":
-        message = str(payload.get("s")) if isinstance(payload, dict) else ""
-        return None, None, message or "行情返回异常"
+    return entry_point, exit_point, errors
 
-    closes = payload.get("c")
-    timestamps = payload.get("t")
-    if not isinstance(closes, list) or not isinstance(timestamps, list):
-        return None, None, "行情数据缺少收盘价"
 
-    decision_close: float | None = None
-    next_close: float | None = None
-    for close, ts_val in zip(closes, timestamps):
+def _fetch_option_trade_points(
+    symbol: str,
+    predicted_label: str,
+    entry_time: dt.datetime,
+    exit_time: dt.datetime,
+    *,
+    row_meta: dict[str, T.Any] | None,
+    entry_price: float | None,
+) -> tuple[dict[str, T.Any] | None, list[str]]:
+    """Fetch entry/exit prices for the ATM option contract."""
+
+    errors: list[str] = []
+    if entry_price is None or entry_price <= 0:
+        return None, ["无法根据现货价格确定 ATM 行权价"]
+
+    option_type = "C" if predicted_label == "多" else "P"
+    expiry = _determine_option_expiry(entry_time.date(), row_meta)
+    strike = _round_option_strike(entry_price)
+    if strike <= 0:
+        return None, ["未能确定有效的行权价"]
+
+    exchange = TV_OPTION_EXCHANGE or _resolve_tradingview_exchange(symbol, row_meta)
+    if not exchange:
+        return None, ["无法确定期权交易所"]
+
+    variants = _build_option_symbol_variants(symbol, expiry, option_type, strike)
+    window_start = entry_time - dt.timedelta(hours=2)
+    window_end = exit_time + dt.timedelta(hours=2)
+
+    for candidate in variants:
         try:
-            ts_int = int(ts_val)
-        except (TypeError, ValueError):
+            data = tv_data.fetch_hist(
+                candidate,
+                exchange,
+                start=window_start,
+                end=window_end,
+                interval=tv_data.DEFAULT_INTERVAL,
+            )
+        except tv_data.TVDataError as exc:
+            errors.append(f"{candidate}@{exchange}: {exc}")
             continue
-        date_at_ts = dt.datetime.fromtimestamp(ts_int, dt.timezone.utc).date()
-        try:
-            close_val = float(close)
-        except (TypeError, ValueError):
-            continue
-        if date_at_ts == decision_day:
-            decision_close = close_val
-        elif date_at_ts == next_day:
-            next_close = close_val
 
-    if decision_close is None or next_close is None:
-        return decision_close, next_close, "缺少 T 或 T+1 收盘价"
+        entry_point = tv_data.fetch_price_point(
+            data,
+            entry_time,
+            tolerance=dt.timedelta(minutes=TV_OPTION_TOLERANCE_MINUTES),
+        )
+        exit_point = tv_data.fetch_price_point(
+            data,
+            exit_time,
+            tolerance=dt.timedelta(minutes=TV_OPTION_TOLERANCE_MINUTES),
+        )
 
-    return decision_close, next_close, None
+        if entry_point and exit_point:
+            return (
+                {
+                    "symbol": candidate,
+                    "exchange": exchange,
+                    "strike": strike,
+                    "expiry": expiry,
+                    "entry": entry_point,
+                    "exit": exit_point,
+                },
+                errors,
+            )
+
+        errors.append(f"{candidate}@{exchange}: 缺少目标时间段报价")
+
+    return None, errors
+
+
+def _evaluate_trade_window(
+    symbol: str,
+    decision_day: dt.date,
+    predicted_label: str,
+    row_meta: dict[str, T.Any] | None,
+) -> tuple[dict[str, T.Any] | None, list[str]]:
+    """Gather intraday prices for underlying and ATM option via tvDatafeed."""
+
+    if predicted_label == "放弃":
+        return None, []
+
+    exchange = _resolve_tradingview_exchange(symbol, row_meta)
+    if not exchange:
+        return None, ["无法确定股票所属交易所"]
+
+    entry_time, exit_time = _compute_trade_window(decision_day)
+    entry_point, exit_point, base_errors = _fetch_underlying_trade_points(
+        symbol, exchange, entry_time, exit_time
+    )
+
+    payload: dict[str, T.Any] = {
+        "entry_time": entry_time,
+        "exit_time": exit_time,
+        "underlying_entry": entry_point,
+        "underlying_exit": exit_point,
+        "underlying_exchange": exchange,
+    }
+
+    errors = list(base_errors)
+
+    if entry_point is None or exit_point is None:
+        return payload, errors
+
+    option_data, option_errors = _fetch_option_trade_points(
+        symbol,
+        predicted_label,
+        entry_time,
+        exit_time,
+        row_meta=row_meta,
+        entry_price=entry_point.price,
+    )
+    payload["option"] = option_data
+    errors.extend(option_errors)
+
+    return payload, errors
 
 
 def auto_evaluate_predictions_logic(
@@ -4578,6 +4750,26 @@ def auto_evaluate_predictions_logic(
     correct_count = 0
     move_samples: list[float] = []
 
+    tv_ready = tv_data.is_available()
+    tv_error: str | None = None
+    if tv_ready:
+        try:
+            tv_data.ensure_client()
+        except tv_data.TVDataError as exc:
+            tv_ready = False
+            tv_error = str(exc)
+
+    row_lookup: dict[str, dict[str, T.Any]] = {}
+    if isinstance(archive_entry, dict):
+        rows_payload = archive_entry.get("rowData") or archive_entry.get("rows")
+        if isinstance(rows_payload, list):
+            for row in rows_payload:
+                if not isinstance(row, dict):
+                    continue
+                symbol_key = str(row.get("symbol") or "").upper()
+                if symbol_key and symbol_key not in row_lookup:
+                    row_lookup[symbol_key] = row
+
     results = []
     if isinstance(archive_entry, dict):
         raw_results = archive_entry.get("results")
@@ -4640,68 +4832,209 @@ def auto_evaluate_predictions_logic(
         symbol = str(entry.get("symbol") or "").upper()
         if not symbol:
             continue
-        decision_close, next_close, error_text = _fetch_t_plus_one_closes(
-            symbol, target_date
-        )
+        row_meta = row_lookup.get(symbol)
+
+        try:
+            dci_final = float(entry.get("dci_final") or 0.0)
+        except (TypeError, ValueError):
+            dci_final = 0.0
+        try:
+            p_up_pct = float(entry.get("p_up_pct") or 0.0)
+        except (TypeError, ValueError):
+            p_up_pct = 0.0
+
+        predicted_label = "放弃"
+        if dci_final >= 60.0:
+            predicted_label = "多" if p_up_pct > 50.0 else "空"
+
+        entry_time, exit_time = _compute_trade_window(target_date)
+        actual_reference_date = exit_time.date().isoformat()
 
         actual_direction = "数据缺失"
-        move_pct: float | None = None
+        actual_move_pct: float | None = None
+        option_move_pct: float | None = None
         correct_text = "-"
         actual_up: bool | None = None
-        actual_reference_date = next_trading_day(target_date).isoformat()
-
-        if decision_close is not None and next_close is not None:
-            if decision_close > 0:
-                move_pct = round(
-                    ((next_close - decision_close) / decision_close) * 100.0,
-                    2,
-                )
-                move_samples.append(abs(move_pct))
-                if move_pct > 0:
-                    actual_direction = "上涨"
-                    actual_up = True
-                elif move_pct < 0:
-                    actual_direction = "下跌"
-                    actual_up = False
-                else:
-                    actual_direction = "持平"
-                    actual_up = True
-                predicted = str(entry.get("direction") or "")
-                if actual_direction == "上涨":
-                    is_correct = predicted == "买入"
-                elif actual_direction == "下跌":
-                    is_correct = predicted == "卖出"
-                else:
-                    is_correct = True
-                correct_text = "是" if is_correct else "否"
-                if is_correct:
-                    correct_count += 1
-            else:
-                errors.append(f"{symbol}: 决策日收盘价异常")
+        if predicted_label == "放弃":
+            evaluation_source = "skipped"
         else:
-            errors.append(f"{symbol}: {error_text or '缺少行情数据'}")
+            evaluation_source = "tvDatafeed" if tv_ready else "unavailable"
+
+        underlying_entry_price: float | None = None
+        underlying_exit_price: float | None = None
+        underlying_entry_time: str | None = None
+        underlying_exit_time: str | None = None
+        option_symbol: str | None = None
+        option_exchange: str | None = None
+        option_strike: float | None = None
+        option_expiry: str | None = None
+        option_entry_price: float | None = None
+        option_exit_price: float | None = None
+        option_entry_time: str | None = None
+        option_exit_time: str | None = None
+
+        trade_errors: list[str] = []
+        trade_payload: dict[str, T.Any] | None = None
+
+        if predicted_label == "放弃":
+            actual_direction = "放弃"
+        elif tv_ready:
+            trade_payload, trade_errors = _evaluate_trade_window(
+                symbol, target_date, predicted_label, row_meta
+            )
+        elif not tv_ready and tv_error:
+            trade_errors.append(tv_error)
+        elif not tv_ready:
+            trade_errors.append("tvDatafeed 未启用")
+
+        if trade_payload:
+            entry_point = trade_payload.get("underlying_entry")
+            exit_point = trade_payload.get("underlying_exit")
+            evaluation_source = "tvDatafeed"
+
+            if isinstance(entry_point, tv_data.PricePoint):
+                underlying_entry_price = entry_point.price
+                underlying_entry_time = (
+                    entry_point.timestamp.astimezone(US_EASTERN).isoformat()
+                )
+            if isinstance(exit_point, tv_data.PricePoint):
+                underlying_exit_price = exit_point.price
+                underlying_exit_time = (
+                    exit_point.timestamp.astimezone(US_EASTERN).isoformat()
+                )
+
+            option_payload = trade_payload.get("option")
+            if isinstance(option_payload, dict):
+                option_symbol = option_payload.get("symbol")
+                option_exchange = option_payload.get("exchange")
+                option_strike = option_payload.get("strike")
+                expiry_value = option_payload.get("expiry")
+                if isinstance(expiry_value, dt.date):
+                    option_expiry = expiry_value.isoformat()
+                entry_option = option_payload.get("entry")
+                exit_option = option_payload.get("exit")
+                if isinstance(entry_option, tv_data.PricePoint):
+                    option_entry_price = entry_option.price
+                    option_entry_time = (
+                        entry_option.timestamp.astimezone(US_EASTERN).isoformat()
+                    )
+                if isinstance(exit_option, tv_data.PricePoint):
+                    option_exit_price = exit_option.price
+                    option_exit_time = (
+                        exit_option.timestamp.astimezone(US_EASTERN).isoformat()
+                    )
+
+                if (
+                    isinstance(entry_point, tv_data.PricePoint)
+                    and isinstance(exit_point, tv_data.PricePoint)
+                    and isinstance(entry_option, tv_data.PricePoint)
+                    and isinstance(exit_option, tv_data.PricePoint)
+                ):
+                    delta_s = exit_point.price - entry_point.price
+                    if entry_point.price > 0:
+                        actual_move_pct = round(
+                            (delta_s / entry_point.price) * 100.0,
+                            2,
+                        )
+                    delta_option = exit_option.price - entry_option.price
+                    if entry_option.price > 0:
+                        option_move_pct = round(
+                            (delta_option / entry_option.price) * 100.0,
+                            2,
+                        )
+
+                    if predicted_label == "多":
+                        if delta_s > 0 and delta_option > 0:
+                            actual_direction = "涨"
+                            actual_up = True
+                        elif delta_s < 0 and delta_option < 0:
+                            actual_direction = "跌"
+                            actual_up = False
+                        else:
+                            actual_direction = "放弃"
+                            actual_up = None
+                    else:  # predicted_label == "空"
+                        if delta_s < 0 and delta_option > 0:
+                            actual_direction = "涨"
+                            actual_up = False
+                        elif delta_s > 0 and delta_option < 0:
+                            actual_direction = "跌"
+                            actual_up = True
+                        else:
+                            actual_direction = "放弃"
+                            actual_up = None
+
+            elif predicted_label != "放弃":
+                entry_point = trade_payload.get("underlying_entry")
+                exit_point = trade_payload.get("underlying_exit")
+                if isinstance(entry_point, tv_data.PricePoint) and isinstance(
+                    exit_point, tv_data.PricePoint
+                ):
+                    delta_s = exit_point.price - entry_point.price
+                    if entry_point.price > 0:
+                        actual_move_pct = round(
+                            (delta_s / entry_point.price) * 100.0,
+                            2,
+                        )
+                    actual_direction = "数据缺失"
+                    actual_up = True if delta_s > 0 else False if delta_s < 0 else None
+
+        for err in trade_errors:
+            if err:
+                errors.append(f"{symbol}: {err}")
+
+        evaluated = predicted_label != "放弃" and actual_direction in {"涨", "跌"}
+        if evaluated:
+            if actual_direction == "涨":
+                correct_text = "是"
+                correct_count += 1
+            else:
+                correct_text = "否"
+            if actual_move_pct is not None:
+                move_samples.append(abs(actual_move_pct))
+        else:
+            correct_text = "-"
 
         item = {
             "symbol": symbol,
             "company": entry.get("company"),
             "sector": entry.get("sector"),
-            "predicted_direction": entry.get("direction"),
+            "predicted_direction": predicted_label,
             "actual_direction": actual_direction,
-            "actual_move_pct": move_pct,
+            "actual_move_pct": actual_move_pct,
+            "actual_option_move_pct": option_move_pct,
             "prediction_correct": correct_text,
             "timeline_label": entry.get("timeline_label"),
             "timeline_key": entry.get("timeline_key"),
             "checked_at": now.isoformat(),
             "actual_reference_date": actual_reference_date,
+            "evaluation_source": evaluation_source,
+            "underlying_entry_price": underlying_entry_price,
+            "underlying_exit_price": underlying_exit_price,
+            "underlying_entry_time": underlying_entry_time,
+            "underlying_exit_time": underlying_exit_time,
+            "option_symbol": option_symbol,
+            "option_exchange": option_exchange,
+            "option_strike": option_strike,
+            "option_expiry": option_expiry,
+            "option_entry_price": option_entry_price,
+            "option_exit_price": option_exit_price,
+            "option_entry_time": option_entry_time,
+            "option_exit_time": option_exit_time,
         }
         evaluation_items.append(item)
 
-        if RL_MANAGER is not None and actual_up is not None:
+        if (
+            RL_MANAGER is not None
+            and evaluated
+            and actual_up is not None
+            and actual_move_pct is not None
+        ):
             try:
                 RL_MANAGER.apply_feedback(
                     symbol,
                     actual_up=actual_up,
-                    actual_move_pct=move_pct,
+                    actual_move_pct=actual_move_pct,
                     prediction_id=entry.get("rl_prediction_id"),
                     sector=entry.get("sector")
                     if entry.get("sector") not in (None, "未知")
@@ -4710,7 +5043,12 @@ def auto_evaluate_predictions_logic(
             except Exception:
                 pass
 
-    total = len(evaluation_items)
+    total = sum(
+        1
+        for item in evaluation_items
+        if item.get("predicted_direction") != "放弃"
+        and item.get("actual_direction") in {"涨", "跌"}
+    )
     success_rate = (correct_count / total) if total else 0.0
     avg_move = sum(move_samples) / len(move_samples) if move_samples else None
 
@@ -5224,14 +5562,6 @@ def update_parameter_history_logic(agent_data, history_state, log_state):  # noq
         entry["last"] = {}
 
     if recorded_global_changes or recorded_sector_changes:
-        snapshot_payload = {
-            "timestamp": timestamp,
-            "global_changes": recorded_global_changes,
-            "sector_changes": recorded_sector_changes,
-            "state": copy.deepcopy(history),
-        }
-        _persist_parameter_snapshot(timestamp, snapshot_payload)
-
         summary_bits: list[str] = []
         if recorded_global_changes:
             summary_bits.append(f"全局参数变更 {len(recorded_global_changes)} 项")

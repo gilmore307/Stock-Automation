@@ -1,6 +1,9 @@
 """Reinforcement learning agent that calibrates DCI predictions with feedback."""
 from __future__ import annotations
 
+import copy
+import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -20,8 +23,50 @@ from . import (
 )
 
 
-DEFAULT_STATE_PATH = Path(__file__).with_name("dci_rl_state.json")
-STATE_PATH = Path(os.getenv("DCI_RL_STATE_PATH", str(DEFAULT_STATE_PATH)))
+CORE_FEATURE_DEFAULTS: Dict[str, float] = {
+    # Core DCI level metrics. The values are calibrated so that when a feature
+    # sits at a “neutral” mid-point (e.g. final score around 50%), the RL
+    # adjustment stays within a low single-digit percentage.
+    "bias": 0.0,
+    "base_score": 0.40,
+    "p_up_offset": 0.70,
+    "dci_final": 0.32,
+    "dci_penalised": -0.22,
+    "position_weight": 0.12,
+    "certainty": 0.28,
+}
+
+SHRINK_FEATURE_DEFAULTS: Dict[str, float] = {
+    # Shrink factors are < 1 when penalties apply, so we start with negative
+    # weights to tilt the policy away from setups that were aggressively
+    # discounted by the core DCI pipeline.
+    "shrink_shrink_EG": -0.06,
+    "shrink_shrink_CI": -0.04,
+    "shrink_disagreement": -0.05,
+    "shrink_shock": -0.07,
+}
+
+FACTOR_WEIGHT_MULTIPLIER = 0.35
+FACTOR_FEATURE_DEFAULTS: Dict[str, float] = {
+    # Project the handcrafted DCI factor weights onto the RL feature space with
+    # a conservative multiplier so per-factor contributions rarely exceed ~0.25
+    # to the pre-tanh activation even on strong z-scores.
+    f"factor_{name}": weight * FACTOR_WEIGHT_MULTIPLIER
+    for name, weight in BASE_FACTOR_WEIGHTS.items()
+}
+
+DEFAULT_AGENT_WEIGHTS: Dict[str, float] = {
+    **CORE_FEATURE_DEFAULTS,
+    **SHRINK_FEATURE_DEFAULTS,
+    **FACTOR_FEATURE_DEFAULTS,
+}
+
+DEFAULT_STATE_FILE = Path(__file__).with_name("dci_rl_state.json")
+LEGACY_STATE_PATH = Path(os.getenv("DCI_RL_STATE_PATH", str(DEFAULT_STATE_FILE)))
+DEFAULT_STATE_DIR = Path(__file__).resolve().parent.parent / "archives" / "rl_models"
+STATE_DIR = Path(os.getenv("DCI_RL_STATE_DIR", str(DEFAULT_STATE_DIR)))
+HISTORY_LIMIT = 200
+ZERO_TOLERANCE = 1e-8
 
 
 @dataclass(frozen=True)
@@ -78,7 +123,7 @@ class DCIRLAgent:
         self.learning_rate = learning_rate
         self.gamma = gamma
         self.adjustment_scale = adjustment_scale
-        self.weights: Dict[str, float] = {}
+        self.weights: Dict[str, float] = dict(DEFAULT_AGENT_WEIGHTS)
         self.bias: float = 0.0
         self.baseline: float = 0.0
         self.pending: Dict[str, List[PendingPrediction]] = {}
@@ -111,6 +156,28 @@ class DCIRLAgent:
     def _ensure_feature_keys(self, features: Dict[str, float]) -> None:
         for key in features:
             self.weights.setdefault(key, 0.0)
+
+    def ensure_default_weights(self, overwrite_if_zero: bool = False) -> bool:
+        """Ensure all known default feature weights exist on the agent.
+
+        Parameters
+        ----------
+        overwrite_if_zero:
+            When ``True`` any existing weight that is effectively zero (within
+            ``ZERO_TOLERANCE``) will be replaced by the default template value.
+            This is primarily used to back-fill legacy checkpoints that were
+            saved before we introduced heuristic initialisation.
+        """
+
+        modified = False
+        for key, value in DEFAULT_AGENT_WEIGHTS.items():
+            if key not in self.weights or (
+                overwrite_if_zero
+                and math.isclose(self.weights.get(key, 0.0), 0.0, abs_tol=ZERO_TOLERANCE)
+            ):
+                self.weights[key] = float(value)
+                modified = True
+        return modified
 
     def record_prediction(self, result: DCIResult) -> RLPrediction:
         """Store a prediction to await feedback and return adjusted probability."""
@@ -284,6 +351,15 @@ class DCIRLAgent:
         weights = payload.get("weights")
         if isinstance(weights, dict):
             agent.weights = {str(k): float(v) for k, v in weights.items()}
+        else:
+            agent.weights = dict(DEFAULT_AGENT_WEIGHTS)
+
+        needs_overwrite = all(
+            math.isclose(agent.weights.get(key, 0.0), 0.0, abs_tol=ZERO_TOLERANCE)
+            for key in DEFAULT_AGENT_WEIGHTS
+        )
+
+        agent.ensure_default_weights(overwrite_if_zero=needs_overwrite)
 
         pending_payload = payload.get("pending")
         if isinstance(pending_payload, list):
@@ -330,24 +406,271 @@ class RLAgentManager:
 
     def __init__(
         self,
-        state_path: Path = STATE_PATH,
+        state_path: Path = LEGACY_STATE_PATH,
+        state_dir: Path = STATE_DIR,
         factor_weight_rate: float = 0.05,
     ) -> None:
-        self.state_path = state_path
+        self.legacy_state_path = Path(state_path)
+        self.state_dir = Path(state_dir)
         self._lock = threading.Lock()
         self._agent = DCIRLAgent()
         self._sector_agents: Dict[str, DCIRLAgent] = {}
         self.factor_weight_rate = float(factor_weight_rate)
         self._factor_weights: Dict[str, float] = get_factor_weights()
-        self._load_state()
+        self._sector_file_map: Dict[str, Path] = {}
+        self._model_history_cache: Dict[str, List[Dict[str, object]]] = {}
+        self._last_saved_models: Dict[str, Dict[str, object]] = {}
+        self._factor_history_cache: List[Dict[str, object]] = []
+        self._last_saved_factor_weights: Dict[str, float] = {}
+        state_loaded = self._load_state()
+        defaults_applied = self._agent.ensure_default_weights()
+        for agent in self._sector_agents.values():
+            if agent.ensure_default_weights():
+                defaults_applied = True
         # Ensure the DCI module sees the persisted weights when the manager starts.
         set_factor_weights(self._factor_weights)
+        self._model_history_cache.setdefault("global", [])
+        if state_loaded and "global" not in self._last_saved_models:
+            self._last_saved_models["global"] = copy.deepcopy(self._agent.to_dict())
+        if state_loaded and not self._last_saved_factor_weights:
+            self._last_saved_factor_weights = dict(self._factor_weights)
+        if not state_loaded or defaults_applied:
+            self._save_state()
+        elif not self._last_saved_factor_weights:
+            self._last_saved_factor_weights = dict(self._factor_weights)
 
-    def _load_state(self) -> None:
-        if not self.state_path.exists():
+    @staticmethod
+    def _current_timestamp() -> str:
+        return dt.datetime.now(dt.timezone.utc).isoformat()
+
+    @staticmethod
+    def _sector_key(sector: str) -> str:
+        return f"sector::{sector}"
+
+    @staticmethod
+    def _safe_sector_file_name(sector: str) -> str:
+        safe = "".join(ch if ch.isalnum() else "_" for ch in sector.strip())
+        safe = safe[:40] or "sector"
+        digest = hashlib.sha1(sector.encode("utf-8")).hexdigest()[:8]
+        return f"sector_{safe}_{digest}.json"
+
+    @staticmethod
+    def _values_equal(old: object, new: object) -> bool:
+        if isinstance(old, (int, float)) or isinstance(new, (int, float)):
+            try:
+                return math.isclose(float(old), float(new), rel_tol=1e-9, abs_tol=1e-12)
+            except (TypeError, ValueError):
+                return False
+        return old == new
+
+    def _get_sector_path(self, sector: str) -> Path:
+        if sector in self._sector_file_map:
+            return self._sector_file_map[sector]
+        filename = self._safe_sector_file_name(sector)
+        path = self.state_dir / filename
+        self._sector_file_map[sector] = path
+        return path
+
+    def _compute_model_changes(
+        self,
+        previous: Optional[Dict[str, object]],
+        current: Dict[str, object],
+    ) -> List[Dict[str, object]]:
+        if not previous:
+            return []
+
+        changes: List[Dict[str, object]] = []
+        for key in (
+            "learning_rate",
+            "gamma",
+            "adjustment_scale",
+            "bias",
+            "baseline",
+            "update_count",
+            "prediction_count",
+        ):
+            old_value = previous.get(key) if isinstance(previous, dict) else None
+            new_value = current.get(key)
+            if not self._values_equal(old_value, new_value):
+                changes.append({
+                    "parameter": key,
+                    "old_value": old_value,
+                    "new_value": new_value,
+                })
+
+        previous_weights = (
+            previous.get("weights") if isinstance(previous, dict) and isinstance(previous.get("weights"), dict) else {}
+        )
+        current_weights = (
+            current.get("weights") if isinstance(current.get("weights"), dict) else {}
+        )
+        weight_keys = set(previous_weights) | set(current_weights)
+        for weight_key in sorted(weight_keys):
+            old_weight = previous_weights.get(weight_key)
+            new_weight = current_weights.get(weight_key)
+            if not self._values_equal(old_weight, new_weight):
+                changes.append({
+                    "parameter": f"weight::{weight_key}",
+                    "old_value": old_weight,
+                    "new_value": new_weight,
+                })
+
+        return changes
+
+    def _write_model_file(
+        self,
+        path: Path,
+        cache_key: str,
+        model_type: str,
+        state: Dict[str, object],
+        **metadata: object,
+    ) -> None:
+        timestamp = self._current_timestamp()
+        history = self._model_history_cache.get(cache_key, [])
+        changes = self._compute_model_changes(self._last_saved_models.get(cache_key), state)
+        if changes:
+            history = (history + [{"timestamp": timestamp, "changes": changes}])[-HISTORY_LIMIT:]
+        payload = {
+            "model": model_type,
+            "state": state,
+            "history": history,
+            "updated_at": timestamp,
+            **metadata,
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
+        self._model_history_cache[cache_key] = history
+        self._last_saved_models[cache_key] = copy.deepcopy(state)
+
+    def _write_factor_weights_file(self) -> None:
+        timestamp = self._current_timestamp()
+        previous = self._last_saved_factor_weights or {}
+        changes: List[Dict[str, object]] = []
+        all_keys = set(previous) | set(self._factor_weights)
+        for key in sorted(all_keys):
+            old_value = previous.get(key)
+            new_value = self._factor_weights.get(key)
+            if not self._values_equal(old_value, new_value):
+                changes.append({
+                    "parameter": key,
+                    "old_value": old_value,
+                    "new_value": new_value,
+                })
+        history = self._factor_history_cache
+        if changes:
+            history = (history + [{"timestamp": timestamp, "changes": changes}])[-HISTORY_LIMIT:]
+        payload = {
+            "updated_at": timestamp,
+            "weights": self._factor_weights,
+            "history": history,
+        }
+        factor_path = self.state_dir / "factor_weights.json"
+        factor_path.parent.mkdir(parents=True, exist_ok=True)
+        with factor_path.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
+        self._factor_history_cache = history
+        self._last_saved_factor_weights = dict(self._factor_weights)
+
+    def _write_legacy_state_file(self) -> None:
+        payload = {
+            "global": self._agent.to_dict(),
+            "sectors": {sector: agent.to_dict() for sector, agent in self._sector_agents.items()},
+            "factor_weights": self._factor_weights,
+        }
+        self.legacy_state_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.legacy_state_path.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
+
+    def _load_state(self) -> bool:
+        if self._load_from_directory():
+            return True
+
+        previous_models = bool(self._last_saved_models)
+        previous_weights = dict(self._factor_weights)
+        self._load_legacy_state()
+
+        if self._last_saved_models and not previous_models:
+            return True
+
+        return self._factor_weights != previous_weights
+
+    def _load_from_directory(self) -> bool:
+        if not self.state_dir.exists():
+            return False
+
+        loaded_any = False
+        self._sector_agents.clear()
+        self._sector_file_map.clear()
+
+        global_path = self.state_dir / "global.json"
+        if global_path.exists():
+            try:
+                with global_path.open("r", encoding="utf-8") as fh:
+                    payload = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                payload = None
+            if isinstance(payload, dict):
+                state_payload = payload.get("state")
+                if isinstance(state_payload, dict):
+                    self._agent = DCIRLAgent.from_dict(state_payload)
+                    self._last_saved_models["global"] = copy.deepcopy(state_payload)
+                    history_payload = payload.get("history")
+                    if isinstance(history_payload, list):
+                        self._model_history_cache["global"] = history_payload[-HISTORY_LIMIT:]
+                    loaded_any = True
+
+        for sector_path in sorted(self.state_dir.glob("sector_*.json")):
+            try:
+                with sector_path.open("r", encoding="utf-8") as fh:
+                    payload = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            sector_name = payload.get("name") or payload.get("sector")
+            if not isinstance(sector_name, str) or not sector_name.strip():
+                continue
+            state_payload = payload.get("state")
+            if not isinstance(state_payload, dict):
+                continue
+            sector_name = sector_name.strip()
+            self._sector_agents[sector_name] = DCIRLAgent.from_dict(state_payload)
+            cache_key = self._sector_key(sector_name)
+            self._sector_file_map[sector_name] = sector_path
+            self._last_saved_models[cache_key] = copy.deepcopy(state_payload)
+            history_payload = payload.get("history")
+            if isinstance(history_payload, list):
+                self._model_history_cache[cache_key] = history_payload[-HISTORY_LIMIT:]
+            loaded_any = True
+
+        factor_path = self.state_dir / "factor_weights.json"
+        if factor_path.exists():
+            try:
+                with factor_path.open("r", encoding="utf-8") as fh:
+                    payload = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                payload = None
+            if isinstance(payload, dict):
+                weights_payload = payload.get("weights")
+                if isinstance(weights_payload, dict):
+                    try:
+                        self._factor_weights = set_factor_weights(weights_payload)
+                    except Exception:  # pragma: no cover - defensive fallback
+                        self._factor_weights = dict(BASE_FACTOR_WEIGHTS)
+                    self._last_saved_factor_weights = dict(self._factor_weights)
+                history_payload = payload.get("history")
+                if isinstance(history_payload, list):
+                    self._factor_history_cache = history_payload[-HISTORY_LIMIT:]
+                loaded_any = True
+
+        return loaded_any
+
+    def _load_legacy_state(self) -> None:
+        if not self.legacy_state_path.exists():
             return
         try:
-            with self.state_path.open("r", encoding="utf-8") as fh:
+            with self.legacy_state_path.open("r", encoding="utf-8") as fh:
                 payload = json.load(fh)
         except json.JSONDecodeError:
             return
@@ -360,29 +683,79 @@ class RLAgentManager:
                 self._factor_weights = set_factor_weights(factor_weights_payload)
             except Exception:  # pragma: no cover - defensive fallback
                 self._factor_weights = dict(BASE_FACTOR_WEIGHTS)
+        self._last_saved_factor_weights = dict(self._factor_weights)
 
+        self._sector_agents.clear()
         if "global" in payload or "sectors" in payload:
             global_payload = payload.get("global")
             if isinstance(global_payload, dict):
                 self._agent = DCIRLAgent.from_dict(global_payload)
+                self._last_saved_models["global"] = copy.deepcopy(global_payload)
             sectors_payload = payload.get("sectors")
             if isinstance(sectors_payload, dict):
                 for sector_name, data in sectors_payload.items():
                     if isinstance(data, dict):
-                        self._sector_agents[str(sector_name)] = DCIRLAgent.from_dict(data)
+                        sector_name_str = str(sector_name)
+                        self._sector_agents[sector_name_str] = DCIRLAgent.from_dict(data)
+                        cache_key = self._sector_key(sector_name_str)
+                        self._last_saved_models[cache_key] = copy.deepcopy(data)
         else:
             # Backward compatibility with legacy single-agent state
             self._agent = DCIRLAgent.from_dict(payload)
+            self._last_saved_models["global"] = copy.deepcopy(payload)
+
+    def _prune_removed_sector_files(self, active_paths: set[Path]) -> None:
+        if not self.state_dir.exists():
+            return
+        for sector_path in self.state_dir.glob("sector_*.json"):
+            if sector_path not in active_paths:
+                try:
+                    sector_path.unlink()
+                except OSError:
+                    continue
+        # Remove stale mappings
+        self._sector_file_map = {
+            sector: path for sector, path in self._sector_file_map.items() if path in active_paths
+        }
+        active_sector_keys = {self._sector_key(sector) for sector in self._sector_agents}
+        active_sector_keys.add("global")
+        self._last_saved_models = {
+            key: value
+            for key, value in self._last_saved_models.items()
+            if key in active_sector_keys
+        }
+        self._model_history_cache = {
+            key: value
+            for key, value in self._model_history_cache.items()
+            if key in active_sector_keys
+        }
 
     def _save_state(self) -> None:
-        payload = {
-            "global": self._agent.to_dict(),
-            "sectors": {sector: agent.to_dict() for sector, agent in self._sector_agents.items()},
-            "factor_weights": self._factor_weights,
-        }
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.state_path.open("w", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        global_state = self._agent.to_dict()
+        self._write_model_file(
+            self.state_dir / "global.json",
+            "global",
+            "global",
+            global_state,
+        )
+
+        active_paths: set[Path] = set()
+        for sector, agent in self._sector_agents.items():
+            sector_state = agent.to_dict()
+            path = self._get_sector_path(sector)
+            self._write_model_file(
+                path,
+                self._sector_key(sector),
+                "sector",
+                sector_state,
+                name=sector,
+            )
+            active_paths.add(path)
+
+        self._prune_removed_sector_files(active_paths)
+        self._write_factor_weights_file()
+        self._write_legacy_state_file()
 
     def _get_sector_agent(self, sector: str) -> DCIRLAgent:
         key = sector.strip()
@@ -390,6 +763,7 @@ class RLAgentManager:
         if agent is None:
             agent = DCIRLAgent()
             self._sector_agents[key] = agent
+        agent.ensure_default_weights()
         return agent
 
     def record_prediction(self, result: DCIResult, sector: Optional[str] = None) -> RLPrediction:
