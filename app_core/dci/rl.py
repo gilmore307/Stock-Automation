@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 import threading
 
-from dci import (
+from . import (
     BASE_FACTOR_WEIGHTS,
     DCIResult,
     adjust_factor_weights,
