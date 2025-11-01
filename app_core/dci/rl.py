@@ -24,22 +24,35 @@ from . import (
 
 
 CORE_FEATURE_DEFAULTS: Dict[str, float] = {
+    # Core DCI level metrics. The values are calibrated so that when a feature
+    # sits at a “neutral” mid-point (e.g. final score around 50%), the RL
+    # adjustment stays within a low single-digit percentage.
     "bias": 0.0,
-    "base_score": 0.0,
-    "p_up_offset": 0.0,
-    "dci_final": 0.0,
-    "dci_penalised": 0.0,
-    "position_weight": 0.0,
-    "certainty": 0.0,
+    "base_score": 0.40,
+    "p_up_offset": 0.70,
+    "dci_final": 0.32,
+    "dci_penalised": -0.22,
+    "position_weight": 0.12,
+    "certainty": 0.28,
 }
 
 SHRINK_FEATURE_DEFAULTS: Dict[str, float] = {
-    f"shrink_{name}": 0.0
-    for name in ("shrink_EG", "shrink_CI", "disagreement", "shock")
+    # Shrink factors are < 1 when penalties apply, so we start with negative
+    # weights to tilt the policy away from setups that were aggressively
+    # discounted by the core DCI pipeline.
+    "shrink_shrink_EG": -0.06,
+    "shrink_shrink_CI": -0.04,
+    "shrink_disagreement": -0.05,
+    "shrink_shock": -0.07,
 }
 
+FACTOR_WEIGHT_MULTIPLIER = 0.35
 FACTOR_FEATURE_DEFAULTS: Dict[str, float] = {
-    f"factor_{name}": 0.0 for name in BASE_FACTOR_WEIGHTS
+    # Project the handcrafted DCI factor weights onto the RL feature space with
+    # a conservative multiplier so per-factor contributions rarely exceed ~0.25
+    # to the pre-tanh activation even on strong z-scores.
+    f"factor_{name}": weight * FACTOR_WEIGHT_MULTIPLIER
+    for name, weight in BASE_FACTOR_WEIGHTS.items()
 }
 
 DEFAULT_AGENT_WEIGHTS: Dict[str, float] = {
@@ -53,6 +66,7 @@ LEGACY_STATE_PATH = Path(os.getenv("DCI_RL_STATE_PATH", str(DEFAULT_STATE_FILE))
 DEFAULT_STATE_DIR = Path(__file__).resolve().parent.parent / "archives" / "rl_models"
 STATE_DIR = Path(os.getenv("DCI_RL_STATE_DIR", str(DEFAULT_STATE_DIR)))
 HISTORY_LIMIT = 200
+ZERO_TOLERANCE = 1e-8
 
 
 @dataclass(frozen=True)
@@ -143,12 +157,24 @@ class DCIRLAgent:
         for key in features:
             self.weights.setdefault(key, 0.0)
 
-    def ensure_default_weights(self) -> bool:
-        """Ensure all known default feature weights exist on the agent."""
+    def ensure_default_weights(self, overwrite_if_zero: bool = False) -> bool:
+        """Ensure all known default feature weights exist on the agent.
+
+        Parameters
+        ----------
+        overwrite_if_zero:
+            When ``True`` any existing weight that is effectively zero (within
+            ``ZERO_TOLERANCE``) will be replaced by the default template value.
+            This is primarily used to back-fill legacy checkpoints that were
+            saved before we introduced heuristic initialisation.
+        """
 
         modified = False
         for key, value in DEFAULT_AGENT_WEIGHTS.items():
-            if key not in self.weights:
+            if key not in self.weights or (
+                overwrite_if_zero
+                and math.isclose(self.weights.get(key, 0.0), 0.0, abs_tol=ZERO_TOLERANCE)
+            ):
                 self.weights[key] = float(value)
                 modified = True
         return modified
@@ -325,8 +351,15 @@ class DCIRLAgent:
         weights = payload.get("weights")
         if isinstance(weights, dict):
             agent.weights = {str(k): float(v) for k, v in weights.items()}
+        else:
+            agent.weights = dict(DEFAULT_AGENT_WEIGHTS)
 
-        agent.ensure_default_weights()
+        needs_overwrite = all(
+            math.isclose(agent.weights.get(key, 0.0), 0.0, abs_tol=ZERO_TOLERANCE)
+            for key in DEFAULT_AGENT_WEIGHTS
+        )
+
+        agent.ensure_default_weights(overwrite_if_zero=needs_overwrite)
 
         pending_payload = payload.get("pending")
         if isinstance(pending_payload, list):
