@@ -1675,6 +1675,15 @@ def next_trading_day(base_date: dt.date) -> dt.date:
     return base_date + dt.timedelta(days=1)
 
 
+def _shift_weekend_to_monday(base_date: dt.date) -> tuple[dt.date, bool]:
+    """Return Monday for weekend dates, indicating whether a shift occurred."""
+
+    wd = base_date.weekday()
+    if wd >= 5:  # Saturday/Sunday
+        return base_date + dt.timedelta(days=(7 - wd)), True
+    return base_date, False
+
+
 def previous_trading_day(base_date: dt.date) -> dt.date:
     """Return the previous US trading day (skipping weekends)."""
 
@@ -2260,6 +2269,22 @@ def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data,
     if target_date < min_allowed:
         target_date = min_allowed
 
+    adjusted_date, weekend_shifted = _shift_weekend_to_monday(target_date)
+    if adjusted_date > max_allowed:
+        adjusted_date = max_allowed
+        weekend_shifted = False
+    if adjusted_date < min_allowed:
+        adjusted_date = min_allowed
+        weekend_shifted = False
+
+    if weekend_shifted and adjusted_date != target_date:
+        weekend_note = (
+            f"选择的日期为周末，已自动切换至 {adjusted_date.strftime('%Y-%m-%d')}（周一）。"
+        )
+    else:
+        weekend_note = ""
+    target_date = adjusted_date
+
     target_date_iso = target_date.isoformat()
 
     if login_trigger:
@@ -2287,7 +2312,10 @@ def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data,
         status_message = (
             "已登录 Firstrade，预测任务将依次拉取各决策日财报并开始运行。"
         )
-        logs = append_log([], status_message, task_label="财报日程")
+        logs_list: list[str] = []
+        if weekend_note:
+            logs_list = append_log(logs_list, weekend_note, task_label="财报日程")
+        logs = append_log(logs_list, status_message, task_label="财报日程")
         return (
             no_update,
             logs,
@@ -2301,7 +2329,14 @@ def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data,
     bypass_cache = manual_refresh
 
     if cache_entry and not bypass_cache:
-        logs = append_log([], f"命中 {target_date} 的本地缓存。", task_label="财报日程")
+        logs_list: list[str] = []
+        if weekend_note:
+            logs_list = append_log(logs_list, weekend_note, task_label="财报日程")
+        logs = append_log(
+            logs_list,
+            f"命中 {target_date} 的本地缓存。",
+            task_label="财报日程",
+        )
         cached_status = str(cache_entry.get("status") or "")
         extra = "（来自本地缓存，无需重新请求。）"
         status_out = (cached_status + "\n" + extra) if cached_status else extra
@@ -2361,12 +2396,19 @@ def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data,
     )
     thread.start()
 
+    if weekend_note:
+        status_prefix = weekend_note + "\n"
+    else:
+        status_prefix = ""
+
     if login_trigger and bypass_cache:
         status_message = f"检测到 Firstrade 登录，开始重新筛选 {target_date} 的数据……"
     elif manual_refresh:
         status_message = f"正在刷新 {target_date} 的财报列表……"
     else:
         status_message = f"开始获取 {target_date} 的数据……"
+    if status_prefix:
+        status_message = status_prefix + status_message
     waiting_detail = "等待财报列表完成后执行"
     if login_trigger and bypass_cache:
         waiting_detail = f"检测到登录，重新筛选 {target_date} 的数据后执行"
@@ -2563,6 +2605,13 @@ def update_predictions_logic(
     twofa = (twofa or "").strip()
 
     target_date = _coerce_date(picker_date) or us_eastern_today()
+    adjusted_target, weekend_shifted = _shift_weekend_to_monday(target_date)
+    weekend_note = ""
+    if weekend_shifted and adjusted_target != target_date:
+        weekend_note = (
+            f"选择的日期为周末，已自动切换至 {adjusted_target.strftime('%Y-%m-%d')}（周一）。"
+        )
+    target_date = adjusted_target
     target_date_iso = target_date.isoformat()
 
     initial_logs = log_state if isinstance(log_state, list) else []
@@ -2573,6 +2622,9 @@ def update_predictions_logic(
         if not message:
             return
         log_entries = append_log(log_entries, message, task_label=task_label)
+
+    if weekend_note:
+        _emit(weekend_note, task_label="预测任务")
 
     if not logged_in:
         if triggered == "ft-session-store":
