@@ -17,6 +17,10 @@ def build_layout(config: "LayoutConfig") -> html.Div:  # noqa: D401
     del config
     return html.Div(
         [
+            html.Div(
+                id="prediction-status",
+                style={"margin": "8px 0", "whiteSpace": "pre-wrap"},
+            ),
             dag.AgGrid(
                 id="prediction-table",
                 columnDefs=[
