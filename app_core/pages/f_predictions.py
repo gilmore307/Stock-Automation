@@ -17,11 +17,6 @@ def build_layout(config: "LayoutConfig") -> html.Div:  # noqa: D401
     del config
     return html.Div(
         [
-            html.Div(
-                "系统会根据财报列表自动生成 DCI 预测；此处仅展示尚未出结果的标的。",
-                id="prediction-status",
-                style={"margin": "8px 0", "whiteSpace": "pre-wrap"},
-            ),
             dag.AgGrid(
                 id="prediction-table",
                 columnDefs=[

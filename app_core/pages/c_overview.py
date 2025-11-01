@@ -17,10 +17,6 @@ def build_layout(config: "LayoutConfig") -> html.Div:  # noqa: D401
     del config
     return html.Div(
         [
-            html.Div(
-                "该页面展示整体预测命中率以及按行业板块拆分的表现，帮助快速把握模型健康度。",
-                style={"margin": "8px 0", "whiteSpace": "pre-wrap"},
-            ),
             dbc.Row(
                 [
                     dbc.Col(

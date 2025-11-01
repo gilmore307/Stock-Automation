@@ -20,10 +20,6 @@ def build_layout(config: "LayoutConfig") -> html.Div:
     return html.Div(
         [
             html.Div(
-                "此页聚焦已完成检验的标的，可对比不同预测时点与实际果。",
-                style={"margin": "8px 0", "whiteSpace": "pre-wrap"},
-            ),
-            html.Div(
                 [
                     html.Div(
                         [
