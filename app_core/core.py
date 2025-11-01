@@ -162,17 +162,30 @@ def _load_archive_directory(directory: Path) -> dict[str, T.Any]:
     result: dict[str, T.Any] = {}
     if not directory.exists():
         return result
-    for path in sorted(directory.glob("*.json")):
-        if not path.is_file():
+    for path in sorted(directory.iterdir()):
+        if path.is_file():
+            if path.suffix.lower() != ".json" or path.name == "index.json":
+                continue
+            key = path.stem
+            try:
+                with path.open("r", encoding="utf-8") as fh:
+                    payload = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, dict):
+                result[key] = payload
             continue
-        key = path.stem
-        try:
-            with path.open("r", encoding="utf-8") as fh:
-                payload = json.load(fh)
-        except (OSError, json.JSONDecodeError):
-            continue
-        if isinstance(payload, dict):
-            result[key] = payload
+        if path.is_dir():
+            summary = path / "summary.json"
+            if not summary.exists():
+                continue
+            try:
+                with summary.open("r", encoding="utf-8") as fh:
+                    payload = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, dict):
+                result[path.name] = payload
     return result
 
 
@@ -266,16 +279,32 @@ def _has_valid_ft_session(session_state: dict[str, T.Any] | None) -> bool:
     return bool(sid and ftat)
 
 
+def _earnings_archive_dir(date_value: dt.date) -> Path:
+    return EARNINGS_ARCHIVE_DIR / date_value.isoformat()
+
+
 def _earnings_archive_file(date_value: dt.date) -> Path:
-    return EARNINGS_ARCHIVE_DIR / f"{date_value.isoformat()}.json"
+    return _earnings_archive_dir(date_value) / "summary.json"
+
+
+def _earnings_symbol_file(date_value: dt.date, symbol: str) -> Path:
+    safe_symbol = "".join(
+        ch for ch in str(symbol) if ch.isalnum() or ch in {"-", "_", "."}
+    )
+    safe_symbol = safe_symbol or "symbol"
+    return _earnings_archive_dir(date_value) / f"{safe_symbol}.json"
+
+
+def _prediction_archive_dir(date_value: dt.date) -> Path:
+    return PREDICTION_ARCHIVE_DIR / date_value.isoformat()
 
 
 def _prediction_archive_file(date_value: dt.date) -> Path:
-    return PREDICTION_ARCHIVE_DIR / f"{date_value.isoformat()}.json"
+    return _prediction_archive_dir(date_value) / "summary.json"
 
 
 def _prediction_symbol_dir(date_value: dt.date) -> Path:
-    return PREDICTION_ARCHIVE_DIR / date_value.isoformat()
+    return _prediction_archive_dir(date_value)
 
 
 def _prediction_symbol_file(date_value: dt.date, symbol: str) -> Path:
@@ -755,10 +784,11 @@ def _store_cached_earnings(
     if options_filter_applied is not True:
         return
     key = date_value.isoformat()
+    generated_at = dt.datetime.now(US_EASTERN).isoformat()
     payload = {
         "rowData": row_data,
         "status": status,
-        "generated_at": dt.datetime.now(US_EASTERN).isoformat(),
+        "generated_at": generated_at,
     }
     if options_filter_applied is not None:
         payload["options_filter_applied"] = bool(options_filter_applied)
@@ -775,6 +805,68 @@ def _store_cached_earnings(
             except (OSError, json.JSONDecodeError):
                 payload_to_write = payload
         _write_archive_file(archive_file, payload_to_write)
+
+        symbol_dir = _earnings_archive_dir(date_value)
+        symbol_map: dict[str, list[dict[str, T.Any]]] = {}
+        for entry in row_data or []:
+            if not isinstance(entry, dict):
+                continue
+            symbol = str(entry.get("symbol") or "").upper()
+            if not symbol:
+                continue
+            symbol_map.setdefault(symbol, []).append(dict(entry))
+
+        if symbol_map:
+            symbol_dir.mkdir(parents=True, exist_ok=True)
+            for symbol, rows in symbol_map.items():
+                file_path = _earnings_symbol_file(date_value, symbol)
+                try:
+                    with file_path.open("r", encoding="utf-8") as fh:
+                        existing_payload = json.load(fh)
+                except (OSError, json.JSONDecodeError):
+                    existing_payload = {}
+
+                history = existing_payload.get("history")
+                if not isinstance(history, list):
+                    history = []
+
+                if rows:
+                    rows_payload = rows
+                else:
+                    existing_rows = existing_payload.get("rows")
+                    rows_payload = existing_rows if isinstance(existing_rows, list) else []
+                rows_safe = _json_safe(rows_payload)
+
+                history_entry = {
+                    "generated_at": generated_at,
+                    "status": status,
+                    "rows": rows_safe,
+                }
+                if options_filter_applied is not None:
+                    history_entry["options_filter_applied"] = bool(options_filter_applied)
+
+                history.append(history_entry)
+
+                symbol_payload = {
+                    "decision_date": key,
+                    "symbol": symbol,
+                    "rows": rows_safe,
+                    "latest_generated_at": generated_at,
+                    "latest_status": status,
+                    "history": _json_safe(history),
+                    "total_runs": len(history),
+                }
+                if options_filter_applied is not None:
+                    symbol_payload["options_filter_applied"] = bool(options_filter_applied)
+
+                _write_archive_file(file_path, symbol_payload)
+
+        legacy_path = EARNINGS_ARCHIVE_DIR / f"{key}.json"
+        if legacy_path.exists():
+            try:
+                legacy_path.unlink()
+            except OSError:
+                pass
 
         cache = _load_earnings_cache_raw()
         cache[key] = payload_to_write
@@ -865,8 +957,33 @@ def _store_prediction_results(
     }
     if timeline_sources:
         payload["timeline_sources"] = timeline_sources
-    payload["missing"] = _json_safe(list(missing or []))
-    payload["errors"] = _json_safe(list(errors or []))
+
+    missing_entries: list[str] = []
+    missing_symbol_set: set[str] = set()
+    for item in missing or []:
+        if item is None:
+            continue
+        text = str(item)
+        if text not in missing_entries:
+            missing_entries.append(text)
+        base = text.split("(", 1)[0].strip().upper()
+        if base:
+            missing_symbol_set.add(base)
+
+    error_entries: list[str] = []
+    error_symbol_set: set[str] = set()
+    for item in errors or []:
+        if item is None:
+            continue
+        text = str(item)
+        if text not in error_entries:
+            error_entries.append(text)
+        base = text.split("(", 1)[0].strip().upper()
+        if base:
+            error_symbol_set.add(base)
+
+    payload["missing"] = _json_safe(missing_entries)
+    payload["errors"] = _json_safe(error_entries)
     if timeline_statuses:
         payload["timeline_statuses"] = _json_safe(timeline_statuses)
     with PREDICTION_LOCK:
@@ -900,11 +1017,19 @@ def _store_prediction_results(
             if symbol:
                 metadata_lookup[symbol] = meta
 
-        if symbol_groups:
+        all_symbols = (
+            set(symbol_groups.keys())
+            | set(metadata_lookup.keys())
+            | missing_symbol_set
+            | error_symbol_set
+        )
+        if all_symbols:
             symbol_dir.mkdir(parents=True, exist_ok=True)
-            for symbol, entries in symbol_groups.items():
-                file_path = _prediction_symbol_file(target_date, symbol)
-                legacy_path = symbol_dir / f"{key}_{symbol}.json"
+            for symbol in sorted(all_symbols):
+                symbol_key = str(symbol).upper()
+                entries = symbol_groups.get(symbol_key, [])
+                file_path = _prediction_symbol_file(target_date, symbol_key)
+                legacy_path = symbol_dir / f"{key}_{symbol_key}.json"
 
                 existing_payload: dict[str, T.Any] = {}
                 legacy_source_used = False
@@ -924,32 +1049,61 @@ def _store_prediction_results(
                     history = []
 
                 entry_results_safe = _json_safe(entries)
+                latest_timelines = {}
+                for entry in entries:
+                    timeline_key = str(entry.get("timeline_key") or "")
+                    if timeline_key:
+                        latest_timelines[timeline_key] = entry
+
+                symbol_missing = symbol_key in missing_symbol_set
+                symbol_error = symbol_key in error_symbol_set
+                status_flag = "missing" if symbol_missing else "error" if symbol_error else "completed"
 
                 history_entry = {
                     "run_id": run_id,
                     "generated_at": generated_at,
-                    "status": status,
+                    "status": status_flag,
                     "results": entry_results_safe,
+                    "timelines": _json_safe(latest_timelines),
+                    "missing": symbol_missing,
+                    "error": symbol_error,
                 }
                 if timeline_sources:
                     history_entry["timeline_sources"] = timeline_sources
 
                 history.append(history_entry)
 
-                metadata = metadata_lookup.get(symbol)
+                metadata = metadata_lookup.get(symbol_key)
                 if metadata is None and isinstance(existing_payload.get("metadata"), dict):
                     metadata = existing_payload["metadata"]
                 metadata_safe = _json_safe(metadata) if metadata is not None else None
 
+                symbol_rows = [
+                    row
+                    for row in row_data or []
+                    if isinstance(row, dict)
+                    and str(row.get("symbol") or "").upper() == symbol_key
+                ]
+                if symbol_rows:
+                    rows_payload = symbol_rows
+                else:
+                    existing_rows = existing_payload.get("rows")
+                    rows_payload = existing_rows if isinstance(existing_rows, list) else []
+                rows_safe = _json_safe(rows_payload)
+
                 per_symbol_payload = {
                     "decision_date": key,
-                    "symbol": symbol,
+                    "symbol": symbol_key,
                     "history": _json_safe(history),
                     "total_runs": len(history),
                     "latest_run_id": run_id,
                     "latest_generated_at": generated_at,
-                    "latest_status": status,
+                    "latest_status": status_flag,
                     "latest_results": entry_results_safe,
+                    "latest_timelines": _json_safe(latest_timelines),
+                    "rows": rows_safe,
+                    "missing": symbol_missing,
+                    "error": symbol_error,
                 }
                 if metadata_safe:
                     per_symbol_payload["metadata"] = metadata_safe
@@ -967,6 +1121,13 @@ def _store_prediction_results(
                         legacy_path.unlink()
                     except OSError:
                         pass
+
+        legacy_summary = PREDICTION_ARCHIVE_DIR / f"{key}.json"
+        if legacy_summary.exists():
+            try:
+                legacy_summary.unlink()
+            except OSError:
+                pass
 
         archive = _load_prediction_archive_raw()
         archive[key] = payload_to_write
@@ -1210,6 +1371,13 @@ def _store_prediction_evaluation(target_date: dt.date, evaluation: dict[str, T.A
                 json.dump(archive, fh, ensure_ascii=False, indent=2)
         except OSError:
             pass
+
+        legacy_summary = PREDICTION_ARCHIVE_DIR / f"{key}.json"
+        if legacy_summary.exists():
+            try:
+                legacy_summary.unlink()
+            except OSError:
+                pass
 
 
 def _load_symbol_meta_cache() -> dict[str, dict[str, T.Any]]:
