@@ -3171,15 +3171,24 @@ def render_model_details_logic(agent_data):  # noqa: D401
 
     return rows
 
-def update_parameter_history_logic(agent_data, history_state):  # noqa: D401
+def update_parameter_history_logic(agent_data, history_state, log_state):  # noqa: D401
     base_history: dict[str, T.Any]
     if isinstance(history_state, dict):
         base_history = history_state
     else:
         base_history = {"global": {"last": {}, "changes": []}, "sectors": {}}
 
+    initial_logs = log_state if isinstance(log_state, list) else []
+    log_entries = initial_logs
+
+    def _emit(message: str) -> None:
+        nonlocal log_entries
+        if not message:
+            return
+        log_entries = append_log(log_entries, message, task_label="强化模型")
+
     if not isinstance(agent_data, dict):
-        return base_history
+        return base_history, no_update
 
     timestamp = dt.datetime.now(US_EASTERN).strftime("%Y-%m-%d %H:%M:%S")
     history = copy.deepcopy(base_history)
@@ -3288,7 +3297,17 @@ def update_parameter_history_logic(agent_data, history_state):  # noqa: D401
         }
         _persist_parameter_snapshot(timestamp, snapshot_payload)
 
-    return history
+        summary_bits: list[str] = []
+        if recorded_global_changes:
+            summary_bits.append(f"全局参数变更 {len(recorded_global_changes)} 项")
+        if recorded_sector_changes:
+            summary_bits.append(f"行业参数变更 {len(recorded_sector_changes)} 项")
+        if summary_bits:
+            _emit("RL 参数更新：" + "；".join(summary_bits))
+
+    log_output = log_entries if log_entries != initial_logs else no_update
+
+    return history, log_output
 
 def render_parameter_history_tables_logic(history_state):  # noqa: D401
     if not isinstance(history_state, dict):
