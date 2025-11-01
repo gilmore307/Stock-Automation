@@ -2421,9 +2421,17 @@ def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data,
         )
 
     cache_entry = _get_cached_earnings(target_date)
+    cached_rows: list[dict[str, T.Any]] = []
+    cached_status = ""
+    if isinstance(cache_entry, dict):
+        payload = cache_entry.get("rowData")
+        if isinstance(payload, list):
+            cached_rows = payload
+        cached_status = str(cache_entry.get("status") or "")
+
     bypass_cache = manual_refresh
 
-    if cache_entry and not bypass_cache:
+    if cached_rows and not bypass_cache:
         logs_list: list[str] = []
         if weekend_note:
             logs_list = append_log(logs_list, weekend_note, task_label="财报日程")
@@ -2432,12 +2440,9 @@ def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data,
             f"命中 {target_date} 的本地缓存。",
             task_label="财报日程",
         )
-        cached_status = str(cache_entry.get("status") or "")
         extra = "（来自本地缓存，无需重新请求。）"
         status_out = (cached_status + "\n" + extra) if cached_status else extra
-        row_data = cache_entry.get("rowData")
-        if not isinstance(row_data, list):
-            row_data = []
+        row_data = list(cached_rows)
         archive_entry = _get_prediction_archive(target_date)
         timeline_has_results: set[str] = set()
         if isinstance(archive_entry, dict):
@@ -2474,48 +2479,61 @@ def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data,
         )
         return None, logs, status_out, row_data, True, tasks
 
-    run_id = uuid.uuid4().hex
-    _init_run_state(run_id, target_date)
+    if cached_rows and bypass_cache:
+        status_lines: list[str] = []
+        logs_list: list[str] = []
+        if weekend_note:
+            logs_list = append_log(logs_list, weekend_note, task_label="财报日程")
+            status_lines.append(weekend_note)
+        manual_note = (
+            "手动刷新请求已记录，但预测任务尚未启动。"
+            "请在预测页开始任务以重新获取财报列表。"
+        )
+        status_lines.append(manual_note)
+        if cached_status:
+            cached_line = f"当前显示最近的缓存结果：{cached_status}"
+            status_lines.append(cached_line)
+        status_message = "\n".join(line for line in status_lines if line)
+        logs = append_log(logs_list, manual_note, task_label="财报日程")
+        return None, logs, status_message, list(cached_rows), True, no_update
 
-    thread = threading.Thread(
-        target=_execute_run,
-        args=(
-            run_id,
-            username or "",
-            password or "",
-            (twofa or ""),
-            session_state,
-            target_date,
-        ),
-        daemon=True,
-    )
-    thread.start()
-
+    status_lines: list[str] = []
+    logs_list: list[str] = []
     if weekend_note:
-        status_prefix = weekend_note + "\n"
-    else:
-        status_prefix = ""
+        logs_list = append_log(logs_list, weekend_note, task_label="财报日程")
+        status_lines.append(weekend_note)
 
-    if login_trigger and bypass_cache:
-        status_message = f"检测到 Firstrade 登录，开始重新筛选 {target_date} 的数据……"
-    elif manual_refresh:
-        status_message = f"正在刷新 {target_date} 的财报列表……"
+    if manual_refresh:
+        waiting_message = (
+            "手动刷新请求已记录，但预测任务尚未启动。"
+            "请在预测页开始任务后自动获取财报列表。"
+        )
     else:
-        status_message = f"开始获取 {target_date} 的数据……"
-    if status_prefix:
-        status_message = status_prefix + status_message
-    waiting_detail = "等待财报列表完成后执行"
-    if login_trigger and bypass_cache:
-        waiting_detail = f"检测到登录，重新筛选 {target_date} 的数据后执行"
-    elif manual_refresh:
-        waiting_detail = f"手动刷新 -> 正在获取 {target_date} 的数据"
-    else:
-        waiting_detail = f"正在获取 {target_date} 的数据"
+        waiting_message = (
+            "预测任务尚未启动。将在预测页开始任务后自动获取"
+            f" {target_date.strftime('%Y-%m-%d')} 的财报列表。"
+        )
+
+    status_lines.append(waiting_message)
+    status_message = "\n".join(line for line in status_lines if line)
+    logs = append_log(logs_list, waiting_message, task_label="财报日程")
 
     timeline_waiting = []
     for idx, cfg in enumerate(PREDICTION_TIMELINES, start=1):
         task_id, name, offset_label = _describe_timeline_task(target_date, cfg)
-        detail_text = waiting_detail if idx == 1 else f"等待前序任务完成后执行 {offset_label}"
+        offset_days = _resolve_timeline_offset_days(cfg)
+        future_date = target_date + dt.timedelta(days=offset_days)
+        future_label = future_date.strftime("%Y-%m-%d")
+        if idx == 1:
+            detail_text = (
+                "等待预测任务 -> 将在任务启动后抓取 "
+                f"{future_label} 的财报列表并执行 {offset_label}"
+            )
+        else:
+            detail_text = (
+                "等待预测任务 -> 前序任务完成后执行 "
+                f"{offset_label}（财报日 {future_label}）"
+            )
         timeline_waiting.append(
             {
                 "id": task_id,
@@ -2530,7 +2548,8 @@ def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data,
         timeline_waiting,
         target_date=target_date_iso,
     )
-    return run_id, [], status_message, [], False, tasks
+    table_out = list(cached_rows) if manual_refresh and cached_rows else []
+    return None, logs, status_message, table_out, True, tasks
 
 
 def _execute_run(
