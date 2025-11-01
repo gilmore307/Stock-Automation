@@ -7,6 +7,7 @@ import datetime as dt
 import uuid
 import copy
 import math
+from collections import deque
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -269,6 +270,31 @@ def _persist_log_entry(entry: str) -> None:
             _enforce_log_rotation()
     except OSError:
         return
+
+
+def load_recent_logs(max_entries: int = 500) -> list[str]:
+    """Load the most recent log entries from archived log files."""
+
+    try:
+        files = sorted(
+            LOG_ARCHIVE_DIR.glob("log-*.txt"),
+            key=lambda path: path.stat().st_mtime,
+        )
+    except OSError:
+        return []
+
+    buffer: deque[str] = deque(maxlen=max_entries)
+    for path in files:
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    cleaned = line.rstrip("\r\n")
+                    if cleaned:
+                        buffer.append(cleaned)
+        except OSError:
+            continue
+
+    return list(buffer)
 
 
 def _has_valid_ft_session(session_state: dict[str, T.Any] | None) -> bool:
@@ -2802,9 +2828,17 @@ def _prepare_earnings_dataset(
     options_applied = selection_mode in {"matched", "empty"}
     return rows_out, status_text, session_out, options_applied, ""
 
-def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data, task_state):  # noqa: D401
+def start_run_logic(
+    auto_intervals,
+    selected_date,
+    refresh_clicks,
+    session_data,
+    task_state,
+    log_state,
+):  # noqa: D401
     trigger = ctx.triggered_id
     session_state = session_data if isinstance(session_data, dict) else {}
+    initial_logs = log_state if isinstance(log_state, list) else []
     logged_in = _has_valid_ft_session(session_state)
     manual_refresh = trigger == "earnings-refresh-btn"
     login_trigger = trigger == "ft-session-store"
@@ -2826,12 +2860,12 @@ def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data,
     if not logged_in:
         if login_trigger:
             message = "检测到无效的 Firstrade 会话，请重新登录。"
-            logs = append_log([], message, task_label="财报日程")
+            logs = append_log(initial_logs, message, task_label="财报日程")
             return logs, message, [], no_update
 
         if manual_refresh or trigger == "earnings-date-picker":
             message = "尚未登录 Firstrade，请先在连接页登录后再刷新财报列表。"
-            logs = append_log([], message, task_label="财报日程")
+            logs = append_log(initial_logs, message, task_label="财报日程")
             return logs, message, [], no_update
 
         return no_update, no_update, no_update, no_update
@@ -2888,7 +2922,7 @@ def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data,
         status_message = (
             "已登录 Firstrade，预测任务将依次拉取各决策日财报并开始运行。"
         )
-        logs_list: list[str] = []
+        logs_list: list[str] = initial_logs
         if weekend_note:
             logs_list = append_log(logs_list, weekend_note, task_label="财报日程")
         logs = append_log(logs_list, status_message, task_label="财报日程")
@@ -2911,7 +2945,7 @@ def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data,
     bypass_cache = manual_refresh
 
     if cached_rows and not bypass_cache:
-        logs_list: list[str] = []
+        logs_list: list[str] = initial_logs
         if weekend_note:
             logs_list = append_log(logs_list, weekend_note, task_label="财报日程")
         logs = append_log(
@@ -2965,7 +2999,7 @@ def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data,
 
     if cached_rows and bypass_cache:
         status_lines: list[str] = []
-        logs_list: list[str] = []
+        logs_list: list[str] = initial_logs
         if weekend_note:
             logs_list = append_log(logs_list, weekend_note, task_label="财报日程")
             status_lines.append(weekend_note)
@@ -2982,7 +3016,7 @@ def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data,
         return logs, status_message, list(cached_rows), no_update
 
     status_lines: list[str] = []
-    logs_list: list[str] = []
+    logs_list: list[str] = initial_logs
     if weekend_note:
         logs_list = append_log(logs_list, weekend_note, task_label="财报日程")
         status_lines.append(weekend_note)
@@ -3871,10 +3905,17 @@ def _prediction_thread_worker(
 
         message = "\n".join(lines)
 
+        if lines:
+            _emit("预测任务总结：", task_label="预测汇总")
+            for line in lines:
+                if line:
+                    _emit(line, task_label="预测汇总")
+
         timeline_sources = {
             key: value.isoformat() for key, value in timeline_dates.items() if isinstance(value, dt.date)
         }
 
+        _emit("正在写入预测结果到存档……", task_label="预测任务")
         _store_prediction_results(
             target_date,
             aggregated_row_data,
@@ -3886,6 +3927,7 @@ def _prediction_thread_worker(
             errors=errors,
             timeline_statuses=timeline_final_statuses,
         )
+        _emit("预测存档写入完成。", task_label="预测任务")
 
         archive_entry = _get_prediction_archive(target_date)
 

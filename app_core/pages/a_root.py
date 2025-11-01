@@ -147,7 +147,11 @@ def build_layout(config: LayoutConfig) -> html.Div:
     return html.Div(
         [
             dcc.Store(id="ft-session-store", storage_type="memory"),
-            dcc.Store(id="log-store", storage_type="memory", data=[]),
+            dcc.Store(
+                id="log-store",
+                storage_type="memory",
+                data=core.load_recent_logs(),
+            ),
             dcc.Store(id="log-autoscroll", storage_type="memory"),
             dcc.Store(id="task-store", storage_type="memory", data={"tasks": []}),
             dcc.Store(
