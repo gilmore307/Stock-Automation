@@ -7,6 +7,8 @@ import datetime as dt
 import uuid
 import copy
 import math
+import traceback
+from collections import deque
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -52,6 +54,7 @@ LOG_MAX_FILES = 20
 LOG_FILE_LOCK = threading.Lock()
 CURRENT_LOG_FILE: Path | None = None
 CURRENT_LOG_LINE_COUNT = 0
+PROCESS_ID = os.getpid()
 
 
 def us_eastern_today() -> dt.date:
@@ -234,7 +237,7 @@ def _reset_log_rotation_state() -> None:
 def _enforce_log_rotation() -> None:
     try:
         files = sorted(
-            LOG_ARCHIVE_DIR.glob("log-*.txt"),
+            LOG_ARCHIVE_DIR.glob(f"log-{PROCESS_ID}-*.txt"),
             key=lambda path: path.stat().st_mtime,
         )
     except OSError:
@@ -261,7 +264,7 @@ def _persist_log_entry(entry: str) -> None:
             if needs_new_file:
                 stamp = dt.datetime.now(US_EASTERN).strftime("%Y%m%d-%H%M%S")
                 suffix = uuid.uuid4().hex[:6]
-                CURRENT_LOG_FILE = LOG_ARCHIVE_DIR / f"log-{stamp}-{suffix}.txt"
+                CURRENT_LOG_FILE = LOG_ARCHIVE_DIR / f"log-{PROCESS_ID}-{stamp}-{suffix}.txt"
                 CURRENT_LOG_LINE_COUNT = 0
             with CURRENT_LOG_FILE.open("a", encoding="utf-8") as fh:
                 fh.write(entry + "\n")
@@ -269,6 +272,31 @@ def _persist_log_entry(entry: str) -> None:
             _enforce_log_rotation()
     except OSError:
         return
+
+
+def load_recent_logs(max_entries: int = 500) -> list[str]:
+    """Load the most recent log entries from archived log files."""
+
+    try:
+        files = sorted(
+            LOG_ARCHIVE_DIR.glob(f"log-{PROCESS_ID}-*.txt"),
+            key=lambda path: path.stat().st_mtime,
+        )
+    except OSError:
+        return []
+
+    buffer: deque[str] = deque(maxlen=max_entries)
+    for path in files:
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    cleaned = line.rstrip("\r\n")
+                    if cleaned:
+                        buffer.append(cleaned)
+        except OSError:
+            continue
+
+    return list(buffer)
 
 
 def _has_valid_ft_session(session_state: dict[str, T.Any] | None) -> bool:
@@ -1249,7 +1277,7 @@ def _timeline_state_is_done(status: dict[str, T.Any] | None) -> bool:
     if not isinstance(status, dict):
         return False
     state = str(status.get("state") or "").lower()
-    return state in {"completed", "empty"}
+    return state in {"completed"}
 
 
 def _build_task_updates_from_statuses(
@@ -2802,9 +2830,17 @@ def _prepare_earnings_dataset(
     options_applied = selection_mode in {"matched", "empty"}
     return rows_out, status_text, session_out, options_applied, ""
 
-def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data, task_state):  # noqa: D401
+def start_run_logic(
+    auto_intervals,
+    selected_date,
+    refresh_clicks,
+    session_data,
+    task_state,
+    log_state,
+):  # noqa: D401
     trigger = ctx.triggered_id
     session_state = session_data if isinstance(session_data, dict) else {}
+    initial_logs = log_state if isinstance(log_state, list) else []
     logged_in = _has_valid_ft_session(session_state)
     manual_refresh = trigger == "earnings-refresh-btn"
     login_trigger = trigger == "ft-session-store"
@@ -2826,12 +2862,12 @@ def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data,
     if not logged_in:
         if login_trigger:
             message = "检测到无效的 Firstrade 会话，请重新登录。"
-            logs = append_log([], message, task_label="财报日程")
+            logs = append_log(initial_logs, message, task_label="财报日程")
             return logs, message, [], no_update
 
         if manual_refresh or trigger == "earnings-date-picker":
             message = "尚未登录 Firstrade，请先在连接页登录后再刷新财报列表。"
-            logs = append_log([], message, task_label="财报日程")
+            logs = append_log(initial_logs, message, task_label="财报日程")
             return logs, message, [], no_update
 
         return no_update, no_update, no_update, no_update
@@ -2888,7 +2924,7 @@ def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data,
         status_message = (
             "已登录 Firstrade，预测任务将依次拉取各决策日财报并开始运行。"
         )
-        logs_list: list[str] = []
+        logs_list: list[str] = initial_logs
         if weekend_note:
             logs_list = append_log(logs_list, weekend_note, task_label="财报日程")
         logs = append_log(logs_list, status_message, task_label="财报日程")
@@ -2911,7 +2947,7 @@ def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data,
     bypass_cache = manual_refresh
 
     if cached_rows and not bypass_cache:
-        logs_list: list[str] = []
+        logs_list: list[str] = initial_logs
         if weekend_note:
             logs_list = append_log(logs_list, weekend_note, task_label="财报日程")
         logs = append_log(
@@ -2965,7 +3001,7 @@ def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data,
 
     if cached_rows and bypass_cache:
         status_lines: list[str] = []
-        logs_list: list[str] = []
+        logs_list: list[str] = initial_logs
         if weekend_note:
             logs_list = append_log(logs_list, weekend_note, task_label="财报日程")
             status_lines.append(weekend_note)
@@ -2982,7 +3018,7 @@ def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data,
         return logs, status_message, list(cached_rows), no_update
 
     status_lines: list[str] = []
-    logs_list: list[str] = []
+    logs_list: list[str] = initial_logs
     if weekend_note:
         logs_list = append_log(logs_list, weekend_note, task_label="财报日程")
         status_lines.append(weekend_note)
@@ -3262,6 +3298,11 @@ def _prediction_thread_worker(
             if key and not _timeline_state_is_done(existing_statuses.get(key)):
                 pending_set.add(key)
 
+    try:
+        pending_preview = ", ".join(sorted(pending_set)) or "无待处理时点"
+    except TypeError:  # pragma: no cover - defensive
+        pending_preview = "无待处理时点"
+
     row_groups_existing = _group_rowdata_by_timeline(archive_snapshot.get("rowData"))
     result_groups_existing = _group_results_by_timeline(archive_snapshot.get("results"))
     timeline_sources_snapshot = (
@@ -3314,6 +3355,14 @@ def _prediction_thread_worker(
     run_identifier = uuid.uuid4().hex
 
     try:
+        _emit(
+            "预测线程已启动，准备执行关键步骤……",
+            task_label="预测任务",
+        )
+        _emit(
+            f"目标日期：{target_date_iso}，待处理时点：{pending_preview}",
+            task_label="预测任务",
+        )
         if triggered == "ft-session-store":
             summary_msg = (
                 f"{target_date.strftime('%m月%d日')} 的预测序列已启动，共 {len(PREDICTION_TIMELINES)} 个时点。"
@@ -3426,6 +3475,17 @@ def _prediction_thread_worker(
             timeline_date_str = timeline_date.isoformat()
             existing_meta_map = row_groups_existing.get(timeline_key, {})
             should_process = timeline_key in pending_set
+
+            if should_process:
+                _emit(
+                    f"开始准备 {label}（决策日 {timeline_date_str}）的预测任务。",
+                    task_label=label,
+                )
+            else:
+                _emit(
+                    f"{label}（决策日 {timeline_date_str}）已存在记录，将检查是否需要复用。",
+                    task_label=label,
+                )
 
             if not should_process:
                 meta_map = {symbol: dict(data) for symbol, data in existing_meta_map.items()}
@@ -3737,9 +3797,24 @@ def _prediction_thread_worker(
                     continue
                 all_missing_set.add(str(item))
             if isinstance(partial_missing_detail, dict):
+                grouped_missing_detail: dict[str, list[str]] = {}
                 for miss_key, miss_reason in partial_missing_detail.items():
-                    if miss_key:
-                        missing_reason_lookup[miss_key] = miss_reason
+                    if not miss_key:
+                        continue
+                    reason_text = str(miss_reason or "原因未明")
+                    key_text = str(miss_key)
+                    missing_reason_lookup[key_text] = reason_text
+                    grouped_missing_detail.setdefault(reason_text, []).append(key_text)
+                for reason_text, miss_entries in grouped_missing_detail.items():
+                    if not miss_entries:
+                        continue
+                    sample_text = "；".join(miss_entries[:5])
+                    if len(miss_entries) > 5:
+                        sample_text += "……"
+                    _emit(
+                        f"{label} 缺数据原因（{reason_text}）：{len(miss_entries)} 条（{sample_text}）",
+                        task_label=label,
+                    )
 
             for item in partial_errors:
                 if item is None:
@@ -3750,6 +3825,10 @@ def _prediction_thread_worker(
             success = int(summary.get("success", 0) or 0)
             missing_cnt = int(summary.get("missing", 0) or 0)
             error_cnt = int(summary.get("error", 0) or 0)
+            _emit(
+                f"{label}（{timeline_date_str}）DCI 处理完成：成功 {success}，缺数据 {missing_cnt}，失败 {error_cnt}。",
+                task_label=label,
+            )
             parts: list[str] = []
             if success:
                 parts.append(f"完成{success}次")
@@ -3871,10 +3950,22 @@ def _prediction_thread_worker(
 
         message = "\n".join(lines)
 
+        _emit(
+            f"预测汇总：结果 {len(results)} 条，缺数据 {len(missing)} 条，错误 {len(errors)} 条。",
+            task_label="预测任务",
+        )
+
+        if lines:
+            _emit("预测任务总结：", task_label="预测汇总")
+            for line in lines:
+                if line:
+                    _emit(line, task_label="预测汇总")
+
         timeline_sources = {
             key: value.isoformat() for key, value in timeline_dates.items() if isinstance(value, dt.date)
         }
 
+        _emit("正在写入预测结果到存档……", task_label="预测任务")
         _store_prediction_results(
             target_date,
             aggregated_row_data,
@@ -3886,6 +3977,7 @@ def _prediction_thread_worker(
             errors=errors,
             timeline_statuses=timeline_final_statuses,
         )
+        _emit("预测存档写入完成。", task_label="预测任务")
 
         archive_entry = _get_prediction_archive(target_date)
 
@@ -3933,6 +4025,10 @@ def _prediction_thread_worker(
     except Exception as exc:  # pragma: no cover - defensive guard
         error_message = f"预测任务失败：{exc}"
         _emit(error_message, task_label="预测任务")
+        tb_text = traceback.format_exc()
+        if tb_text:
+            for line in tb_text.strip().splitlines():
+                _emit(line, task_label="预测任务")
         fallback_store = {
             "results": [],
             "missing": [],

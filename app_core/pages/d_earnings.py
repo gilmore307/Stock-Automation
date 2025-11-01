@@ -85,15 +85,17 @@ def register_callbacks(app: Dash) -> None:
         Input("earnings-refresh-btn", "n_clicks"),
         Input("ft-session-store", "data"),
         State("task-store", "data"),
+        State("log-store", "data"),
         prevent_initial_call="initial_duplicate",
     )
-    def start_run(auto_intervals, selected_date, refresh_clicks, session_data, task_state):  # noqa: D401
+    def start_run(auto_intervals, selected_date, refresh_clicks, session_data, task_state, log_state):  # noqa: D401
         return core.start_run_logic(
             auto_intervals,
             selected_date,
             refresh_clicks,
             session_data,
             task_state,
+            log_state,
         )
 
     @app.callback(
