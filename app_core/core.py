@@ -1766,6 +1766,19 @@ def pick_by_times(rows: T.List[dict], want_after_hours=False, want_pre_market=Fa
     return out
 
 
+def _describe_time_bucket(time_label: str | None) -> str:
+    """Map a Nasdaq earnings time string into the dashboard's bucket labels."""
+
+    text = str(time_label or "").strip()
+    if _is_after_hours(text):
+        return "盘后"
+    if _is_pre_market(text):
+        return "盘前"
+    if _is_time_not_supplied(text):
+        return "时间待定"
+    return "常规盘"
+
+
 def append_log(
     logs: T.Optional[T.List[str]], message: str, *, task_label: str | None = None
 ) -> T.List[str]:
@@ -2069,6 +2082,141 @@ class FTClient:
 
 
 
+
+
+def _prepare_earnings_dataset(
+    target_date: dt.date,
+    session_state: dict[str, T.Any] | None,
+    username: str,
+    password: str,
+    twofa: str,
+    *,
+    logger: T.Optional[T.Callable[[str], None]] = None,
+) -> tuple[list[dict[str, T.Any]], str, dict[str, T.Any] | None, bool, str]:
+    """Fetch Nasdaq earnings and filter to symbols backed by weekly options."""
+
+    def _log(message: str) -> None:
+        if logger:
+            try:
+                logger(message)
+            except Exception:  # pragma: no cover - logging best effort
+                pass
+
+    session_payload = session_state if isinstance(session_state, dict) else {}
+
+    try:
+        base_rows = fetch_earnings_by_date(target_date)
+    except Exception as exc:  # pragma: no cover - defensive network handling
+        error = f"财报列表请求失败：{exc}"
+        _log(error)
+        return [], "", None, False, error
+
+    if not base_rows:
+        message = f"{target_date.strftime('%Y-%m-%d')} 未找到可用的财报记录。"
+        _log(message)
+        return [], message, None, True, ""
+
+    _log(
+        f"{target_date.strftime('%Y-%m-%d')} 财报列表共 {len(base_rows)} 条，准备执行 Firstrade 筛选。"
+    )
+
+    has_session = _has_valid_ft_session(session_payload)
+    ft_client: FTClient | None = None
+    session_out: dict[str, T.Any] | None = None
+
+    if has_session or (username and password):
+        ft_client = FTClient(
+            username,
+            password,
+            twofa,
+            session_state=session_payload if has_session else None,
+            login=not has_session,
+            logger=_log,
+        )
+        if ft_client.enabled:
+            session_out = ft_client.export_session_state()
+        else:
+            error = ft_client.error or "Firstrade 会话不可用"
+            _log(f"Firstrade 筛选失败：{error}")
+            return [], "", session_out, False, error
+    else:
+        error = "缺少 Firstrade 会话凭证"
+        _log(error)
+        return [], "", None, False, error
+
+    weekly_map: dict[str, bool] = {}
+    filtered_rows: list[dict[str, T.Any]] = []
+    options_applied = False
+    error_message = ""
+
+    if ft_client and ft_client.enabled:
+        expiry_date = this_friday(target_date)
+        options_applied = True
+        for entry in base_rows:
+            symbol = str(entry.get("symbol") or "").upper()
+            if not symbol:
+                continue
+            if symbol not in weekly_map:
+                result = ft_client.has_weekly_expiring_on(symbol, expiry_date)
+                if result is None:
+                    options_applied = False
+                    if ft_client.error:
+                        error_message = ft_client.error
+                    _log(f"无法确认 {symbol} 的周五期权信息。")
+                    break
+                weekly_map[symbol] = bool(result)
+            if weekly_map.get(symbol):
+                filtered_rows.append(entry)
+
+        if options_applied and ft_client.enabled:
+            _log(f"Firstrade 筛选完成，保留 {len(filtered_rows)} 条记录。")
+            base_rows = filtered_rows
+        else:
+            base_rows = []
+            if not error_message:
+                error_message = "Firstrade 筛选未完成"
+    else:  # pragma: no cover - guarded above
+        return [], "", session_out, False, ft_client.error if ft_client else ""
+
+    if error_message and ft_client and not ft_client.enabled and not error_message.endswith("未完成"):
+        _log(f"Firstrade 会话失效：{error_message}")
+        return [], "", session_out, False, error_message
+
+    if not options_applied:
+        status_text = f"{target_date.strftime('%Y-%m-%d')} 未完成 Firstrade 周五期权筛选。"
+        return [], status_text, session_out, False, ""
+
+    if not base_rows:
+        status_text = f"{target_date.strftime('%Y-%m-%d')} 筛选后暂无符合条件的标的。"
+    else:
+        status_text = (
+            f"{target_date.strftime('%Y-%m-%d')} 筛选周五期权后保留 {len(base_rows)} 个标的。"
+        )
+
+    rows_out: list[dict[str, T.Any]] = []
+    for entry in base_rows:
+        symbol = str(entry.get("symbol") or "").upper()
+        if not symbol:
+            continue
+        row = {
+            "symbol": symbol,
+            "company": entry.get("company") or "",
+            "time": entry.get("time") or "",
+            "bucket": _describe_time_bucket(entry.get("time")),
+            "decision_date": target_date.isoformat(),
+            "timeline_date": target_date.isoformat(),
+            "weekly_exp_this_fri": True,
+        }
+        raw_payload = entry.get("raw")
+        if raw_payload is not None:
+            row["raw"] = raw_payload
+        sector = entry.get("sector") or _get_symbol_sector(symbol)
+        if sector:
+            row["sector"] = sector
+        rows_out.append(row)
+
+    return rows_out, status_text, session_out, True, ""
+
 def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data, username, password, twofa, task_state):  # noqa: D401
     trigger = ctx.triggered_id
     session_state = session_data if isinstance(session_data, dict) else {}
@@ -2246,6 +2394,73 @@ def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data,
         target_date=target_date_iso,
     )
     return run_id, [], status_message, [], False, tasks
+
+
+def _execute_run(
+    run_id: str,
+    username: str,
+    password: str,
+    twofa: str,
+    session_state: dict[str, T.Any] | None,
+    target_date: dt.date,
+) -> None:
+    """Background worker that refreshes and filters the earnings list."""
+
+    def _log(message: str) -> None:
+        _append_run_log(run_id, message)
+
+    try:
+        _log(f"开始刷新 {target_date.strftime('%Y-%m-%d')} 的财报列表。")
+        rows, status_text, session_out, options_applied, error_message = _prepare_earnings_dataset(
+            target_date,
+            session_state,
+            username,
+            password,
+            twofa,
+            logger=_log,
+        )
+        if error_message:
+            status = f"财报列表失败：{error_message}"
+            _log(status)
+            session_payload = session_out if isinstance(session_out, dict) else NO_UPDATE_SENTINEL
+            _update_run_state(
+                run_id,
+                rowData=[],
+                status=status,
+                completed=True,
+                session_state=session_payload,
+                options_filter_applied=False,
+            )
+            return
+
+        session_payload = session_out if isinstance(session_out, dict) else NO_UPDATE_SENTINEL
+        if options_applied:
+            try:
+                _store_cached_earnings(target_date, rows, status_text or "", options_filter_applied=True)
+            except Exception:  # pragma: no cover - cache best effort
+                _log("写入本地缓存时出现问题，已忽略。")
+
+        if not status_text:
+            status_text = f"{target_date.strftime('%Y-%m-%d')} 财报刷新完成。"
+
+        _update_run_state(
+            run_id,
+            rowData=rows,
+            status=status_text,
+            completed=True,
+            session_state=session_payload,
+            options_filter_applied=bool(options_applied),
+        )
+    except Exception as exc:  # pragma: no cover - defensive guard
+        _log(f"刷新过程中出现异常：{exc}")
+        _update_run_state(
+            run_id,
+            rowData=[],
+            status=f"发生错误：{exc}",
+            completed=True,
+            session_state=NO_UPDATE_SENTINEL,
+            options_filter_applied=False,
+        )
 
 def poll_run_state_logic(n_intervals, run_id, existing_logs, current_rows, task_state):  # noqa: D401
     del n_intervals
