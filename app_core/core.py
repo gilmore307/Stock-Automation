@@ -1277,7 +1277,7 @@ def _timeline_state_is_done(status: dict[str, T.Any] | None) -> bool:
     if not isinstance(status, dict):
         return False
     state = str(status.get("state") or "").lower()
-    return state in {"completed", "empty"}
+    return state in {"completed"}
 
 
 def _build_task_updates_from_statuses(
