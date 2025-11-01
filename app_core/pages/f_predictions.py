@@ -170,11 +170,17 @@ def register_callbacks(app: Dash) -> None:
 
     @app.callback(
         Output("evaluation-store", "data"),
+        Output("task-store", "data", allow_duplicate=True),
         Input("post-open-eval", "n_intervals"),
         State("evaluation-store", "data"),
+        State("task-store", "data"),
     )
-    def auto_evaluate_predictions(n_intervals, existing_store):  # noqa: D401
-        return core.auto_evaluate_predictions_logic(n_intervals, existing_store)
+    def auto_evaluate_predictions(n_intervals, existing_store, task_state):  # noqa: D401
+        return core.auto_evaluate_predictions_logic(
+            n_intervals,
+            existing_store,
+            task_state,
+        )
 
     @app.callback(
         Output("prediction-store", "data", allow_duplicate=True),

@@ -154,6 +154,10 @@ DCI_AUTO_BASELINE_ENABLED = (
     str(os.getenv("DCI_AUTO_BASELINE", "1")).strip().lower() not in {"0", "false", "no"}
 )
 
+DAILY_T_MINUS_ONE_TASK_ID = "daily::t-1-eval"
+DAILY_ADJUST_TASK_ID = "daily::adjust-params"
+BACKFILL_TASK_ID = "backfill::validation"
+
 EARNINGS_CACHE_PATH = CACHE_ROOT / "earnings.json"
 EARNINGS_ARCHIVE_DIR = ARCHIVE_ROOT / "earnings"
 CACHE_LOCK = threading.Lock()
@@ -405,7 +409,20 @@ FACTOR_DESCRIPTIONS: dict[str, str] = {
     "EarningsYield_vs_Sector": "相对于行业的盈利收益率。",
 }
 
-TASK_ORDER = [f"predict::{cfg['key']}" for cfg in PREDICTION_TIMELINES]
+PREDICTION_TASK_SEQUENCE = [
+    "decision_day",
+    "plus1",
+    "plus3",
+    "plus7",
+    "plus14",
+]
+
+TASK_ORDER = [
+    DAILY_T_MINUS_ONE_TASK_ID,
+    DAILY_ADJUST_TASK_ID,
+    *[f"predict::{key}" for key in PREDICTION_TASK_SEQUENCE],
+    BACKFILL_TASK_ID,
+]
 
 VALIDATION_PARAMETER_SPECS: list[dict[str, T.Any]] = [
     {"label": "方向", "field": "direction", "fmt": "text", "actual_field": "actual_direction"},
@@ -618,12 +635,40 @@ def _build_validation_figures(
                 fig_prob.add_hline(y=move_value, line_dash="dot", line_color="firebrick", name="实际涨跌幅")
 
     return fig_dci, fig_prob
-TASK_TEMPLATES: dict[str, dict[str, T.Any]] = {}
+TASK_TEMPLATES: dict[str, dict[str, T.Any]] = {
+    DAILY_T_MINUS_ONE_TASK_ID: {
+        "id": DAILY_T_MINUS_ONE_TASK_ID,
+        "name": "T-1 实际结果检验",
+    },
+    DAILY_ADJUST_TASK_ID: {
+        "id": DAILY_ADJUST_TASK_ID,
+        "name": "模型参数及因子权重调整",
+    },
+    BACKFILL_TASK_ID: {
+        "id": BACKFILL_TASK_ID,
+        "name": "回溯验证任务",
+    },
+}
+
 for _timeline_cfg in PREDICTION_TIMELINES:
     _key = str(_timeline_cfg.get("key"))
-    TASK_TEMPLATES[f"predict::{_key}"] = {
-        "id": f"predict::{_key}",
-        "name": f"{_timeline_cfg.get('label', _key)} 预测",
+    if not _key:
+        continue
+    _task_id = f"predict::{_key}"
+    _default_name = f"{_timeline_cfg.get('label', _key)} 预测"
+    if _key == "decision_day":
+        _default_name = "T+0 预测"
+    elif _key == "plus1":
+        _default_name = "T+1 预测"
+    elif _key == "plus3":
+        _default_name = "T+3 预测"
+    elif _key == "plus7":
+        _default_name = "T+7 预测"
+    elif _key == "plus14":
+        _default_name = "T+14 预测"
+    TASK_TEMPLATES[_task_id] = {
+        "id": _task_id,
+        "name": _default_name,
     }
 
 
@@ -4182,21 +4227,350 @@ def render_prediction_table_logic(store_data):  # noqa: D401
         return pending
     return []
 
-def auto_evaluate_predictions_logic(n_intervals, existing_store):  # noqa: D401
+def _is_trading_day(date_value: dt.date) -> bool:
+    """Return whether the given date is a US trading day (Mon-Fri)."""
+
+    return date_value.weekday() < 5
+
+
+def _has_decision_day_predictions(archive_entry: dict[str, T.Any] | None) -> bool:
+    """Return True if the archive entry contains decision-day predictions."""
+
+    if not isinstance(archive_entry, dict):
+        return False
+
+    raw_results = archive_entry.get("results")
+    if not isinstance(raw_results, list):
+        return False
+    for result in raw_results:
+        if not isinstance(result, dict):
+            continue
+        timeline_key = str(result.get("timeline_key") or "")
+        lookback = result.get("lookback_days")
+        if timeline_key == "decision_day" or (isinstance(lookback, (int, float)) and int(lookback) == 0):
+            return True
+    return False
+
+
+def _has_evaluation_record(archive_entry: dict[str, T.Any] | None) -> bool:
+    """Return True if the archive entry already carries a validation record."""
+
+    if not isinstance(archive_entry, dict):
+        return False
+
+    evaluation = archive_entry.get("evaluation")
+    if not isinstance(evaluation, dict):
+        return False
+    summary = evaluation.get("summary")
+    if isinstance(summary, dict) and summary.get("checked_at"):
+        return True
+    items = evaluation.get("items")
+    return isinstance(items, list) and bool(items)
+
+
+def _find_validation_target(start_date: dt.date) -> tuple[dt.date | None, bool]:
+    """Locate the most recent decision day that requires validation.
+
+    The search skips the immediate previous trading day (``start_date``) because
+    its T+1 results are not yet available during the morning run. The returned
+    tuple consists of ``(date, is_backfilled)`` where ``is_backfilled`` indicates
+    whether the located date is older than ``start_date``.
+    """
+
+    candidate = start_date
+    fallback: dt.date | None = None
+    skipped_start = False
+    for _ in range(120):  # limit search horizon to avoid infinite loops
+        if not skipped_start and candidate == start_date:
+            skipped_start = True
+            candidate = previous_trading_day(candidate)
+            continue
+
+        if not _is_trading_day(candidate):
+            candidate -= dt.timedelta(days=1)
+            continue
+
+        entry = _get_prediction_archive(candidate)
+        if not _has_decision_day_predictions(entry):
+            candidate = previous_trading_day(candidate)
+            continue
+
+        if not _has_evaluation_record(entry):
+            return candidate, candidate < start_date
+
+        if fallback is None:
+            fallback = candidate
+        candidate = previous_trading_day(candidate)
+
+    if fallback is not None:
+        return fallback, fallback < start_date
+    return None, False
+
+
+def _date_to_utc_timestamp(date_value: dt.date) -> int:
+    """Convert a date to a UTC midnight timestamp accepted by Finnhub APIs."""
+
+    as_utc = dt.datetime(date_value.year, date_value.month, date_value.day, tzinfo=dt.timezone.utc)
+    return int(as_utc.timestamp())
+
+
+def _fetch_t_plus_one_closes(symbol: str, decision_day: dt.date) -> tuple[float | None, float | None, str | None]:
+    """Fetch the T and T+1 closing prices for the given symbol.
+
+    Returns (decision_close, next_close, error). Only daily closes up to the next
+    trading day are considered to avoid using future information.
+    """
+
+    next_day = next_trading_day(decision_day)
+    from_ts = _date_to_utc_timestamp(decision_day)
+    # Add one extra day to ensure the next trading day's candle is included.
+    to_ts = _date_to_utc_timestamp(next_day + dt.timedelta(days=1))
+
+    try:
+        resp = requests.get(
+            "https://finnhub.io/api/v1/stock/candle",
+            params={
+                "symbol": symbol,
+                "resolution": "D",
+                "from": from_ts,
+                "to": to_ts,
+                "token": FINNHUB_API_KEY,
+            },
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        return None, None, str(exc)
+
+    if not resp.ok:
+        return None, None, f"HTTP {resp.status_code}"
+
+    try:
+        payload = resp.json()
+    except ValueError:
+        return None, None, "响应非 JSON 数据"
+
+    if not isinstance(payload, dict) or payload.get("s") != "ok":
+        message = str(payload.get("s")) if isinstance(payload, dict) else ""
+        return None, None, message or "行情返回异常"
+
+    closes = payload.get("c")
+    timestamps = payload.get("t")
+    if not isinstance(closes, list) or not isinstance(timestamps, list):
+        return None, None, "行情数据缺少收盘价"
+
+    decision_close: float | None = None
+    next_close: float | None = None
+    for close, ts_val in zip(closes, timestamps):
+        try:
+            ts_int = int(ts_val)
+        except (TypeError, ValueError):
+            continue
+        date_at_ts = dt.datetime.fromtimestamp(ts_int, dt.timezone.utc).date()
+        try:
+            close_val = float(close)
+        except (TypeError, ValueError):
+            continue
+        if date_at_ts == decision_day:
+            decision_close = close_val
+        elif date_at_ts == next_day:
+            next_close = close_val
+
+    if decision_close is None or next_close is None:
+        return decision_close, next_close, "缺少 T 或 T+1 收盘价"
+
+    return decision_close, next_close, None
+
+
+def auto_evaluate_predictions_logic(
+    n_intervals, existing_store, existing_task_state
+):  # noqa: D401
     del n_intervals
 
     now = dt.datetime.now(US_EASTERN)
-    if now.hour < 9 or (now.hour == 9 and now.minute < 40):
-        return no_update, no_update
-
     today = now.date()
     today_iso = today.isoformat()
+    trading_day = _is_trading_day(today)
 
     store = existing_store if isinstance(existing_store, dict) else {}
-    if store.get("last_run") == today_iso:
-        return no_update, no_update
 
-    target_date = previous_trading_day(today)
+    tasks_updates: list[dict[str, T.Any]] = []
+    existing_task_map: dict[str, dict[str, T.Any]] = {}
+    if isinstance(existing_task_state, dict):
+        tasks_payload = existing_task_state.get("tasks")
+        if isinstance(tasks_payload, list):
+            for task in tasks_payload:
+                if isinstance(task, dict) and task.get("id"):
+                    existing_task_map[str(task["id"])] = task
+
+    def _task_name(task_id: str) -> str:
+        template = TASK_TEMPLATES.get(task_id)
+        if isinstance(template, dict) and template.get("name"):
+            return str(template["name"])
+        return task_id
+
+    def _update_task(task_id: str, status: str, detail: str, **extra: T.Any) -> None:
+        payload = {
+            "id": task_id,
+            "name": _task_name(task_id),
+            "status": status,
+            "detail": detail,
+        }
+        payload.update(extra)
+        tasks_updates.append(payload)
+
+    def _ensure_prediction_task(task_id: str, detail: str, *, default_status: str = "等待") -> None:
+        existing = existing_task_map.get(task_id)
+        if existing is not None:
+            current_status = str(existing.get("status") or "")
+            if current_status not in {"等待", ""}:
+                return
+            current_detail = str(existing.get("detail") or "")
+            if current_detail == detail:
+                return
+            status_to_use = default_status if current_status in {"", "等待"} else current_status
+        else:
+            status_to_use = default_status
+        _update_task(task_id, status_to_use, detail)
+        existing_task_map[task_id] = {"status": status_to_use, "detail": detail}
+
+    def _finalise_tasks():
+        if not tasks_updates:
+            return no_update
+        base_state = existing_task_state if isinstance(existing_task_state, dict) else None
+        return _merge_task_updates(base_state, tasks_updates)
+
+    time_now = now.time()
+    for key in PREDICTION_TASK_SEQUENCE:
+        task_id = f"predict::{key}"
+        if key == "decision_day":
+            if not trading_day:
+                detail = "今日非开盘日，等待下个开盘日 15:00 开始 T+0 预测"
+            elif time_now < dt.time(15, 0):
+                detail = "等待美东15:00 开始 T+0 预测"
+            else:
+                detail = "已过美东15:00，可立即开始 T+0 预测"
+        elif key == "plus1":
+            detail = "待 T+0 预测完成后执行 T+1 预测"
+            if not trading_day:
+                detail = "待下个开盘日完成 T+0 后执行 T+1 预测"
+        elif key == "plus3":
+            detail = "待 T+1 预测完成后执行 T+3 预测"
+        elif key == "plus7":
+            detail = "待 T+3 预测完成后执行 T+7 预测"
+        elif key == "plus14":
+            detail = "待 T+7 预测完成后执行 T+14 预测"
+        else:
+            detail = "等待前序预测任务完成"
+        _ensure_prediction_task(task_id, detail)
+
+    prev_trading = previous_trading_day(today)
+    waiting_detail = (
+        f"等待美东10:00 获取 {prev_trading.isoformat()} 的 T+1 行情数据"
+    )
+
+    if now.hour < 10:
+        _update_task(DAILY_T_MINUS_ONE_TASK_ID, "等待", waiting_detail)
+        _update_task(
+            DAILY_ADJUST_TASK_ID,
+            "等待",
+            "等待检验完成后根据结果调整模型参数与因子权重",
+        )
+        if trading_day:
+            backfill_status = "等待"
+            backfill_detail = "等待当日预测完成后执行回溯验证"
+        else:
+            backfill_status = "进行中"
+            backfill_detail = "今日非开盘日，持续执行回溯验证"
+        _update_task(BACKFILL_TASK_ID, backfill_status, backfill_detail)
+        return no_update, _finalise_tasks()
+
+    if store.get("last_run") == today_iso:
+        summary = store.get("summary") if isinstance(store.get("summary"), dict) else {}
+        target_text = str(
+            store.get("date")
+            or summary.get("date")
+            or prev_trading.isoformat()
+        )
+        total = int(summary.get("total") or 0)
+        correct = int(summary.get("correct") or 0)
+        success_rate = summary.get("success_rate")
+        try:
+            success_pct = f"{round(float(success_rate) * 100, 1)}%"
+        except (TypeError, ValueError):
+            success_pct = "-"
+        errors = summary.get("errors") if isinstance(summary.get("errors"), list) else []
+
+        if total > 0:
+            eval_detail = (
+                f"{target_text}：命中 {correct}/{total}（{success_pct}）"
+            )
+            if errors:
+                eval_detail += f"，{len(errors)} 条异常"
+            eval_status = "已完成"
+            adjust_status = "已完成"
+            adjust_detail = "已根据最新检验自动调整模型参数与因子权重"
+        else:
+            message = str(
+                store.get("message")
+                or summary.get("message")
+                or "未找到可用于验证的预测记录。"
+            )
+            eval_detail = message
+            eval_status = "无数据"
+            adjust_status = "无数据"
+            adjust_detail = "无检验结果，跳过参数调整"
+
+        _update_task(DAILY_T_MINUS_ONE_TASK_ID, eval_status, eval_detail)
+        _update_task(DAILY_ADJUST_TASK_ID, adjust_status, adjust_detail)
+
+        backfill_flag = bool(summary.get("backfill") or store.get("backfill"))
+        if backfill_flag:
+            backfill_status = "进行中"
+            backfill_detail = f"回溯验证：最近检验 {target_text}"
+        elif not trading_day:
+            backfill_status = "进行中"
+            backfill_detail = "今日非开盘日，持续执行回溯验证"
+        else:
+            backfill_status = "等待"
+            backfill_detail = "等待当日预测完成后执行回溯验证"
+        _update_task(BACKFILL_TASK_ID, backfill_status, backfill_detail)
+
+        return no_update, _finalise_tasks()
+
+    search_start = previous_trading_day(today)
+    target_date, is_backfill = _find_validation_target(search_start)
+    if target_date is None:
+        message = "未找到可用于验证的预测记录。"
+        evaluation_store = {
+            "last_run": today_iso,
+            "date": None,
+            "checked_at": now.isoformat(),
+            "items": [],
+            "summary": {
+                "date": None,
+                "checked_at": now.isoformat(),
+                "total": 0,
+                "correct": 0,
+                "success_rate": 0.0,
+                "avg_move": None,
+            },
+            "message": message,
+        }
+        _update_task(DAILY_T_MINUS_ONE_TASK_ID, "无数据", message)
+        _update_task(
+            DAILY_ADJUST_TASK_ID,
+            "无数据",
+            "无检验结果，跳过参数调整",
+        )
+        if trading_day:
+            backfill_status = "等待"
+            backfill_detail = "等待当日预测完成后执行回溯验证"
+        else:
+            backfill_status = "进行中"
+            backfill_detail = "今日非开盘日，持续执行回溯验证"
+        _update_task(BACKFILL_TASK_ID, backfill_status, backfill_detail)
+        return evaluation_store, _finalise_tasks()
+
     archive_entry = _get_prediction_archive(target_date)
 
     evaluation_items: list[dict[str, T.Any]] = []
@@ -4212,7 +4586,10 @@ def auto_evaluate_predictions_logic(n_intervals, existing_store):  # noqa: D401
                 r
                 for r in raw_results
                 if isinstance(r, dict)
-                and (str(r.get("timeline_key")) == "decision_day" or int(r.get("lookback_days", 0)) == 0)
+                and (
+                    str(r.get("timeline_key")) == "decision_day"
+                    or int(r.get("lookback_days", 0)) == 0
+                )
             ]
 
     if not results:
@@ -4239,33 +4616,46 @@ def auto_evaluate_predictions_logic(n_intervals, existing_store):  # noqa: D401
             "summary": evaluation_payload["summary"],
             "message": evaluation_payload.get("message"),
         }
-        return evaluation_store, no_update
+        note_detail = f"{target_date.isoformat()}：无预测记录，自动跳过"
+        _update_task(DAILY_T_MINUS_ONE_TASK_ID, "无数据", note_detail)
+        _update_task(
+            DAILY_ADJUST_TASK_ID,
+            "无数据",
+            "无检验结果，跳过参数调整",
+        )
+        if is_backfill or not trading_day:
+            backfill_status = "进行中"
+            backfill_detail = (
+                f"回溯验证：待处理 {target_date.isoformat()} 的预测记录"
+                if is_backfill
+                else "今日非开盘日，持续执行回溯验证"
+            )
+        else:
+            backfill_status = "等待"
+            backfill_detail = "等待当日预测完成后执行回溯验证"
+        _update_task(BACKFILL_TASK_ID, backfill_status, backfill_detail)
+        return evaluation_store, _finalise_tasks()
 
     for entry in results:
         symbol = str(entry.get("symbol") or "").upper()
         if not symbol:
             continue
-        try:
-            resp = requests.get(
-                "https://finnhub.io/api/v1/quote",
-                params={"symbol": symbol, "token": FINNHUB_API_KEY},
-                timeout=10,
-            )
-            data = resp.json() if resp.ok else None
-        except (requests.RequestException, ValueError) as exc:
-            data = None
-            errors.append(f"{symbol}: {exc}")
+        decision_close, next_close, error_text = _fetch_t_plus_one_closes(
+            symbol, target_date
+        )
 
         actual_direction = "数据缺失"
         move_pct: float | None = None
         correct_text = "-"
         actual_up: bool | None = None
+        actual_reference_date = next_trading_day(target_date).isoformat()
 
-        if isinstance(data, dict):
-            current_price = float(data.get("c") or 0.0)
-            prev_close = float(data.get("pc") or 0.0)
-            if prev_close > 0:
-                move_pct = round(((current_price - prev_close) / prev_close) * 100.0, 2)
+        if decision_close is not None and next_close is not None:
+            if decision_close > 0:
+                move_pct = round(
+                    ((next_close - decision_close) / decision_close) * 100.0,
+                    2,
+                )
                 move_samples.append(abs(move_pct))
                 if move_pct > 0:
                     actual_direction = "上涨"
@@ -4287,9 +4677,9 @@ def auto_evaluate_predictions_logic(n_intervals, existing_store):  # noqa: D401
                 if is_correct:
                     correct_count += 1
             else:
-                errors.append(f"{symbol}: 缺少上一交易日收盘价")
+                errors.append(f"{symbol}: 决策日收盘价异常")
         else:
-            errors.append(f"{symbol}: 获取行情失败")
+            errors.append(f"{symbol}: {error_text or '缺少行情数据'}")
 
         item = {
             "symbol": symbol,
@@ -4302,6 +4692,7 @@ def auto_evaluate_predictions_logic(n_intervals, existing_store):  # noqa: D401
             "timeline_label": entry.get("timeline_label"),
             "timeline_key": entry.get("timeline_key"),
             "checked_at": now.isoformat(),
+            "actual_reference_date": actual_reference_date,
         }
         evaluation_items.append(item)
 
@@ -4312,7 +4703,9 @@ def auto_evaluate_predictions_logic(n_intervals, existing_store):  # noqa: D401
                     actual_up=actual_up,
                     actual_move_pct=move_pct,
                     prediction_id=entry.get("rl_prediction_id"),
-                    sector=entry.get("sector") if entry.get("sector") not in (None, "未知") else None,
+                    sector=entry.get("sector")
+                    if entry.get("sector") not in (None, "未知")
+                    else None,
                 )
             except Exception:
                 pass
@@ -4330,6 +4723,8 @@ def auto_evaluate_predictions_logic(n_intervals, existing_store):  # noqa: D401
         "avg_move": avg_move,
         "errors": errors,
     }
+    if is_backfill:
+        summary["backfill"] = True
 
     evaluation_payload = {
         "date": target_date.isoformat(),
@@ -4337,6 +4732,8 @@ def auto_evaluate_predictions_logic(n_intervals, existing_store):  # noqa: D401
         "items": evaluation_items,
         "summary": summary,
     }
+    if is_backfill:
+        evaluation_payload["backfill"] = True
     if errors:
         evaluation_payload["errors"] = errors
 
@@ -4350,10 +4747,69 @@ def auto_evaluate_predictions_logic(n_intervals, existing_store):  # noqa: D401
         "summary": summary,
     }
     if errors:
-        evaluation_store["message"] = "; ".join(errors)
+        evaluation_store["errors"] = errors
 
-    snapshot = RL_MANAGER.snapshot() if RL_MANAGER is not None else None
-    return evaluation_store, snapshot or no_update
+    message_lines: list[str] = []
+    if total:
+        rate_pct = round(success_rate * 100.0, 1)
+        message_lines.append(
+            f"完成 {target_date.strftime('%Y-%m-%d')} 的决策日预测检验，命中 {correct_count}/{total}（{rate_pct}%）。"
+        )
+    else:
+        message_lines.append("昨日未记录可检验的预测。")
+    if errors:
+        message_lines.append("；".join(errors))
+    evaluation_store["message"] = "\n".join(message_lines)
+
+    if is_backfill:
+        note = f"回溯验证：使用 {target_date.isoformat()} 的预测记录"
+        if evaluation_store.get("message"):
+            evaluation_store["message"] = f"{evaluation_store['message']}; {note}"
+        else:
+            evaluation_store["message"] = note
+
+    if total:
+        eval_detail = (
+            f"{target_date.isoformat()}：命中 {correct_count}/{total}"
+            f"（{round(success_rate * 100.0, 1)}%）"
+        )
+        if errors:
+            eval_detail += f"，{len(errors)} 条异常"
+        eval_status = "已完成"
+        adjust_status = "已完成"
+        adjust_detail = "已根据最新检验自动调整模型参数与因子权重"
+    else:
+        eval_detail = f"{target_date.isoformat()}：无预测记录，自动跳过"
+        eval_status = "无数据"
+        adjust_status = "无数据"
+        adjust_detail = "无检验结果，跳过参数调整"
+
+    _update_task(
+        DAILY_T_MINUS_ONE_TASK_ID,
+        eval_status,
+        eval_detail,
+        start_time=now.strftime("%H:%M:%S"),
+        end_time=now.strftime("%H:%M:%S"),
+    )
+    _update_task(
+        DAILY_ADJUST_TASK_ID,
+        adjust_status,
+        adjust_detail,
+    )
+
+    if is_backfill:
+        backfill_status = "进行中"
+        backfill_detail = f"回溯验证：处理 {target_date.isoformat()} 的预测记录"
+    elif not trading_day:
+        backfill_status = "进行中"
+        backfill_detail = "今日非开盘日，持续执行回溯验证"
+    else:
+        backfill_status = "等待"
+        backfill_detail = "等待当日预测完成后执行回溯验证"
+    _update_task(BACKFILL_TASK_ID, backfill_status, backfill_detail)
+
+    return evaluation_store, _finalise_tasks()
+
 
 def sync_actual_into_predictions_logic(evaluation_store, prediction_store):  # noqa: D401
     if not isinstance(evaluation_store, dict):
