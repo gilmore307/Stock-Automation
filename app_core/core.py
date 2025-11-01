@@ -21,6 +21,7 @@ import plotly.graph_objects as go
 from dash import dcc, html, ctx, no_update
 
 from .dci import BASE_FACTOR_WEIGHTS, build_inputs, compute_dci, get_factor_weights
+from .dci.providers import load_dci_payloads
 
 try:
     from .dci.rl import RLAgentManager, get_global_manager
@@ -74,11 +75,6 @@ FRED_API_KEY = os.getenv(
     "FRED_API_KEY",
     "5c9129e297742bb633b85e498edf83fa",
 )
-
-DEFAULT_DCI_DATA_PATH = (
-    Path(__file__).with_name("dci").joinpath("archive", "example.json")
-)
-DCI_DATA_PATH = Path(os.getenv("DCI_DATA_PATH", str(DEFAULT_DCI_DATA_PATH)))
 
 PREDICTION_TIMELINES = [
     {
@@ -1526,14 +1522,7 @@ DEFAULT_PICKER_DATE, MIN_PICKER_DATE, MAX_PICKER_DATE = _date_picker_bounds()
 
 
 def _load_dci_payloads() -> dict[str, dict[str, T.Any]]:
-    try:
-        with DCI_DATA_PATH.open("r", encoding="utf-8") as fh:
-            payload = json.load(fh)
-    except FileNotFoundError:
-        return {}
-    except json.JSONDecodeError:
-        return {}
-
+    payload = load_dci_payloads()
     if not isinstance(payload, dict):
         return {}
 
@@ -1628,7 +1617,7 @@ def _compute_dci_for_symbols(
             continue
         data = payloads.get(symbol)
         if not data:
-            reason = "未找到该标的的 DCI 输入文件"
+            reason = "未找到该标的的 DCI 输入数据"
             if progress_callback:
                 for timeline in timelines:
                     try:
