@@ -59,6 +59,7 @@ def build_layout(config: LayoutConfig) -> html.Div:
                     "rl_snapshot": config.rl_snapshot,
                 },
             ),
+            dcc.Store(id="prediction-run-id-store", storage_type="memory"),
             dcc.Store(id="rl-agent-store", storage_type="memory", data=config.rl_snapshot),
             dcc.Store(
                 id="rl-parameter-history",
@@ -67,6 +68,7 @@ def build_layout(config: LayoutConfig) -> html.Div:
             ),
             dcc.Store(id="evaluation-store", storage_type="memory", data={}),
             dcc.Interval(id="log-poller", interval=1000, disabled=True),
+            dcc.Interval(id="prediction-poller", interval=1000, disabled=True),
             dcc.Interval(id="connection-poller", interval=60000, n_intervals=0),
             dcc.Interval(id="auto-run-trigger", interval=1500, n_intervals=0, max_intervals=1),
             dcc.Interval(id="post-open-eval", interval=300000, n_intervals=0),
