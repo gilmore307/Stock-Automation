@@ -21,6 +21,7 @@ import plotly.graph_objects as go
 from dash import dcc, html, ctx, no_update
 
 from .dci import BASE_FACTOR_WEIGHTS, build_inputs, compute_dci, get_factor_weights
+from .dci.providers import load_dci_payloads
 
 try:
     from .dci.rl import RLAgentManager, get_global_manager
@@ -74,11 +75,6 @@ FRED_API_KEY = os.getenv(
     "FRED_API_KEY",
     "5c9129e297742bb633b85e498edf83fa",
 )
-
-DEFAULT_DCI_DATA_PATH = (
-    Path(__file__).with_name("dci").joinpath("archive", "example.json")
-)
-DCI_DATA_PATH = Path(os.getenv("DCI_DATA_PATH", str(DEFAULT_DCI_DATA_PATH)))
 
 PREDICTION_TIMELINES = [
     {
@@ -153,6 +149,10 @@ PREDICTION_TIMELINES = [
         "aliases": ["decision_day", "day0", "decision", "today", "0", "final"],
     },
 ]
+
+DCI_AUTO_BASELINE_ENABLED = (
+    str(os.getenv("DCI_AUTO_BASELINE", "1")).strip().lower() not in {"0", "false", "no"}
+)
 
 EARNINGS_CACHE_PATH = CACHE_ROOT / "earnings.json"
 EARNINGS_ARCHIVE_DIR = ARCHIVE_ROOT / "earnings"
@@ -1526,14 +1526,7 @@ DEFAULT_PICKER_DATE, MIN_PICKER_DATE, MAX_PICKER_DATE = _date_picker_bounds()
 
 
 def _load_dci_payloads() -> dict[str, dict[str, T.Any]]:
-    try:
-        with DCI_DATA_PATH.open("r", encoding="utf-8") as fh:
-            payload = json.load(fh)
-    except FileNotFoundError:
-        return {}
-    except json.JSONDecodeError:
-        return {}
-
+    payload = load_dci_payloads()
     if not isinstance(payload, dict):
         return {}
 
@@ -1575,14 +1568,52 @@ def _extract_timeline_payload(
     return None, ""
 
 
+def _build_baseline_dci_snapshot() -> dict[str, T.Any]:
+    """返回一个使用内置中性参数的 DCI 输入快照。"""
+
+    factors = {name: {"z": 0.0} for name in get_factor_weights().keys()}
+    return {
+        "factors": factors,
+        "z_cons": 0.0,
+        "z_narr": 0.0,
+        "CI": 0.0,
+        "Q": 0.0,
+        "D": 0.0,
+        "EM_pct": 5.0,
+        "S_stab": 1.0,
+        "shock_flag": 0,
+        "__source__": "baseline",
+    }
+
+
+def _build_baseline_symbol_payload(
+    timelines: list[dict[str, T.Any]] | None,
+) -> dict[str, T.Any]:
+    """构造包含所有时点默认快照的标的输入。"""
+
+    base_snapshot = _build_baseline_dci_snapshot()
+    payload: dict[str, T.Any] = dict(base_snapshot)
+    snapshots: dict[str, dict[str, T.Any]] = {}
+    if timelines:
+        for cfg in timelines:
+            key = str(cfg.get("key") or "").strip()
+            if not key:
+                continue
+            snapshots[key] = _build_baseline_dci_snapshot()
+    payload["snapshots"] = snapshots
+    payload["__source__"] = "baseline"
+    return payload
+
+
 def _summarise_dci_payloads(
     symbols: list[str],
     payloads: dict[str, dict[str, T.Any]] | None,
-) -> tuple[list[str], list[str]]:
-    """根据已载入的 DCI 输入区分可用与缺失的标的。"""
+) -> tuple[list[str], list[str], list[str]]:
+    """根据已载入的 DCI 输入区分可用、缺失及回退的标的。"""
 
     available: list[str] = []
     missing: list[str] = []
+    fallback: list[str] = []
 
     if not isinstance(payloads, dict):
         payloads = {}
@@ -1593,10 +1624,12 @@ def _summarise_dci_payloads(
             continue
         if isinstance(payloads.get(symbol), dict):
             available.append(symbol)
+        elif DCI_AUTO_BASELINE_ENABLED:
+            fallback.append(symbol)
         else:
             missing.append(symbol)
 
-    return available, missing
+    return available, missing, fallback
 
 
 def _compute_dci_for_symbols(
@@ -1627,21 +1660,18 @@ def _compute_dci_for_symbols(
         if not symbol:
             continue
         data = payloads.get(symbol)
+        symbol_uses_baseline = False
+        if not data and DCI_AUTO_BASELINE_ENABLED:
+            data = _build_baseline_symbol_payload(timelines)
+            symbol_uses_baseline = True
         if not data:
-            reason = "未找到该标的的 DCI 输入文件"
             if progress_callback:
                 for timeline in timelines:
                     try:
-                        progress_callback(
-                            symbol,
-                            timeline,
-                            "missing",
-                            reason,
-                        )
+                        progress_callback(symbol, timeline, "missing", None)
                     except Exception:  # pragma: no cover - logging best effort
                         pass
             missing.append(symbol)
-            missing_detail_map[symbol] = reason
             continue
 
         meta_entry = metadata_map.get(symbol) if isinstance(metadata_map, dict) else None
@@ -1660,6 +1690,11 @@ def _compute_dci_for_symbols(
                     pass
 
             payload, alias = _extract_timeline_payload(data, timeline)
+            timeline_uses_baseline = symbol_uses_baseline
+            if not payload and DCI_AUTO_BASELINE_ENABLED:
+                payload = _build_baseline_dci_snapshot()
+                alias = str(timeline.get("key") or alias)
+                timeline_uses_baseline = True
             if not payload:
                 label = str(timeline.get("label") or timeline.get("key") or "未知时点")
                 aliases = [str(timeline.get("key") or "")] + [
@@ -1780,6 +1815,9 @@ def _compute_dci_for_symbols(
                         "rl_p_up_pct": rl_p_up_pct,
                         "rl_delta_pct": rl_delta_pct,
                         "rl_prediction_id": rl_prediction_id,
+                        "input_source": "baseline"
+                        if timeline_uses_baseline
+                        else "dataset",
                         "selection_value": selection_value,
                         "shrink_factors": shrink_map,
                         "scaled_factors": scaled_map,
@@ -3413,8 +3451,11 @@ def _prediction_thread_worker(
             elif stage == "missing":
                 timeline_summary.setdefault(key, {"label": label, "success": 0, "missing": 0, "error": 0})
                 timeline_summary[key]["missing"] = timeline_summary[key].get("missing", 0) + 1
-                detail_note = f"（{detail}）" if detail else ""
-                message = f"{symbol} 的 {label} 输入缺失，跳过该时点{bucket_part}{detail_note}。"
+                if detail:
+                    detail_note = f"（{detail}）"
+                    message = f"{symbol} 的 {label} 输入缺失，跳过该时点{bucket_part}{detail_note}。"
+                else:
+                    message = None
             elif stage == "error":
                 timeline_summary.setdefault(key, {"label": label, "success": 0, "missing": 0, "error": 0})
                 timeline_summary[key]["error"] = timeline_summary[key].get("error", 0) + 1
@@ -3745,7 +3786,11 @@ def _prediction_thread_worker(
             metadata_map = timeline_metadata_map.get(timeline_key, {})
             symbols = list(metadata_map.keys())
             dci_payloads = _load_dci_payloads()
-            available_symbols, missing_symbols = _summarise_dci_payloads(
+            (
+                available_symbols,
+                missing_symbols,
+                fallback_symbols,
+            ) = _summarise_dci_payloads(
                 symbols,
                 dci_payloads,
             )
@@ -3757,11 +3802,17 @@ def _prediction_thread_worker(
                 summary_parts.append(
                     f"命中 {len(available_symbols)} 个标的（{sample}{more}）"
                 )
+            if fallback_symbols:
+                sample = "，".join(fallback_symbols[:6])
+                more = "……" if len(fallback_symbols) > 6 else ""
+                summary_parts.append(
+                    f"对 {len(fallback_symbols)} 个标的使用内置基准因子（{sample}{more}）"
+                )
             if missing_symbols:
                 sample = "，".join(missing_symbols[:6])
                 more = "……" if len(missing_symbols) > 6 else ""
                 summary_parts.append(
-                    f"缺少 {len(missing_symbols)} 个标的的 DCI 输入（{sample}{more}）"
+                    f"数据源未覆盖 {len(missing_symbols)} 个标的（{sample}{more}）"
                 )
 
             if summary_parts:
@@ -3801,7 +3852,9 @@ def _prediction_thread_worker(
                 for miss_key, miss_reason in partial_missing_detail.items():
                     if not miss_key:
                         continue
-                    reason_text = str(miss_reason or "原因未明")
+                    if not miss_reason:
+                        continue
+                    reason_text = str(miss_reason)
                     key_text = str(miss_key)
                     missing_reason_lookup[key_text] = reason_text
                     grouped_missing_detail.setdefault(reason_text, []).append(key_text)
@@ -3920,7 +3973,9 @@ def _prediction_thread_worker(
             lines.append(f"缺少数据的条目：{preview_missing}")
             grouped_missing: dict[str, list[str]] = {}
             for miss_key in missing:
-                reason_text = missing_reason_lookup.get(miss_key) or "原因未明"
+                reason_text = missing_reason_lookup.get(miss_key)
+                if not reason_text:
+                    continue
                 grouped_missing.setdefault(reason_text, []).append(miss_key)
             for reason_text, miss_entries in grouped_missing.items():
                 sample_text = "；".join(miss_entries[:5])
