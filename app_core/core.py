@@ -150,6 +150,10 @@ PREDICTION_TIMELINES = [
     },
 ]
 
+DCI_AUTO_BASELINE_ENABLED = (
+    str(os.getenv("DCI_AUTO_BASELINE", "1")).strip().lower() not in {"0", "false", "no"}
+)
+
 EARNINGS_CACHE_PATH = CACHE_ROOT / "earnings.json"
 EARNINGS_ARCHIVE_DIR = ARCHIVE_ROOT / "earnings"
 CACHE_LOCK = threading.Lock()
@@ -1564,14 +1568,52 @@ def _extract_timeline_payload(
     return None, ""
 
 
+def _build_baseline_dci_snapshot() -> dict[str, T.Any]:
+    """返回一个使用内置中性参数的 DCI 输入快照。"""
+
+    factors = {name: {"z": 0.0} for name in get_factor_weights().keys()}
+    return {
+        "factors": factors,
+        "z_cons": 0.0,
+        "z_narr": 0.0,
+        "CI": 0.0,
+        "Q": 0.0,
+        "D": 0.0,
+        "EM_pct": 5.0,
+        "S_stab": 1.0,
+        "shock_flag": 0,
+        "__source__": "baseline",
+    }
+
+
+def _build_baseline_symbol_payload(
+    timelines: list[dict[str, T.Any]] | None,
+) -> dict[str, T.Any]:
+    """构造包含所有时点默认快照的标的输入。"""
+
+    base_snapshot = _build_baseline_dci_snapshot()
+    payload: dict[str, T.Any] = dict(base_snapshot)
+    snapshots: dict[str, dict[str, T.Any]] = {}
+    if timelines:
+        for cfg in timelines:
+            key = str(cfg.get("key") or "").strip()
+            if not key:
+                continue
+            snapshots[key] = _build_baseline_dci_snapshot()
+    payload["snapshots"] = snapshots
+    payload["__source__"] = "baseline"
+    return payload
+
+
 def _summarise_dci_payloads(
     symbols: list[str],
     payloads: dict[str, dict[str, T.Any]] | None,
-) -> tuple[list[str], list[str]]:
-    """根据已载入的 DCI 输入区分可用与缺失的标的。"""
+) -> tuple[list[str], list[str], list[str]]:
+    """根据已载入的 DCI 输入区分可用、缺失及回退的标的。"""
 
     available: list[str] = []
     missing: list[str] = []
+    fallback: list[str] = []
 
     if not isinstance(payloads, dict):
         payloads = {}
@@ -1582,10 +1624,12 @@ def _summarise_dci_payloads(
             continue
         if isinstance(payloads.get(symbol), dict):
             available.append(symbol)
+        elif DCI_AUTO_BASELINE_ENABLED:
+            fallback.append(symbol)
         else:
             missing.append(symbol)
 
-    return available, missing
+    return available, missing, fallback
 
 
 def _compute_dci_for_symbols(
@@ -1616,6 +1660,10 @@ def _compute_dci_for_symbols(
         if not symbol:
             continue
         data = payloads.get(symbol)
+        symbol_uses_baseline = False
+        if not data and DCI_AUTO_BASELINE_ENABLED:
+            data = _build_baseline_symbol_payload(timelines)
+            symbol_uses_baseline = True
         if not data:
             if progress_callback:
                 for timeline in timelines:
@@ -1642,6 +1690,11 @@ def _compute_dci_for_symbols(
                     pass
 
             payload, alias = _extract_timeline_payload(data, timeline)
+            timeline_uses_baseline = symbol_uses_baseline
+            if not payload and DCI_AUTO_BASELINE_ENABLED:
+                payload = _build_baseline_dci_snapshot()
+                alias = str(timeline.get("key") or alias)
+                timeline_uses_baseline = True
             if not payload:
                 label = str(timeline.get("label") or timeline.get("key") or "未知时点")
                 aliases = [str(timeline.get("key") or "")] + [
@@ -1762,6 +1815,9 @@ def _compute_dci_for_symbols(
                         "rl_p_up_pct": rl_p_up_pct,
                         "rl_delta_pct": rl_delta_pct,
                         "rl_prediction_id": rl_prediction_id,
+                        "input_source": "baseline"
+                        if timeline_uses_baseline
+                        else "dataset",
                         "selection_value": selection_value,
                         "shrink_factors": shrink_map,
                         "scaled_factors": scaled_map,
@@ -3730,7 +3786,11 @@ def _prediction_thread_worker(
             metadata_map = timeline_metadata_map.get(timeline_key, {})
             symbols = list(metadata_map.keys())
             dci_payloads = _load_dci_payloads()
-            available_symbols, missing_symbols = _summarise_dci_payloads(
+            (
+                available_symbols,
+                missing_symbols,
+                fallback_symbols,
+            ) = _summarise_dci_payloads(
                 symbols,
                 dci_payloads,
             )
@@ -3741,6 +3801,12 @@ def _prediction_thread_worker(
                 more = "……" if len(available_symbols) > 6 else ""
                 summary_parts.append(
                     f"命中 {len(available_symbols)} 个标的（{sample}{more}）"
+                )
+            if fallback_symbols:
+                sample = "，".join(fallback_symbols[:6])
+                more = "……" if len(fallback_symbols) > 6 else ""
+                summary_parts.append(
+                    f"对 {len(fallback_symbols)} 个标的使用内置基准因子（{sample}{more}）"
                 )
             if missing_symbols:
                 sample = "，".join(missing_symbols[:6])
