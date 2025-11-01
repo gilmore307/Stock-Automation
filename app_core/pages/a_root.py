@@ -16,6 +16,7 @@ from .e_tasks import build_layout as build_tasks_tab
 from .f_predictions import build_layout as build_predictions_tab
 from .g_validation import build_layout as build_validation_tab
 from .h_reinforcement import build_layout as build_reinforcement_tab
+from .login import build_login_panel
 
 
 @dataclass(slots=True)
@@ -67,53 +68,75 @@ def build_layout(config: LayoutConfig) -> html.Div:
             ),
             dcc.Store(id="evaluation-store", storage_type="memory", data={}),
             dcc.Interval(id="prediction-poller", interval=1000, disabled=True),
-            dcc.Interval(id="connection-poller", interval=60000, n_intervals=0),
-            dcc.Interval(id="auto-run-trigger", interval=1500, n_intervals=0, max_intervals=1),
+            dcc.Interval(
+                id="connection-poller", interval=60000, n_intervals=0, disabled=True
+            ),
+            dcc.Interval(
+                id="auto-run-trigger",
+                interval=1500,
+                n_intervals=0,
+                max_intervals=1,
+                disabled=True,
+            ),
             dcc.Interval(id="post-open-eval", interval=300000, n_intervals=0),
-            dbc.Navbar(
-                dbc.Container(
-                    [
-                        dbc.NavbarBrand(config.navbar_title),
-                        dbc.Button(
-                            "查看日志",
-                            id="show-log-btn",
-                            color="primary",
-                            className="ms-auto",
+            html.Div(
+                build_login_panel(config),
+                id="login-shell",
+            ),
+            html.Div(
+                [
+                    dbc.Navbar(
+                        dbc.Container(
+                            [
+                                dbc.NavbarBrand(config.navbar_title),
+                                dbc.Button(
+                                    "查看日志",
+                                    id="show-log-btn",
+                                    color="primary",
+                                    className="ms-auto",
+                                ),
+                            ],
+                            fluid=True,
                         ),
-                    ],
-                    fluid=True,
-                ),
-                color="dark",
-                dark=True,
-                className="mb-3",
-            ),
-            *heading_children,
-            dcc.Tabs(
-                [
-                    dcc.Tab(label="数据连接", children=[build_connections_tab(config)]),
-                    dcc.Tab(label="预测概览", children=[build_overview_tab(config)]),
-                    dcc.Tab(label="财报日程", children=[build_earnings_tab(config)]),
-                    dcc.Tab(label="任务中心", children=[build_tasks_tab(config)]),
-                    dcc.Tab(label="预测明细", children=[build_predictions_tab(config)]),
-                    dcc.Tab(label="验证回顾", children=[build_validation_tab(config)]),
-                    dcc.Tab(label="强化模型", children=[build_reinforcement_tab(config)]),
-                ]
-            ),
-            dbc.Modal(
-                [
-                    dbc.ModalHeader(dbc.ModalTitle("执行日志")),
-                    dbc.ModalBody(
-                        html.Pre(
-                            id="log-output",
-                            style={"maxHeight": "60vh", "overflowY": "auto"},
-                        )
+                        color="dark",
+                        dark=True,
+                        className="mb-3",
                     ),
-                    dbc.ModalFooter(dbc.Button("关闭", id="close-log-btn", color="secondary")),
+                    *heading_children,
+                    dcc.Tabs(
+                        [
+                            dcc.Tab(
+                                label="数据连接", children=[build_connections_tab(config)]
+                            ),
+                            dcc.Tab(label="预测概览", children=[build_overview_tab(config)]),
+                            dcc.Tab(label="财报日程", children=[build_earnings_tab(config)]),
+                            dcc.Tab(label="任务中心", children=[build_tasks_tab(config)]),
+                            dcc.Tab(label="预测明细", children=[build_predictions_tab(config)]),
+                            dcc.Tab(label="验证回顾", children=[build_validation_tab(config)]),
+                            dcc.Tab(label="强化模型", children=[build_reinforcement_tab(config)]),
+                        ]
+                    ),
+                    dbc.Modal(
+                        [
+                            dbc.ModalHeader(dbc.ModalTitle("执行日志")),
+                            dbc.ModalBody(
+                                html.Pre(
+                                    id="log-output",
+                                    style={"maxHeight": "60vh", "overflowY": "auto"},
+                                )
+                            ),
+                            dbc.ModalFooter(
+                                dbc.Button("关闭", id="close-log-btn", color="secondary")
+                            ),
+                        ],
+                        id="log-modal",
+                        is_open=False,
+                        size="lg",
+                        scrollable=True,
+                    ),
                 ],
-                id="log-modal",
-                is_open=False,
-                size="lg",
-                scrollable=True,
+                id="app-shell",
+                style={"display": "none"},
             ),
         ]
     )
@@ -121,6 +144,31 @@ def build_layout(config: LayoutConfig) -> html.Div:
 
 def register_callbacks(app: Dash) -> None:
     """Bind global log viewers and modal toggles."""
+
+    @app.callback(
+        Output("login-shell", "style"),
+        Output("app-shell", "style"),
+        Output("auto-run-trigger", "disabled"),
+        Output("prediction-poller", "disabled"),
+        Output("connection-poller", "disabled"),
+        Input("ft-session-store", "data"),
+    )
+    def _toggle_gate(session_state):
+        logged_in = bool(session_state and isinstance(session_state, dict) and session_state.get("sid"))
+        if logged_in:
+            login_style = {"display": "none"}
+            app_style = {}
+        else:
+            login_style = {"padding": "40px 0"}
+            app_style = {"display": "none"}
+        disable_intervals = not logged_in
+        return (
+            login_style,
+            app_style,
+            disable_intervals,
+            disable_intervals,
+            disable_intervals,
+        )
 
     @app.callback(
         Output("log-output", "children"),
