@@ -76,7 +76,9 @@ FRED_API_KEY = os.getenv(
     "5c9129e297742bb633b85e498edf83fa",
 )
 
-DEFAULT_DCI_DATA_PATH = Path(__file__).with_name("dci").joinpath("inputs.json")
+DEFAULT_DCI_DATA_PATH = (
+    Path(__file__).with_name("dci").joinpath("archive", "example.json")
+)
 DCI_DATA_PATH = Path(os.getenv("DCI_DATA_PATH", str(DEFAULT_DCI_DATA_PATH)))
 
 PREDICTION_TIMELINES = [
