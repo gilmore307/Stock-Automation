@@ -17,6 +17,10 @@ def build_layout(config: "LayoutConfig") -> html.Div:  # noqa: D401
     del config
     return html.Div(
         [
+            html.Div(
+                id="prediction-status",
+                style={"display": "none"},
+            ),
             dag.AgGrid(
                 id="prediction-table",
                 columnDefs=[
@@ -82,6 +86,8 @@ def register_callbacks(app: Dash) -> None:
         Output("rl-agent-store", "data"),
         Output("task-store", "data", allow_duplicate=True),
         Output("log-store", "data", allow_duplicate=True),
+        Output("prediction-run-id-store", "data"),
+        Output("prediction-poller", "disabled", allow_duplicate=True),
         Input("table", "selectedRows"),
         Input("table", "rowData"),
         Input("ft-session-store", "data"),
@@ -91,9 +97,21 @@ def register_callbacks(app: Dash) -> None:
         State("ft-username", "value"),
         State("ft-password", "value"),
         State("ft-2fa", "value"),
+        State("prediction-run-id-store", "data"),
         prevent_initial_call="initial_duplicate",
     )
-    def update_predictions(selected_rows, row_data, session_state, task_state, picker_date, log_state, username, password, twofa):  # noqa: D401
+    def update_predictions(
+        selected_rows,
+        row_data,
+        session_state,
+        task_state,
+        picker_date,
+        log_state,
+        username,
+        password,
+        twofa,
+        existing_run_id,
+    ):  # noqa: D401
         return core.update_predictions_logic(
             selected_rows,
             row_data,
@@ -104,6 +122,7 @@ def register_callbacks(app: Dash) -> None:
             username,
             password,
             twofa,
+            existing_run_id,
         )
 
     @app.callback(
@@ -112,6 +131,42 @@ def register_callbacks(app: Dash) -> None:
     )
     def render_prediction_table(store_data):  # noqa: D401
         return core.render_prediction_table_logic(store_data)
+
+    @app.callback(
+        Output("prediction-store", "data", allow_duplicate=True),
+        Output("prediction-status", "children", allow_duplicate=True),
+        Output("rl-agent-store", "data", allow_duplicate=True),
+        Output("task-store", "data", allow_duplicate=True),
+        Output("log-store", "data", allow_duplicate=True),
+        Output("prediction-poller", "disabled", allow_duplicate=True),
+        Output("prediction-run-id-store", "data", allow_duplicate=True),
+        Input("prediction-poller", "n_intervals"),
+        State("prediction-run-id-store", "data"),
+        State("prediction-store", "data"),
+        State("prediction-status", "children"),
+        State("rl-agent-store", "data"),
+        State("task-store", "data"),
+        State("log-store", "data"),
+        prevent_initial_call=True,
+    )
+    def poll_prediction_run(
+        n_intervals,
+        run_id,
+        existing_store,
+        existing_status,
+        existing_snapshot,
+        existing_task_state,
+        existing_logs,
+    ):  # noqa: D401
+        return core.poll_prediction_run_logic(
+            n_intervals,
+            run_id,
+            existing_store,
+            existing_status,
+            existing_snapshot,
+            existing_task_state,
+            existing_logs,
+        )
 
     @app.callback(
         Output("evaluation-store", "data"),
