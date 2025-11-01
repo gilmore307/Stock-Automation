@@ -19,7 +19,7 @@ def build_layout(config: "LayoutConfig") -> html.Div:  # noqa: D401
         [
             html.Div(
                 id="prediction-status",
-                style={"margin": "8px 0", "whiteSpace": "pre-wrap"},
+                style={"display": "none"},
             ),
             dag.AgGrid(
                 id="prediction-table",
