@@ -2090,15 +2090,18 @@ def start_run_logic(auto_intervals, selected_date, refresh_clicks, session_data,
     else:
         return no_update, no_update, no_update, no_update, no_update, no_update
 
-    if login_trigger and not logged_in:
-        message = "检测到无效的 Firstrade 会话，请重新登录。"
-        logs = append_log([], message, task_label="财报日程")
-        return no_update, logs, message, [], True, no_update
+    if not logged_in:
+        if login_trigger:
+            message = "检测到无效的 Firstrade 会话，请重新登录。"
+            logs = append_log([], message, task_label="财报日程")
+            return no_update, logs, message, [], True, no_update
 
-    if not logged_in and not login_trigger:
-        message = "尚未登录 Firstrade，请先在连接页登录后再刷新财报列表。"
-        logs = append_log([], message, task_label="财报日程")
-        return no_update, logs, message, [], True, no_update
+        if manual_refresh or trigger == "earnings-date-picker":
+            message = "尚未登录 Firstrade，请先在连接页登录后再刷新财报列表。"
+            logs = append_log([], message, task_label="财报日程")
+            return no_update, logs, message, [], True, no_update
+
+        return no_update, no_update, no_update, no_update, no_update, no_update
 
     target_date = _coerce_date(selected_date) or us_eastern_today()
     today_limit = us_eastern_today()
@@ -2357,16 +2360,19 @@ def update_predictions_logic(
         log_entries = append_log(log_entries, message, task_label=task_label)
 
     if not logged_in:
-        message = "尚未登录 Firstrade，无法执行预测任务。"
-        _emit(message, task_label="预测任务")
-        log_output = log_entries if log_entries != initial_logs else no_update
-        return (
-            no_update,
-            message,
-            initial_snapshot,
-            no_update,
-            log_output,
-        )
+        if triggered == "ft-session-store":
+            message = "检测到无效的 Firstrade 会话，请重新登录后再运行预测任务。"
+            log_entries = append_log(log_entries, message, task_label="预测任务")
+            log_output = log_entries if log_entries != initial_logs else no_update
+            return (
+                no_update,
+                message,
+                no_update,
+                no_update,
+                log_output,
+            )
+
+        return no_update, no_update, no_update, no_update, no_update
 
     run_identifier = uuid.uuid4().hex
 
