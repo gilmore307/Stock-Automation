@@ -622,6 +622,8 @@ TASK_TEMPLATES: dict[str, dict[str, T.Any]] = {
     DAILY_T_MINUS_ONE_TASK_ID: {
         "id": DAILY_T_MINUS_ONE_TASK_ID,
         "name": "T-1 实际结果检验",
+        "start_time": "10:00",
+        "preserve_start_time": True,
     },
     DAILY_ADJUST_TASK_ID: {
         "id": DAILY_ADJUST_TASK_ID,
@@ -641,6 +643,13 @@ for _timeline_cfg in PREDICTION_TIMELINES:
     _default_name = f"{_timeline_cfg.get('label', _key)} 预测"
     if _key == "decision_day":
         _default_name = "T+0 预测"
+        TASK_TEMPLATES[_task_id] = {
+            "id": _task_id,
+            "name": _default_name,
+            "start_time": "15:00",
+            "preserve_start_time": True,
+        }
+        continue
     elif _key == "plus1":
         _default_name = "T+1 预测"
     elif _key == "plus3":
@@ -694,6 +703,8 @@ def _normalise_task_entry(entry: dict[str, T.Any]) -> dict[str, T.Any]:
     merged.setdefault("updated_at", dt.datetime.now(US_EASTERN).strftime("%H:%M:%S"))
     merged.setdefault("start_time", base.get("start_time"))
     merged.setdefault("end_time", base.get("end_time"))
+    if base.get("preserve_start_time"):
+        merged.setdefault("preserve_start_time", True)
     return _ensure_task_progress(merged)
 
 
@@ -778,7 +789,8 @@ def _merge_task_updates(
                         detail_text = f"{prefix}：{detail_text}" if detail_text else prefix
                     entry["detail"] = detail_text
                 entry["status"] = "等待"
-                entry.pop("start_time", None)
+                if not entry.get("preserve_start_time"):
+                    entry.pop("start_time", None)
                 if entry.get("end_time") and entry.get("status") != "已完成":
                     entry.pop("end_time", None)
                 entry["updated_at"] = now_ts
@@ -786,10 +798,13 @@ def _merge_task_updates(
                 if status in {"进行中", "等待", "失败", "无数据"}:
                     block_following = True
             entry = _ensure_task_progress(entry)
+            entry.pop("preserve_start_time", None)
             ordered.append(entry)
     for key, value in current_map.items():
         if key not in TASK_ORDER:
-            ordered.append(_ensure_task_progress(value))
+            extra_entry = _ensure_task_progress(value)
+            extra_entry.pop("preserve_start_time", None)
+            ordered.append(extra_entry)
 
     return {"tasks": ordered, "target_date": requested_target}
 
@@ -1910,6 +1925,21 @@ def _check_resource_connections(ft_session: dict[str, T.Any] | None) -> list[dic
     ok, detail = run_with_retry(_check_fred_once)
     add_status("FRED API", "DGS3MO 系列（最新观测值）", ok, detail)
 
+    # TradingView tvDatafeed
+    def _check_tradingview_once() -> tuple[bool, str]:
+        if not tv_data.is_available():
+            return False, "tvDatafeed 未启用（缺少凭据或依赖）"
+        try:
+            client = tv_data.ensure_client()
+        except tv_data.TVDataError as exc:  # pragma: no cover - network/login errors
+            return False, str(exc)
+        if client is None:
+            return False, "未能建立 tvDatafeed 会话"
+        return True, "凭据有效"
+
+    ok, detail = run_with_retry(_check_tradingview_once)
+    add_status("TradingView 数据源", "tvDatafeed 登录", ok, detail)
+
     # Firstrade session status
     if isinstance(ft_session, dict) and ft_session:
         sid = str(ft_session.get("sid", ""))
@@ -1998,112 +2028,6 @@ def _format_factor_value(payload: T.Any) -> str:
         return "—"
 
     return str(payload)
-
-
-def _collect_factor_source_rows() -> tuple[list[dict[str, str]], str | None]:
-    """Return rows describing factor values and their origins."""
-
-    payloads = _load_dci_payloads()
-    factor_names = list(BASE_FACTOR_WEIGHTS.keys())
-
-    if not payloads:
-        rows = [
-            {"factor": name, "value": "—", "source": "未载入数据"}
-            for name in factor_names
-        ]
-        return rows, "未载入任何 DCI 输入数据，显示占位结果。"
-
-    sorted_payloads = sorted(payloads.items(), key=lambda item: str(item[0]))
-    rows: list[dict[str, str]] = []
-    missing: list[str] = []
-
-    for factor_name in factor_names:
-        best_with_source: dict[str, str] | None = None
-        fallback_entry: dict[str, str] | None = None
-
-        for symbol, symbol_payload in sorted_payloads:
-            if not isinstance(symbol_payload, dict):
-                continue
-            factors = symbol_payload.get("factors")
-            if not isinstance(factors, dict):
-                continue
-            factor_payload = factors.get(factor_name)
-            if factor_payload is None:
-                continue
-
-            source = _extract_factor_source(factor_payload, symbol_payload)
-            value_text = _format_factor_value(factor_payload)
-            if symbol:
-                value_text = f"{value_text}｜{symbol}"
-
-            entry = {
-                "factor": factor_name,
-                "value": value_text,
-                "source": source or "—",
-            }
-
-            if source:
-                best_with_source = entry
-                break
-            if fallback_entry is None:
-                fallback_entry = entry
-
-        if best_with_source:
-            rows.append(best_with_source)
-        elif fallback_entry:
-            rows.append(fallback_entry)
-        else:
-            rows.append({"factor": factor_name, "value": "—", "source": "—"})
-            missing.append(factor_name)
-
-    note: str | None = None
-    if missing:
-        missing_text = "，".join(missing)
-        note = f"以下因子未找到数据：{missing_text}"
-
-    return rows, note
-
-
-def _render_factor_preview_table(rows: list[dict[str, str]]) -> html.Div:
-    """Split rows into three columns of tables for compact display."""
-
-    columns: list[list[dict[str, str]]] = [[], [], []]
-    for idx, row in enumerate(rows):
-        columns[idx % 3].append(row)
-
-    column_components: list[dbc.Col] = []
-    for col_rows in columns:
-        if not col_rows:
-            continue
-        table_rows = [
-            html.Tr(
-                [
-                    html.Td(entry.get("factor", "")),
-                    html.Td(entry.get("value", "")),
-                    html.Td(entry.get("source", "")),
-                ]
-            )
-            for entry in col_rows
-        ]
-        table = dbc.Table(
-            [
-                html.Thead(
-                    html.Tr([
-                        html.Th("因子"),
-                        html.Th("数值"),
-                        html.Th("数据源"),
-                    ])
-                ),
-                html.Tbody(table_rows),
-            ],
-            bordered=True,
-            hover=True,
-            size="sm",
-            className="mb-3",
-        )
-        column_components.append(dbc.Col(table, width=12, lg=4))
-
-    return dbc.Row(column_components, className="g-2")
 
 
 def _resolve_payload_source(payload: dict[str, T.Any]) -> str:
@@ -2242,30 +2166,6 @@ def _render_connection_statuses(
         content.append(timestamp_block)
     content.append(table)
 
-    factor_rows, factor_note = _collect_factor_source_rows()
-    if factor_rows:
-        content.append(html.Hr())
-        content.append(
-            html.H5("因子数据提取预览", style={"marginTop": "12px", "fontWeight": "bold"})
-        )
-        if factor_note:
-            content.append(
-                html.Div(
-                    factor_note,
-                    className="text-muted",
-                    style={"marginBottom": "8px"},
-                )
-            )
-        content.append(_render_factor_preview_table(factor_rows))
-    elif factor_note:
-        content.append(html.Hr())
-        content.append(
-            html.Div(
-                factor_note,
-                className="text-muted",
-                style={"marginTop": "12px"},
-            )
-        )
     return html.Div(content)
 
 
@@ -2506,7 +2406,7 @@ def build_prediction_preview(
     if not entry:
         status_message = f"尚未生成任何预测结果。｜生成时间：{timestamp}"
         placeholder = html.Div("暂无预测记录，请先在预测页运行一次预测。", className="text-muted")
-        return status_message, placeholder, placeholder
+        return status_message, placeholder, html.Div()
 
     symbol = str(entry.get("symbol") or "").upper()
     timeline_label = str(entry.get("timeline_label") or entry.get("timeline_key") or "未知时点")
@@ -5047,6 +4947,23 @@ def _evaluate_trade_window(
     return payload, errors
 
 
+def _has_midday_backfill_window(now: dt.datetime) -> bool:
+    """Return True if there's at least a 30-minute gap before T+0 prediction."""
+
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=US_EASTERN)
+
+    window_start = now.replace(hour=10, minute=30, second=0, microsecond=0)
+    if now < window_start:
+        return False
+
+    next_prediction = now.replace(hour=15, minute=0, second=0, microsecond=0)
+    if now >= next_prediction:
+        return False
+
+    return next_prediction - now >= dt.timedelta(minutes=30)
+
+
 def auto_evaluate_predictions_logic(
     n_intervals, existing_store, existing_task_state
 ):  # noqa: D401
@@ -5142,8 +5059,12 @@ def auto_evaluate_predictions_logic(
             "等待检验完成后根据结果调整模型参数与因子权重",
         )
         if trading_day:
-            backfill_status = "等待"
-            backfill_detail = "等待当日预测完成后执行回溯验证"
+            if _has_midday_backfill_window(now):
+                backfill_status = "进行中"
+                backfill_detail = "回溯验证：利用预测间隙执行历史检验"
+            else:
+                backfill_status = "等待"
+                backfill_detail = "等待当日预测完成后执行回溯验证"
         else:
             backfill_status = "进行中"
             backfill_detail = "今日非开盘日，持续执行回溯验证"
@@ -5196,6 +5117,9 @@ def auto_evaluate_predictions_logic(
         elif not trading_day:
             backfill_status = "进行中"
             backfill_detail = "今日非开盘日，持续执行回溯验证"
+        elif _has_midday_backfill_window(now):
+            backfill_status = "进行中"
+            backfill_detail = "回溯验证：利用预测间隙执行历史检验"
         else:
             backfill_status = "等待"
             backfill_detail = "等待当日预测完成后执行回溯验证"
@@ -5229,8 +5153,12 @@ def auto_evaluate_predictions_logic(
             "无检验结果，跳过参数调整",
         )
         if trading_day:
-            backfill_status = "等待"
-            backfill_detail = "等待当日预测完成后执行回溯验证"
+            if _has_midday_backfill_window(now):
+                backfill_status = "进行中"
+                backfill_detail = "回溯验证：利用预测间隙执行历史检验"
+            else:
+                backfill_status = "等待"
+                backfill_detail = "等待当日预测完成后执行回溯验证"
         else:
             backfill_status = "进行中"
             backfill_detail = "今日非开盘日，持续执行回溯验证"
@@ -5635,6 +5563,9 @@ def auto_evaluate_predictions_logic(
     elif not trading_day:
         backfill_status = "进行中"
         backfill_detail = "今日非开盘日，持续执行回溯验证"
+    elif _has_midday_backfill_window(now):
+        backfill_status = "进行中"
+        backfill_detail = "回溯验证：利用预测间隙执行历史检验"
     else:
         backfill_status = "等待"
         backfill_detail = "等待当日预测完成后执行回溯验证"
