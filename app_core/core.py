@@ -8,7 +8,7 @@ import uuid
 import copy
 import math
 import traceback
-from collections import Counter, deque
+from collections import deque
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -2269,278 +2269,420 @@ def _render_connection_statuses(
     return html.Div(content)
 
 
+def _parse_prediction_date(value: T.Any) -> dt.date | None:
+    """Best-effort ISO date parsing for prediction records."""
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        candidate = text[:10]
+        try:
+            return dt.date.fromisoformat(candidate)
+        except ValueError:
+            return None
+    return None
+
+
+def _select_latest_prediction_entry(
+    prediction_store: dict[str, T.Any] | None,
+) -> dict[str, T.Any] | None:
+    """Choose the most recent prediction result based on timeline date."""
+
+    if not isinstance(prediction_store, dict):
+        return None
+
+    raw_results = prediction_store.get("results")
+    if not isinstance(raw_results, list):
+        return None
+
+    candidates: list[tuple[int, dict[str, T.Any]]] = []
+    for idx, item in enumerate(raw_results):
+        if isinstance(item, dict):
+            candidates.append((idx, item))
+
+    if not candidates:
+        return None
+
+    def _key(payload: tuple[int, dict[str, T.Any]]) -> tuple:
+        idx, entry = payload
+        timeline_date = _parse_prediction_date(entry.get("timeline_date"))
+        decision_date = _parse_prediction_date(entry.get("decision_date"))
+        primary_date = timeline_date or decision_date or dt.date.min
+        secondary_date = decision_date or timeline_date or dt.date.min
+        lookback_value = entry.get("timeline_offset_days", entry.get("lookback_days"))
+        try:
+            lookback_int = int(lookback_value)
+        except (TypeError, ValueError):
+            lookback_int = 0
+        # Smaller absolute lookback (更接近决策日) 排在前面。
+        lookback_rank = -abs(lookback_int)
+        return (primary_date, secondary_date, lookback_rank, idx)
+
+    return max(candidates, key=_key)[1]
+
+
+def _resolve_timeline_config(
+    timeline_key: str | None, timeline_alias: str | None
+) -> dict[str, T.Any] | None:
+    """Locate the timeline configuration by key or alias."""
+
+    key_text = (timeline_key or "").strip()
+    alias_text = (timeline_alias or "").strip()
+
+    for cfg in PREDICTION_TIMELINES:
+        cfg_key = str(cfg.get("key") or "").strip()
+        if key_text and key_text == cfg_key:
+            return cfg
+        alias_list = [str(item).strip() for item in (cfg.get("aliases") or []) if item]
+        if alias_text and alias_text in alias_list:
+            return cfg
+
+    if key_text or alias_text:
+        resolved_key = key_text or alias_text
+        resolved_label = alias_text or key_text or resolved_key
+        return {"key": resolved_key, "label": resolved_label, "aliases": []}
+
+    return None
+
+
+def _collect_latest_payload(
+    symbol: str,
+    timeline_key: str | None,
+    timeline_alias: str | None,
+) -> tuple[dict[str, T.Any] | None, dict[str, T.Any] | None, str | None, str | None]:
+    """Return the raw payload for a symbol and timeline along with metadata."""
+
+    payloads = _load_dci_payloads()
+    symbol_payload = payloads.get(symbol.upper()) if isinstance(symbol, str) else None
+
+    if not isinstance(symbol_payload, dict):
+        return None, None, None, None
+
+    cfg = _resolve_timeline_config(timeline_key, timeline_alias)
+    timeline_payload: dict[str, T.Any] | None = None
+    alias_used: str | None = None
+
+    if cfg:
+        timeline_payload, alias_used = _extract_timeline_payload(symbol_payload, cfg)
+        if not isinstance(timeline_payload, dict):
+            timeline_payload = None
+
+    if timeline_payload is None:
+        timeline_payload = symbol_payload
+
+    base_source: str | None = None
+    for bucket in (timeline_payload, symbol_payload):
+        if not isinstance(bucket, dict):
+            continue
+        for key in ("__source__", "source", "provider"):
+            candidate = bucket.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                base_source = candidate.strip()
+                break
+        if base_source:
+            break
+
+    return timeline_payload, symbol_payload, base_source, alias_used
+
+
+def _build_data_source_rows(
+    entry: dict[str, T.Any],
+    timeline_payload: dict[str, T.Any] | None,
+    symbol_payload: dict[str, T.Any] | None,
+    base_source: str | None,
+) -> list[dict[str, str]]:
+    """Assemble rows describing factor inputs and their data sources."""
+
+    factors = {}
+    if isinstance(timeline_payload, dict):
+        raw_factors = timeline_payload.get("factors")
+        if isinstance(raw_factors, dict):
+            factors = raw_factors
+
+    rows: list[dict[str, str]] = []
+    fallback_source = base_source or "—"
+    source_for_missing = (
+        "基线默认"
+        if str(entry.get("input_source") or "").lower() == "baseline"
+        else "缺失"
+    )
+
+    for factor_name in BASE_FACTOR_WEIGHTS:
+        factor_payload = factors.get(factor_name) if isinstance(factors, dict) else None
+        if factor_payload is None:
+            rows.append({
+                "factor": factor_name,
+                "value": "—",
+                "source": source_for_missing,
+            })
+            continue
+
+        source_text = _extract_factor_source(
+            factor_payload,
+            timeline_payload if isinstance(timeline_payload, dict) else {},
+        )
+        if not source_text and isinstance(symbol_payload, dict):
+            source_text = _extract_factor_source(factor_payload, symbol_payload)
+        if not source_text:
+            source_text = fallback_source
+
+        rows.append(
+            {
+                "factor": factor_name,
+                "value": _format_factor_value(factor_payload) or "—",
+                "source": source_text or fallback_source,
+            }
+        )
+
+    extra_keys: list[str] = []
+    if isinstance(timeline_payload, dict):
+        extra_keys = [
+            key
+            for key in timeline_payload.keys()
+            if key not in {"factors", "snapshots"}
+        ]
+
+    if extra_keys and symbol_payload is not None:
+        extra_added = 0
+        for key in sorted(extra_keys):
+            value = timeline_payload.get(key) if isinstance(timeline_payload, dict) else None
+            if isinstance(value, (dict, list)):
+                continue
+            if value in {None, ""}:
+                continue
+            text: str
+            if isinstance(value, (int, float)):
+                text = _format_decimal(value)
+            else:
+                text = str(value)
+                if len(text) > 80:
+                    text = text[:77] + "…"
+            rows.append({
+                "factor": key,
+                "value": text,
+                "source": base_source or "—",
+            })
+            extra_added += 1
+            if extra_added >= 6:
+                break
+
+    return rows
+
+
+def _build_table(rows: list[dict[str, str]], columns: list[tuple[str, str]]) -> T.Any:
+    """Render a small Bootstrap table from row dictionaries."""
+
+    if not rows:
+        return html.Div("暂无相关数据。", className="text-muted small")
+
+    header = html.Thead(html.Tr([html.Th(title) for title, _ in columns]))
+    body_rows: list[html.Tr] = []
+    for row in rows:
+        cells = [html.Td(row.get(key, "—")) for _, key in columns]
+        body_rows.append(html.Tr(cells))
+
+    return dbc.Table(
+        [header, html.Tbody(body_rows)],
+        bordered=True,
+        hover=True,
+        size="sm",
+        className="mb-3",
+    )
+
+
 def build_prediction_preview(
-    task_state: dict[str, T.Any] | None = None,
     prediction_store: dict[str, T.Any] | None = None,
-    agent_data: dict[str, T.Any] | None = None,
     *,
     force_reload: bool = False,
 ) -> tuple[str, T.Any, T.Any]:
-    """Summarise the latest prediction task status and key parameters."""
+    """Render the latest symbol prediction walkthrough for the overview card."""
 
-    del force_reload  # Manual refresh is handled by Dash trigger semantics.
+    del force_reload  # Dash 触发机制已负责刷新，这里无需额外处理。
 
-    tasks: list[dict[str, T.Any]] = []
-    target_date = ""
-    if isinstance(task_state, dict):
-        target_date = str(task_state.get("target_date") or "")
-        raw_tasks = task_state.get("tasks")
-        if isinstance(raw_tasks, list):
-            for entry in raw_tasks:
-                if isinstance(entry, dict):
-                    tasks.append(dict(entry))
-
-    order_map = {task_id: idx for idx, task_id in enumerate(TASK_ORDER)}
-    tasks.sort(
-        key=lambda item: (
-            order_map.get(str(item.get("id") or ""), len(order_map)),
-            str(item.get("start_time") or "9999"),
-            str(item.get("name") or ""),
-        )
-    )
-
-    status_counter: Counter[str] = Counter()
-    last_update = ""
-    for entry in tasks:
-        status_value = str(entry.get("status") or "等待")
-        status_counter[status_value] += 1
-        updated_at = str(entry.get("updated_at") or "")
-        if updated_at and (not last_update or updated_at > last_update):
-            last_update = updated_at
-
-    results: list[dict[str, T.Any]] = []
-    missing_entries: list[str] = []
-    error_entries: list[str] = []
-    if isinstance(prediction_store, dict):
-        raw_results = prediction_store.get("results")
-        if isinstance(raw_results, list):
-            for item in raw_results:
-                if isinstance(item, dict):
-                    results.append(item)
-        raw_missing = prediction_store.get("missing")
-        if isinstance(raw_missing, list):
-            missing_entries = [str(entry) for entry in raw_missing if entry is not None]
-        raw_errors = prediction_store.get("errors")
-        if isinstance(raw_errors, list):
-            error_entries = [str(entry) for entry in raw_errors if entry is not None]
-
-    symbol_set = {
-        str(entry.get("symbol") or "").upper()
-        for entry in results
-        if str(entry.get("symbol") or "")
-    }
-    timeline_set = {
-        str(entry.get("timeline_key") or "")
-        for entry in results
-        if str(entry.get("timeline_key") or "")
-    }
-
+    entry = _select_latest_prediction_entry(prediction_store)
     timestamp = dt.datetime.now(US_EASTERN).strftime("%Y-%m-%d %H:%M:%S %Z")
 
-    status_parts: list[str] = []
-    if target_date:
-        status_parts.append(f"目标预测日：{target_date}")
-    if tasks:
-        summary_order = ["进行中", "已完成", "等待", "失败", "无数据"]
-        summary_text = [
-            f"{label}{status_counter[label]}项"
-            for label in summary_order
-            if status_counter.get(label)
-        ]
-        if summary_text:
-            status_parts.append("步骤概况：" + "，".join(summary_text))
-    if last_update:
-        status_parts.append(f"最近更新：{last_update}")
-    if results:
-        status_parts.append(
-            f"预测结果：{len(results)} 条｜标的 {len(symbol_set) or '0'} 个｜时点 {len(timeline_set) or '0'} 个"
-        )
-    if missing_entries:
-        status_parts.append(f"缺失数据 {len(missing_entries)} 条")
-    if error_entries:
-        status_parts.append(f"异常条目 {len(error_entries)} 条")
-    if status_parts:
-        status_parts.append(f"生成时间：{timestamp}")
-        status_message = " ｜ ".join(status_parts)
-    else:
-        status_message = f"尚未检测到预测任务，请在预测页启动任务。｜生成时间：{timestamp}"
+    if not entry:
+        status_message = f"尚未生成任何预测结果。｜生成时间：{timestamp}"
+        placeholder = html.Div("暂无预测记录，请先在预测页运行一次预测。", className="text-muted")
+        return status_message, placeholder, placeholder
 
-    status_colors = {
-        "已完成": "success",
-        "进行中": "primary",
-        "等待": "secondary",
-        "失败": "danger",
-        "无数据": "warning",
-    }
+    symbol = str(entry.get("symbol") or "").upper()
+    timeline_label = str(entry.get("timeline_label") or entry.get("timeline_key") or "未知时点")
+    timeline_key = str(entry.get("timeline_key") or "")
+    timeline_alias = str(entry.get("timeline_alias") or "")
+    decision_date = str(entry.get("decision_date") or "—")
+    timeline_date = str(entry.get("timeline_date") or "—")
 
-    if not tasks:
-        steps_component = html.Div(
-            "当前没有预测任务，请先在预测页启动任务。",
-            className="text-muted",
-        )
-    else:
-        step_items: list[html.Li] = []
-        for entry in tasks:
-            name = str(entry.get("name") or entry.get("id") or "未命名步骤")
-            status_value = str(entry.get("status") or "等待")
-            detail_text = str(entry.get("detail") or "").strip()
-            progress_text = str(entry.get("symbol_progress") or "").strip()
-            start_time = str(entry.get("start_time") or "").strip()
-            end_time = str(entry.get("end_time") or "").strip()
-            updated_at = str(entry.get("updated_at") or "").strip()
+    direction = str(entry.get("direction") or "—")
+    p_up_pct = entry.get("p_up_pct")
+    dci_base = entry.get("dci_base")
+    dci_pen = entry.get("dci_penalised")
+    dci_final = entry.get("dci_final")
+    certainty = entry.get("certainty")
+    base_score = entry.get("base_score")
+    position_bucket = entry.get("position_bucket")
+    position_weight = entry.get("position_weight")
+    rl_direction = entry.get("rl_direction")
+    rl_p_up_pct = entry.get("rl_p_up_pct")
+    rl_delta_pct = entry.get("rl_delta_pct")
+    input_source = str(entry.get("input_source") or "dataset")
 
-            badge = dbc.Badge(
-                status_value,
-                color=status_colors.get(status_value, "secondary"),
-                className="ms-2",
-            )
-
-            header = html.Div(
-                [
-                    html.Span(name, className="fw-semibold"),
-                    badge,
-                ],
-                className="d-flex justify-content-between align-items-center mb-1",
-            )
-
-            meta_parts: list[str] = []
-            if progress_text and progress_text not in {"", "-"}:
-                meta_parts.append(f"进度：{progress_text}")
-            if start_time:
-                meta_parts.append(f"开始：{start_time}")
-            if end_time:
-                meta_parts.append(f"结束：{end_time}")
-            if updated_at:
-                meta_parts.append(f"更新：{updated_at}")
-
-            details: list[T.Any] = []
-            if detail_text:
-                details.append(html.Div(detail_text, className="small text-muted"))
-            if meta_parts:
-                details.append(
-                    html.Div(" ｜ ".join(meta_parts), className="small text-muted")
-                )
-
-            step_items.append(
-                html.Li(
-                    [header, *details],
-                    className="mb-3",
-                )
-            )
-
-        steps_component = html.Ol(step_items, className="mb-0")
-
-    def _format_param_value(value: T.Any) -> str:
-        if isinstance(value, float):
-            return _format_decimal(value, 4)
-        if isinstance(value, (int,)):
-            return str(value)
-        if isinstance(value, (list, tuple, set)):
-            return "，".join(str(item) for item in value)
+    def _fmt(value: T.Any, digits: int = 2) -> str:
+        if isinstance(value, (int, float)):
+            return _format_decimal(value, digits)
         if value in {None, ""}:
             return "—"
         return str(value)
 
-    def _add_param_row(label: str, value: T.Any, description: str) -> None:
-        display = _format_param_value(value)
-        if display == "—" and value not in {0, 0.0}:
-            return
-        param_rows.append(
-            html.Tr([html.Td(label), html.Td(display), html.Td(description or "")])
-        )
-
-    param_rows: list[html.Tr] = []
-    if target_date:
-        _add_param_row("目标预测日", target_date, "当前预测任务关联的决策日。")
-    if tasks:
-        _add_param_row("记录的任务数", len(tasks), "已跟踪的预测流程步骤数量。")
-        status_desc = {
-            "进行中": "当前正在执行的任务数量。",
-            "已完成": "已结束并成功完成的任务数量。",
-            "等待": "尚未开始的任务数量。",
-            "失败": "执行过程中出现异常的任务数量。",
-            "无数据": "缺少数据而被跳过的任务数量。",
-        }
-        for key, desc in status_desc.items():
-            if status_counter.get(key):
-                _add_param_row(f"{key}任务", status_counter[key], desc)
-        if last_update:
-            _add_param_row("最近更新时间", last_update, "最后一次记录任务状态的时间。")
-    if results:
-        _add_param_row("预测结果数量", len(results), "最新预测任务生成的结果条数。")
-        if symbol_set:
-            _add_param_row("涉及标的数", len(symbol_set), "参与预测的独立标的数量。")
-        if timeline_set:
-            _add_param_row("覆盖时点数", len(timeline_set), "本次任务覆盖的预测时点数量。")
-    if missing_entries:
-        _add_param_row("缺失数据条目", len(missing_entries), "因缺少输入数据而未能生成结果的条目数量。")
-    if error_entries:
-        _add_param_row("异常条目", len(error_entries), "执行过程中出现异常的条目数量。")
-
-    agent_snapshot = agent_data
-    if isinstance(agent_data, dict) and "global" in agent_data and isinstance(agent_data["global"], dict):
-        agent_snapshot = agent_data.get("global")
-
-    rl_descriptions = RL_PARAM_DESCRIPTIONS
-    if isinstance(agent_snapshot, dict):
-        for key, label in [
-            ("learning_rate", "RL 学习率"),
-            ("gamma", "RL 折扣因子"),
-            ("adjustment_scale", "概率调整幅度"),
-            ("bias", "方向偏置"),
-            ("baseline", "RL 基准"),
-            ("update_count", "RL 更新次数"),
-            ("total_predictions", "RL 预测次数"),
-        ]:
-            if key in agent_snapshot:
-                _add_param_row(label, agent_snapshot.get(key), rl_descriptions.get(key, ""))
-
-        pending_counts = agent_data.get("pending_counts") if isinstance(agent_data, dict) else None
-        if not pending_counts and isinstance(agent_snapshot, dict):
-            pending_counts = agent_snapshot.get("pending_counts")
-        if isinstance(pending_counts, dict) and pending_counts:
-            try:
-                pending_total = sum(int(value) for value in pending_counts.values())
-            except (TypeError, ValueError):
-                pending_total = 0
-            preview_items = sorted(
-                ((str(symbol), int(count)) for symbol, count in pending_counts.items()),
-                key=lambda item: (-item[1], item[0]),
-            )
-            preview_text = "；".join(f"{symbol}:{count}" for symbol, count in preview_items[:5])
-            value_text = (
-                f"{pending_total}（{preview_text}）" if preview_text and pending_total else str(pending_total)
-            )
-            _add_param_row("待反馈标的", value_text, "强化学习模块等待实际结果反馈的标的数量。")
-
-        weights = agent_snapshot.get("weights")
-        if isinstance(weights, dict) and weights:
-            top_weights = sorted(
-                ((str(feature), float(weight)) for feature, weight in weights.items()),
-                key=lambda item: abs(item[1]),
-                reverse=True,
-            )
-            preview = "；".join(
-                f"{feature}:{_format_decimal(weight, 4)}" for feature, weight in top_weights[:5]
-            )
-            _add_param_row("权重预览", preview, rl_descriptions.get("weights", "特征权重。"))
-
-    table_component = (
-        dbc.Table(
-            [
-                html.Thead(html.Tr([html.Th("参数"), html.Th("当前值"), html.Th("说明")])),
-                html.Tbody(param_rows),
-            ],
-            bordered=True,
-            hover=True,
-            size="sm",
-            className="mb-0",
-        )
-        if param_rows
-        else html.Div("暂无可用的预测参数信息。", className="text-muted")
+    status_message = (
+        f"标的 {symbol} ｜ 时点 {timeline_label} ｜ 决策日 {decision_date} ｜ "
+        f"方向 {direction} ｜ 上涨概率 {_fmt(p_up_pct)} ｜ 最终 DCI {_fmt(dci_final)} ｜ 生成时间：{timestamp}"
     )
 
-    return status_message, steps_component, table_component
+    timeline_payload, symbol_payload, base_source, alias_used = _collect_latest_payload(
+        symbol, timeline_key, timeline_alias
+    )
+
+    factor_rows = _build_data_source_rows(entry, timeline_payload, symbol_payload, base_source)
+    factor_table = _build_table(
+        factor_rows,
+        [("项目", "factor"), ("原始数据", "value"), ("数据源", "source")],
+    )
+
+    data_section_children: list[T.Any] = [html.H5("数据采集", className="mb-3")]
+    if base_source:
+        data_section_children.append(
+            html.Div(f"主要来源：{base_source}", className="small text-muted mb-2")
+        )
+    if alias_used:
+        data_section_children.append(
+            html.Div(
+                f"命中快照别名：{alias_used}",
+                className="small text-muted mb-2",
+            )
+        )
+    if input_source == "baseline":
+        data_section_children.append(
+            html.Div(
+                "当前标的缺失原始数据，已使用基线默认值。",
+                className="small text-warning mb-2",
+            )
+        )
+    data_section_children.append(factor_table)
+    data_section = html.Div(data_section_children, className="mb-4")
+
+    scaled_map = entry.get("scaled_factors") or {}
+    weight_map = entry.get("factor_weights") or {}
+    scaled_rows: list[dict[str, str]] = []
+    for name in sorted(set(scaled_map.keys()) | set(weight_map.keys())):
+        scaled_rows.append(
+            {
+                "factor": name,
+                "scaled": _format_decimal(scaled_map.get(name), 4),
+                "weight": _format_decimal(weight_map.get(name), 4),
+            }
+        )
+
+    scaled_table = _build_table(
+        scaled_rows,
+        [("因子", "factor"), ("标准化值", "scaled"), ("权重", "weight")],
+    )
+
+    shrink_map = entry.get("shrink_factors") or {}
+    shrink_labels = {
+        "shrink_EG": "一致性收缩",
+        "scale_CI": "拥挤度收缩",
+        "scale_Q": "质量缩放",
+        "disagreement": "分歧约束",
+        "shock": "冲击调整",
+    }
+    shrink_rows = [
+        {
+            "item": shrink_labels.get(key, key),
+            "value": _format_decimal(value, 4),
+        }
+        for key, value in shrink_map.items()
+    ]
+    shrink_table = _build_table(shrink_rows, [("收缩项目", "item"), ("系数", "value")])
+
+    inputs_map = entry.get("inputs") or {}
+    input_labels = {
+        "z_cons": "一致性 z", "z_narr": "叙事 z", "CI": "拥挤度",
+        "Q": "质量分", "D": "分歧度", "EM_pct": "预期波动(%)",
+        "S_stab": "稳定性", "shock_flag": "震荡标记",
+    }
+    input_rows = [
+        {
+            "item": input_labels.get(key, key),
+            "value": _format_decimal(value),
+        }
+        for key, value in inputs_map.items()
+    ]
+    inputs_table = _build_table(input_rows, [("输入项", "item"), ("取值", "value")])
+
+    calc_section = html.Div(
+        [
+            html.H5("因子计算", className="mb-3"),
+            html.Div("特征缩放与权重：", className="small text-muted mb-2"),
+            scaled_table,
+            html.Div("风险约束系数：", className="small text-muted mb-2 mt-3"),
+            shrink_table,
+            html.Div("基础输入指标：", className="small text-muted mb-2 mt-3"),
+            inputs_table,
+        ],
+        className="mb-4",
+    )
+
+    steps_component = html.Div([data_section, calc_section])
+
+    result_rows: list[dict[str, str]] = []
+
+    def _add_result_row(label: str, value: T.Any, description: str) -> None:
+        result_rows.append(
+            {
+                "label": label,
+                "value": _fmt(value),
+                "desc": description,
+            }
+        )
+
+    _add_result_row("标的代码", symbol, "最新计算的预测标的。")
+    _add_result_row("预测时点", timeline_label, f"原始时点键：{timeline_key or '—'}。")
+    _add_result_row("时点对应日期", timeline_date, "预测输入对应的时间截面。")
+    _add_result_row("决策日", decision_date, "预测流程基准的决策日。")
+    _add_result_row("输入来源", input_source, "dataset 表示使用采集数据，baseline 表示使用默认基线。")
+    _add_result_row("基础方向", direction, "DCI 基础方向判定。")
+    _add_result_row("上涨概率(%)", p_up_pct, "DCI 模型输出的上涨概率。")
+    _add_result_row("惩罚前 DCI", dci_base, "原始 DCI 值。")
+    _add_result_row("惩罚后 DCI", dci_pen, "应用约束后的 DCI。")
+    _add_result_row("最终 DCI", dci_final, "用于仓位建议的最终 DCI。")
+    _add_result_row("确定性", certainty, "与最终 DCI 对应的确定性指标。")
+    _add_result_row("基础方向分(S)", base_score, "模型初始方向分值。")
+    _add_result_row("仓位权重", position_weight, "建议的仓位权重比例。")
+    _add_result_row("仓位建议", position_bucket, "离散化后的仓位建议分档。")
+    if rl_direction:
+        _add_result_row("强化学习方向", rl_direction, "RL 调整后的方向判定。")
+    if rl_p_up_pct is not None:
+        _add_result_row("强化学习概率(%)", rl_p_up_pct, "RL 模块输出的最终概率。")
+    if rl_delta_pct is not None:
+        _add_result_row("概率调整(百分点)", rl_delta_pct, "RL 对概率的修正幅度。")
+    if entry.get("actual_direction") is not None:
+        _add_result_row("实际方向", entry.get("actual_direction"), "若已评估则显示真实结果。")
+    if entry.get("prediction_correct") is not None:
+        _add_result_row(
+            "预测是否正确",
+            "是" if entry.get("prediction_correct") else "否",
+            "来自验证流程的结果。",
+        )
+
+    result_table = _build_table(
+        result_rows,
+        [("指标", "label"), ("数值", "value"), ("说明", "desc")],
+    )
+
+    return status_message, steps_component, result_table
 
 
 PREDICTION_RUN_LOCK = threading.Lock()

@@ -29,7 +29,7 @@ def build_layout(config: "LayoutConfig") -> html.Div:  # noqa: D401
                         [
                             html.H4("预测任务概览", className="mb-3"),
                             html.P(
-                                "系统会同步当前预测任务的执行步骤与关键参数数值。",
+                                "展示最近一个标的的完整预测过程，包含数据采集与计算细节。",
                                 className="text-muted",
                             ),
                             dbc.Button(
@@ -69,17 +69,13 @@ def register_callbacks(app: Dash) -> None:
         Output("overview-preview-table", "children"),
         Input("overview-preview-trigger", "n_intervals"),
         Input("overview-preview-run", "n_clicks"),
-        Input("task-store", "data"),
         Input("prediction-store", "data"),
-        Input("rl-agent-store", "data"),
         prevent_initial_call=False,
     )
-    def render_prediction_preview(n_intervals, run_clicks, task_state, prediction_store, agent_data):  # noqa: D401
+    def render_prediction_preview(n_intervals, run_clicks, prediction_store):  # noqa: D401
         del n_intervals, run_clicks
         force_reload = ctx.triggered_id == "overview-preview-run"
         return core.build_prediction_preview(
-            task_state,
             prediction_store,
-            agent_data,
             force_reload=force_reload,
         )
