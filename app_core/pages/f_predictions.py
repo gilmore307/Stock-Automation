@@ -98,7 +98,7 @@ def register_callbacks(app: Dash) -> None:
         State("ft-password", "value"),
         State("ft-2fa", "value"),
         State("prediction-run-id-store", "data"),
-        prevent_initial_call="initial_duplicate",
+        prevent_initial_call=True,
     )
     def update_predictions(
         selected_rows,
