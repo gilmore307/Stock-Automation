@@ -5,6 +5,14 @@ from dataclasses import dataclass
 import math
 from typing import Dict, Iterable, Tuple
 
+from .config import (
+    evaluate_ci_scale,
+    evaluate_penalty,
+    evaluate_quality_scale,
+    get_beta_for_symbol,
+    load_config,
+)
+
 
 ROBUST_EPS = 1e-9
 ROBUST_CLIP = 3.0
@@ -185,33 +193,47 @@ def compute_directional_score(
     return score, scaled
 
 
+def _apply_scale(p_value: float, scale: float) -> float:
+    scale_clamped = max(0.0, min(1.0, scale))
+    return 0.5 + (p_value - 0.5) * scale_clamped
+
+
 def compute_dci(inputs: DCIInputs) -> DCIResult:
     """Compute the Directional Certainty Index as specified."""
 
+    cfg = load_config()
     weights = inputs.factor_weights or get_factor_weights()
     S, scaled = compute_directional_score(inputs.factors, weights)
-    p_raw = _sigmoid(S)
+
+    beta = get_beta_for_symbol(inputs.symbol)
+    p_raw = _sigmoid(beta.beta0 + beta.beta1 * S)
 
     eg = 0.7 * inputs.z_cons + 0.3 * inputs.z_narr
-    shrink_eg = 1.0 / (1.0 + math.exp(0.35 * eg))
-    p1 = 0.5 + (p_raw - 0.5) * shrink_eg
+    shrink_eg = 1.0 / (1.0 + math.exp(cfg.gamma * eg))
+    p_after_eg = _apply_scale(p_raw, shrink_eg)
 
-    ci_eff = min(inputs.crowding_index, 55.0) if inputs.quality_score >= 60.0 else inputs.crowding_index
-    shrink_ci = 1.0 - 0.6 * _sigmoid((ci_eff - 50.0) / 12.0)
-    p2 = 0.5 + (p1 - 0.5) * shrink_ci
+    ci_scale = evaluate_ci_scale(inputs.crowding_index, inputs.quality_score)
+    p_after_ci = _apply_scale(p_after_eg, ci_scale)
 
-    p3 = 0.5 + (p2 - 0.5) * (1.0 - 0.4 * inputs.disagreement)
+    q_scale = evaluate_quality_scale(inputs.quality_score)
+    p_after_quality = _apply_scale(p_after_ci, q_scale)
+
+    disagree_scale = max(0.0, min(1.0, 1.0 - cfg.kappa_d * inputs.disagreement))
+    p_after_disagreement = _apply_scale(p_after_quality, disagree_scale)
 
     if inputs.shock_flag:
-        p4 = 0.5 + (p3 - 0.5) * 0.8
+        shock_scale = cfg.eta_macro
+        p_final = _apply_scale(p_after_disagreement, shock_scale)
     else:
-        p4 = p3
+        shock_scale = 1.0
+        p_final = p_after_disagreement
 
-    p_up = max(0.0, min(1.0, p4))
+    p_up = max(0.0, min(1.0, p_final))
     dci_base = max(p_up, 1.0 - p_up) * 100.0
 
-    penalty = 8.0 * max(0.0, (5.0 - inputs.expected_move_pct) / 5.0)
-    dci_pen = max(0.0, dci_base - penalty)
+    penalty = evaluate_penalty(inputs.expected_move_pct)
+    penalty = min(0.0, penalty)
+    dci_pen = max(0.0, dci_base + penalty)
 
     dci_final = dci_pen * (0.85 + 0.15 * inputs.stability)
 
@@ -232,9 +254,10 @@ def compute_dci(inputs: DCIInputs) -> DCIResult:
 
     shrink_map = {
         "shrink_EG": shrink_eg,
-        "shrink_CI": shrink_ci,
-        "disagreement": 1.0 - 0.4 * inputs.disagreement,
-        "shock": 0.8 if inputs.shock_flag else 1.0,
+        "scale_CI": ci_scale,
+        "scale_Q": q_scale,
+        "disagreement": disagree_scale,
+        "shock": shock_scale,
     }
 
     return DCIResult(
