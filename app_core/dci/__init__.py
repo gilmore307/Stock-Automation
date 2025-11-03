@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from .config import (
     evaluate_ci_scale,
@@ -83,92 +83,299 @@ class DCIResult:
     factor_weights: Dict[str, float]
 
 
-BASE_FACTOR_WEIGHTS: Dict[str, float] = {
-    # A. 预期/基本面动能 0.45
-    "EPS_Rev_30d": 0.20,
-    "Sales_Rev_30d": 0.10,
-    "Guide_Drift": 0.10,
-    "Backlog_Bookings_Delta": 0.05,
-    # B. 经营质量/利润动能 0.25
-    "GM_YoY_Delta": 0.10,
-    "OPM_YoY_Delta": 0.10,
-    "FCF_Margin_Slope": 0.05,
-    # C. 价格/成交动能 0.20
-    "Ret20_rel": 0.10,
-    "Ret60_rel": 0.05,
-    "UDVol20": 0.05,
-    # D. 相对估值 0.10
-    "Value_vs_Sector": 0.07,
-    "EarningsYield_vs_Sector": 0.03,
+@dataclass(frozen=True)
+class FactorDescriptor:
+    """Descriptor tying a factor to its bucket and prior weight."""
+
+    bucket: str
+    prior: float
+
+
+@dataclass(frozen=True)
+class BucketSpec:
+    """Specification for target bucket proportions."""
+
+    code: str
+    label: str
+    target: float
+
+
+FACTOR_BUCKET_SPECS: Dict[str, BucketSpec] = {
+    "A": BucketSpec(code="A", label="预期/基本面动能", target=0.45),
+    "B": BucketSpec(code="B", label="经营质量/利润动能", target=0.25),
+    "C": BucketSpec(code="C", label="价格/成交动能", target=0.20),
+    "D": BucketSpec(code="D", label="相对估值", target=0.10),
 }
+
+
+FACTOR_DESCRIPTORS: Dict[str, FactorDescriptor] = {
+    "EPS_Rev_30d": FactorDescriptor(bucket="A", prior=0.20),
+    "Sales_Rev_30d": FactorDescriptor(bucket="A", prior=0.10),
+    "Guide_Drift": FactorDescriptor(bucket="A", prior=0.10),
+    "Backlog_Bookings_Delta": FactorDescriptor(bucket="A", prior=0.05),
+    "GM_YoY_Delta": FactorDescriptor(bucket="B", prior=0.10),
+    "OPM_YoY_Delta": FactorDescriptor(bucket="B", prior=0.10),
+    "FCF_Margin_Slope": FactorDescriptor(bucket="B", prior=0.05),
+    "Ret20_rel": FactorDescriptor(bucket="C", prior=0.10),
+    "Ret60_rel": FactorDescriptor(bucket="C", prior=0.05),
+    "UDVol20": FactorDescriptor(bucket="C", prior=0.05),
+    "Value_vs_Sector": FactorDescriptor(bucket="D", prior=0.07),
+    "EarningsYield_vs_Sector": FactorDescriptor(bucket="D", prior=0.03),
+}
+
+
+BASE_FACTOR_WEIGHTS: Dict[str, float] = {
+    name: desc.prior for name, desc in FACTOR_DESCRIPTORS.items()
+}
+
+
+FACTOR_BUCKET_FACTORS: Dict[str, List[str]] = {}
+for factor, descriptor in FACTOR_DESCRIPTORS.items():
+    FACTOR_BUCKET_FACTORS.setdefault(descriptor.bucket, []).append(factor)
+
+for bucket_code, spec in FACTOR_BUCKET_SPECS.items():
+    factors = FACTOR_BUCKET_FACTORS.get(bucket_code)
+    if not factors:
+        raise ValueError(f"Bucket {bucket_code} has no factors configured.")
+    bucket_sum = sum(BASE_FACTOR_WEIGHTS[f] for f in factors)
+    if not math.isclose(bucket_sum, spec.target, rel_tol=1e-6, abs_tol=1e-6):
+        raise ValueError(
+            f"Bucket {bucket_code} prior weights sum {bucket_sum:.4f} "
+            f"!= target {spec.target:.4f}"
+        )
+
 
 # Backward compatibility alias for legacy imports in other modules.
 FACTOR_WEIGHTS: Dict[str, float] = BASE_FACTOR_WEIGHTS
 
-_ACTIVE_FACTOR_WEIGHTS: Dict[str, float] = dict(BASE_FACTOR_WEIGHTS)
+
+@dataclass
+class FactorWeightState:
+    weights: Dict[str, float]
+    industry_bias: Dict[str, float]
+    style_bias: Dict[str, float]
+    last_delta: Dict[str, float]
 
 
-def _normalise_weights(weights: Dict[str, float]) -> Dict[str, float]:
-    """Project weights onto the simplex while keeping unknown keys untouched."""
+@dataclass(frozen=True)
+class WeightDriftReport:
+    """Summary emitted after a weight update."""
 
-    filtered: Dict[str, float] = {}
+    weights: Dict[str, float]
+    deltas: Dict[str, float]
+    bucket_totals: Dict[str, float]
+    l1_norm: float
+    l2_norm: float
+    max_drift: float
+    mean_drift: float
+    projected: bool
+    warnings: Tuple[str, ...]
+    industry_bias: Dict[str, float]
+    style_bias: Dict[str, float]
+
+
+FACTOR_WEIGHT_L2_LIMIT = 0.05
+MAX_INTERCEPT_MAGNITUDE = 0.25
+
+
+def _initial_state() -> FactorWeightState:
+    weights = dict(BASE_FACTOR_WEIGHTS)
+    last_delta = {name: 0.0 for name in weights}
+    return FactorWeightState(weights=weights, industry_bias={}, style_bias={}, last_delta=last_delta)
+
+
+_ACTIVE_FACTOR_STATE = _initial_state()
+_LAST_WEIGHT_REPORT: Optional[WeightDriftReport] = None
+
+
+def _project_bucket_weights(candidate: Dict[str, float]) -> Dict[str, float]:
+    """Project arbitrary weights so each bucket sum matches its target."""
+
+    projected: Dict[str, float] = {}
+    for bucket, factors in FACTOR_BUCKET_FACTORS.items():
+        spec = FACTOR_BUCKET_SPECS[bucket]
+        non_negative = {f: max(0.0, float(candidate.get(f, 0.0))) for f in factors}
+        bucket_sum = sum(non_negative.values())
+        if bucket_sum <= 0.0:
+            baseline = {f: BASE_FACTOR_WEIGHTS[f] for f in factors}
+            bucket_sum = sum(baseline.values())
+            non_negative = baseline
+        scale = spec.target / bucket_sum
+        for factor in factors:
+            projected[factor] = non_negative[factor] * scale
+    return projected
+
+
+def _compute_bucket_totals(weights: Dict[str, float]) -> Dict[str, float]:
+    return {
+        bucket: sum(weights[f] for f in factors)
+        for bucket, factors in FACTOR_BUCKET_FACTORS.items()
+    }
+
+
+def _clamp_bias_map(
+    current: Dict[str, float],
+    override: Optional[Dict[str, float]],
+) -> Dict[str, float]:
+    updated = dict(current)
+    if override is None:
+        return updated
+    for key, value in override.items():
+        updated[key] = max(-MAX_INTERCEPT_MAGNITUDE, min(MAX_INTERCEPT_MAGNITUDE, float(value)))
+    keys_to_drop = [key for key, value in updated.items() if abs(value) < 1e-9]
+    for key in keys_to_drop:
+        updated.pop(key)
+    return updated
+
+
+def _build_weight_report(
+    new_weights: Dict[str, float],
+    delta: Dict[str, float],
+    projected: bool,
+    industry_bias: Dict[str, float],
+    style_bias: Dict[str, float],
+) -> WeightDriftReport:
+    l1_norm = sum(abs(v) for v in delta.values())
+    l2_norm = math.sqrt(sum(v * v for v in delta.values()))
+    max_drift = max((abs(v) for v in delta.values()), default=0.0)
+    mean_drift = l1_norm / len(delta) if delta else 0.0
+    bucket_totals = _compute_bucket_totals(new_weights)
+    warnings = []
+    for bucket, spec in FACTOR_BUCKET_SPECS.items():
+        total = bucket_totals[bucket]
+        if not math.isclose(total, spec.target, rel_tol=1e-6, abs_tol=1e-6):
+            warnings.append(
+                f"bucket {bucket} sum {total:.6f} deviates from target {spec.target:.6f}"
+            )
+    if l2_norm > FACTOR_WEIGHT_L2_LIMIT + 1e-9:
+        warnings.append(
+            f"L2 drift {l2_norm:.6f} exceeded limit {FACTOR_WEIGHT_L2_LIMIT:.6f}"
+        )
+    return WeightDriftReport(
+        weights=dict(new_weights),
+        deltas=dict(delta),
+        bucket_totals=bucket_totals,
+        l1_norm=l1_norm,
+        l2_norm=l2_norm,
+        max_drift=max_drift,
+        mean_drift=mean_drift,
+        projected=projected,
+        warnings=tuple(warnings),
+        industry_bias=dict(industry_bias),
+        style_bias=dict(style_bias),
+    )
+
+
+def set_factor_weights(
+    weights: Dict[str, float],
+    *,
+    industry_bias: Optional[Dict[str, float]] = None,
+    style_bias: Optional[Dict[str, float]] = None,
+) -> Dict[str, float]:
+    """Set the active factor weights enforcing bucket/regularisation constraints."""
+
+    global _ACTIVE_FACTOR_STATE, _LAST_WEIGHT_REPORT
+
+    current = _ACTIVE_FACTOR_STATE
+    candidate = dict(current.weights)
     for name in BASE_FACTOR_WEIGHTS:
-        value = float(weights.get(name, 0.0))
-        filtered[name] = max(0.0, value)
+        if name in weights:
+            candidate[name] = float(weights[name])
 
-    total = sum(filtered.values())
-    if total <= 0.0:
-        return dict(BASE_FACTOR_WEIGHTS)
+    projected_weights = _project_bucket_weights(candidate)
+    delta = {
+        name: projected_weights[name] - current.weights[name]
+        for name in BASE_FACTOR_WEIGHTS
+    }
+    l2_norm = math.sqrt(sum(value * value for value in delta.values()))
+    projected = False
+    if l2_norm > FACTOR_WEIGHT_L2_LIMIT:
+        scale = FACTOR_WEIGHT_L2_LIMIT / l2_norm
+        shrunk = {
+            name: current.weights[name] + delta[name] * scale
+            for name in BASE_FACTOR_WEIGHTS
+        }
+        projected_weights = _project_bucket_weights(shrunk)
+        delta = {
+            name: projected_weights[name] - current.weights[name]
+            for name in BASE_FACTOR_WEIGHTS
+        }
+        projected = True
 
-    return {name: filtered[name] / total for name in BASE_FACTOR_WEIGHTS}
+    industry_bias_state = _clamp_bias_map(current.industry_bias, industry_bias)
+    style_bias_state = _clamp_bias_map(current.style_bias, style_bias)
 
+    _ACTIVE_FACTOR_STATE = FactorWeightState(
+        weights=dict(projected_weights),
+        industry_bias=industry_bias_state,
+        style_bias=style_bias_state,
+        last_delta=dict(delta),
+    )
 
-def set_factor_weights(weights: Dict[str, float]) -> Dict[str, float]:
-    """Set the active factor weights and return the normalised copy."""
+    _LAST_WEIGHT_REPORT = _build_weight_report(
+        projected_weights,
+        delta,
+        projected,
+        industry_bias_state,
+        style_bias_state,
+    )
 
-    global _ACTIVE_FACTOR_WEIGHTS
-    normalised = _normalise_weights(weights)
-    _ACTIVE_FACTOR_WEIGHTS = dict(normalised)
-    return dict(_ACTIVE_FACTOR_WEIGHTS)
+    return dict(projected_weights)
 
 
 def get_factor_weights() -> Dict[str, float]:
     """Return a copy of the currently active factor weights."""
 
-    return dict(_ACTIVE_FACTOR_WEIGHTS)
+    return dict(_ACTIVE_FACTOR_STATE.weights)
+
+
+def get_factor_biases() -> Dict[str, Dict[str, float]]:
+    """Return the currently configured industry/style intercepts."""
+
+    return {
+        "industry": dict(_ACTIVE_FACTOR_STATE.industry_bias),
+        "style": dict(_ACTIVE_FACTOR_STATE.style_bias),
+    }
+
+
+def get_last_weight_report() -> Optional[WeightDriftReport]:
+    """Return the most recent weight drift report, if available."""
+
+    return _LAST_WEIGHT_REPORT
 
 
 def adjust_factor_weights(
     deltas: Dict[str, float],
     *,
     learning_rate: float = 1.0,
+    industry_bias_delta: Optional[Dict[str, float]] = None,
+    style_bias_delta: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
-    """Apply incremental updates to factor weights and return the result.
+    """Apply incremental updates to factor weights and return the result."""
 
-    Parameters
-    ----------
-    deltas:
-        Partial map of factor -> delta value to apply.
-    learning_rate:
-        Scaling multiplier for the delta contribution.
-    """
-
-    if not deltas:
+    if not deltas and not industry_bias_delta and not style_bias_delta:
         return get_factor_weights()
 
-    current = get_factor_weights()
-    updated: Dict[str, float] = dict(current)
-    changed = False
-    for name, delta in deltas.items():
-        if name not in updated:
-            continue
-        updated[name] = max(0.0, updated[name] + learning_rate * float(delta))
-        changed = True
+    current_weights = _ACTIVE_FACTOR_STATE.weights
+    candidate = {
+        name: current_weights[name] + learning_rate * float(deltas.get(name, 0.0))
+        for name in BASE_FACTOR_WEIGHTS
+    }
 
-    if not changed:
-        return current
+    industry_bias = dict(_ACTIVE_FACTOR_STATE.industry_bias)
+    style_bias = dict(_ACTIVE_FACTOR_STATE.style_bias)
+    if industry_bias_delta:
+        for key, value in industry_bias_delta.items():
+            industry_bias[key] = industry_bias.get(key, 0.0) + learning_rate * float(value)
+    if style_bias_delta:
+        for key, value in style_bias_delta.items():
+            style_bias[key] = style_bias.get(key, 0.0) + learning_rate * float(value)
 
-    return set_factor_weights(updated)
+    return set_factor_weights(
+        candidate,
+        industry_bias=industry_bias,
+        style_bias=style_bias,
+    )
 
 
 def _sigmoid(x: float) -> float:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import math
 import sys
 import types
 from pathlib import Path
@@ -29,10 +30,19 @@ config_module = _import_module("app_core.dci.config", APP_CORE_PATH / "dci" / "c
 BASE_FACTOR_WEIGHTS = dci_module.BASE_FACTOR_WEIGHTS
 DCIInputs = dci_module.DCIInputs
 FactorInput = dci_module.FactorInput
+FACTOR_BUCKET_FACTORS = dci_module.FACTOR_BUCKET_FACTORS
+FACTOR_BUCKET_SPECS = dci_module.FACTOR_BUCKET_SPECS
+FACTOR_WEIGHT_L2_LIMIT = dci_module.FACTOR_WEIGHT_L2_LIMIT
+MAX_INTERCEPT_MAGNITUDE = dci_module.MAX_INTERCEPT_MAGNITUDE
 compute_dci = dci_module.compute_dci
 evaluate_ci_scale = config_module.evaluate_ci_scale
 evaluate_quality_scale = config_module.evaluate_quality_scale
 evaluate_penalty = config_module.evaluate_penalty
+get_factor_weights = dci_module.get_factor_weights
+set_factor_weights = dci_module.set_factor_weights
+adjust_factor_weights = dci_module.adjust_factor_weights
+get_last_weight_report = dci_module.get_last_weight_report
+get_factor_biases = dci_module.get_factor_biases
 
 
 def _build_base_inputs(**overrides: float) -> DCIInputs:
@@ -120,4 +130,61 @@ def test_shock_shrink_uses_macro_eta():
     normal = compute_dci(_build_base_inputs(shock_flag=0))
     shocked = compute_dci(_build_base_inputs(shock_flag=1))
     assert shocked.dci_final <= normal.dci_final
+
+
+def _reset_factor_state() -> None:
+    biases = get_factor_biases()
+    zero_industry = {key: 0.0 for key in biases["industry"]}
+    zero_style = {key: 0.0 for key in biases["style"]}
+    set_factor_weights(BASE_FACTOR_WEIGHTS, industry_bias=zero_industry, style_bias=zero_style)
+
+
+def test_factor_bucket_totals_locked() -> None:
+    _reset_factor_state()
+    raw_update = {"EPS_Rev_30d": 0.35, "Sales_Rev_30d": 0.05}
+    set_factor_weights(raw_update)
+    weights = get_factor_weights()
+    assert all(value >= 0.0 for value in weights.values())
+
+    for bucket, spec in FACTOR_BUCKET_SPECS.items():
+        total = sum(weights[name] for name in FACTOR_BUCKET_FACTORS[bucket])
+        assert math.isclose(total, spec.target, rel_tol=1e-6, abs_tol=1e-6)
+
+    report = get_last_weight_report()
+    assert report is not None
+    assert report.max_drift >= 0.0
+    assert report.mean_drift >= 0.0
+
+
+def test_weight_adjustment_obeys_norm_limit() -> None:
+    _reset_factor_state()
+    base = get_factor_weights()
+    exaggerated = {name: value + 0.2 for name, value in base.items()}
+    set_factor_weights(exaggerated)
+    report = get_last_weight_report()
+    assert report is not None
+    assert report.l2_norm <= FACTOR_WEIGHT_L2_LIMIT + 1e-9
+
+
+def test_biases_are_clipped_and_persisted() -> None:
+    _reset_factor_state()
+    current = get_factor_weights()
+    set_factor_weights(
+        current,
+        industry_bias={"Tech": 1.0, "Energy": -0.4},
+        style_bias={"Growth": 0.7},
+    )
+    biases = get_factor_biases()
+    assert math.isclose(biases["industry"]["Tech"], MAX_INTERCEPT_MAGNITUDE)
+    assert math.isclose(biases["industry"]["Energy"], -MAX_INTERCEPT_MAGNITUDE)
+    assert math.isclose(biases["style"]["Growth"], MAX_INTERCEPT_MAGNITUDE)
+
+
+def test_adjust_factor_weights_projects_to_bucket_targets() -> None:
+    _reset_factor_state()
+    adjust_factor_weights({"Ret20_rel": 0.02, "Ret60_rel": -0.03})
+    weights = get_factor_weights()
+    total_c = sum(weights[name] for name in FACTOR_BUCKET_FACTORS["C"])
+    assert math.isclose(total_c, FACTOR_BUCKET_SPECS["C"].target, rel_tol=1e-6, abs_tol=1e-6)
+    assert all(value >= 0.0 for value in weights.values())
 
