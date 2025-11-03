@@ -2106,6 +2106,84 @@ def _render_factor_preview_table(rows: list[dict[str, str]]) -> html.Div:
     return dbc.Row(column_components, className="g-2")
 
 
+def _resolve_payload_source(payload: dict[str, T.Any]) -> str:
+    for key in ("source", "__source__", "provider"):
+        candidate = payload.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return ""
+
+
+def _format_preview_value(value: T.Any) -> str:
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    if isinstance(value, (int, float)):
+        return _format_decimal(value)
+    if value in {None, ""}:
+        return "—"
+    return str(value)
+
+
+def _build_preview_rows_for_symbol(
+    symbol: str,
+    payload: dict[str, T.Any],
+) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    source = _resolve_payload_source(payload) or "—"
+
+    meta_fields = [
+        ("symbol", "标的代码"),
+        ("company", "公司"),
+        ("sector", "行业"),
+        ("industry", "子行业"),
+        ("exchange", "交易所"),
+        ("bucket", "时间段"),
+        ("decision_date", "决策日"),
+    ]
+    for key, label in meta_fields:
+        if key == "symbol":
+            rows.append({"factor": label, "value": symbol, "source": source})
+            continue
+        value = payload.get(key)
+        if value in {None, ""}:
+            continue
+        rows.append({"factor": label, "value": _format_preview_value(value), "source": source})
+
+    metric_fields = [
+        ("z_cons", "一致性 z"),
+        ("z_narr", "叙事 z"),
+        ("CI", "拥挤度"),
+        ("Q", "质量分"),
+        ("D", "分歧度"),
+        ("EM_pct", "预期波动(%)"),
+        ("S_stab", "稳定性"),
+        ("shock_flag", "宏观冲击标记"),
+        ("has_weekly", "有周度期权"),
+        ("option_expiry_days", "期权到期日(天)"),
+        ("option_expiry_type", "到期类型"),
+    ]
+
+    for key, label in metric_fields:
+        value = payload.get(key)
+        rows.append({"factor": label, "value": _format_preview_value(value), "source": source})
+
+    factors = payload.get("factors")
+    if isinstance(factors, dict):
+        for factor in BASE_FACTOR_WEIGHTS:
+            factor_payload = factors.get(factor)
+            value_text = _format_factor_value(factor_payload)
+            factor_source = _extract_factor_source(factor_payload, payload) or source
+            rows.append(
+                {
+                    "factor": factor,
+                    "value": value_text,
+                    "source": factor_source,
+                }
+            )
+
+    return rows
+
+
 def _render_connection_statuses(
     statuses: list[dict[str, T.Any]], checked_at: str | None = None
 ) -> T.Union[str, dbc.Table, html.Div]:
@@ -2189,6 +2267,137 @@ def _render_connection_statuses(
             )
         )
     return html.Div(content)
+
+
+def build_prediction_preview(force_reload: bool = False) -> tuple[str, T.Any, T.Any]:
+    """Run a demonstration DCI prediction using the latest payloads."""
+
+    payloads = load_dci_payloads(force_reload=force_reload)
+    timestamp = dt.datetime.now(US_EASTERN).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+    valid_entries = [(symbol, data) for symbol, data in sorted(payloads.items()) if isinstance(data, dict)]
+    if not valid_entries:
+        status = "未能载入任何 DCI 输入数据，请检查消息源配置。"
+        steps = html.Div(
+            "系统没有找到可用于演示的样本，建议先确认数据采集流程是否正常。",
+            className="text-danger",
+        )
+        return status, steps, html.Div()
+
+    symbol, payload = valid_entries[0]
+
+    try:
+        inputs = build_inputs(symbol, payload)
+        result = compute_dci(inputs)
+    except Exception as exc:  # pragma: no cover - diagnostic path
+        error_trace = traceback.format_exc()
+        status = f"测试执行失败：{exc}"
+        steps = html.Pre(error_trace, style={"whiteSpace": "pre-wrap", "fontSize": "0.85rem"})
+        return status, steps, html.Div()
+
+    total_samples = len(valid_entries)
+    company = payload.get("company")
+    label = f"{symbol}"
+    if company:
+        label = f"{symbol}｜{company}"
+    source = _resolve_payload_source(payload) or "未知数据源"
+
+    step_details: list[html.Li] = []
+    step_details.append(
+        html.Li(
+            [
+                html.Strong("样本选择："),
+                f"共解析 {total_samples} 份输入数据，选取 {label}（来源：{source}）。",
+            ]
+        )
+    )
+
+    metric_items = [
+        f"一致性z={_format_decimal(inputs.z_cons)}",
+        f"叙事z={_format_decimal(inputs.z_narr)}",
+        f"拥挤度CI={_format_decimal(inputs.crowding_index)}",
+        f"质量Q={_format_decimal(inputs.quality_score)}",
+        f"分歧度D={_format_decimal(inputs.disagreement)}",
+        f"预期波动={_format_decimal(inputs.expected_move_pct)}%",
+        f"稳定性={_format_decimal(inputs.stability)}",
+        f"宏观冲击标记={'是' if inputs.shock_flag else '否'}",
+    ]
+    step_details.append(
+        html.Li(
+            [
+                html.Strong("关键输入："),
+                html.Ul([html.Li(text) for text in metric_items], className="mb-0"),
+            ]
+        )
+    )
+
+    direction = "看多" if result.direction > 0 else "看空"
+    gating_text = "通过所有风控闸门" if result.gating_passed else "未通过风控闸门"
+    gating_reason = ""
+    if not result.gating_passed and result.gating_reasons:
+        gating_reason = "；".join(result.gating_reasons)
+    base_items = [
+        f"方向分 S={_format_decimal(result.base_score)}（判断为{direction}）",
+        gating_text + (f"（{gating_reason}）" if gating_reason else ""),
+    ]
+    step_details.append(
+        html.Li(
+            [
+                html.Strong("方向得分："),
+                html.Ul([html.Li(text) for text in base_items], className="mb-0"),
+            ]
+        )
+    )
+
+    shrink_labels = {
+        "shrink_EG": "一致性收缩",
+        "scale_CI": "拥挤度收缩",
+        "scale_Q": "质量收缩",
+        "disagreement": "分歧调整",
+        "shock": "宏观冲击",
+    }
+    shrink_items = [
+        f"{label_name}={_format_decimal(result.shrink_factors.get(key, 1.0), 3)}"
+        for key, label_name in shrink_labels.items()
+    ]
+    shrink_items.append(f"最终上涨概率={_format_decimal(result.p_up * 100, 2)}%")
+    step_details.append(
+        html.Li(
+            [
+                html.Strong("概率调整："),
+                html.Ul([html.Li(text) for text in shrink_items], className="mb-0"),
+            ]
+        )
+    )
+
+    penalty = result.dci_penalised - result.dci_base
+    final_items = [
+        f"基础DCI={_format_decimal(result.dci_base)}",
+        f"惩罚后DCI={_format_decimal(result.dci_penalised)}（惩罚{_format_decimal(penalty)}）",
+        f"最终DCI={_format_decimal(result.dci_final)}",
+        f"仓位建议={result.position_bucket}，权重={_format_decimal(result.position_weight * 100, 2)}%",
+    ]
+    step_details.append(
+        html.Li(
+            [
+                html.Strong("结果汇总："),
+                html.Ul([html.Li(text) for text in final_items], className="mb-0"),
+            ]
+        )
+    )
+
+    steps_component = html.Ol(step_details, className="mb-0")
+
+    rows = _build_preview_rows_for_symbol(symbol, payload)
+    table_component = (
+        _render_factor_preview_table(rows)
+        if rows
+        else html.Div("该样本缺少可展示的字段。", className="text-muted")
+    )
+
+    status = f"测试标的：{label}｜数据源：{source}｜完成时间：{timestamp}"
+
+    return status, steps_component, table_component
 
 
 PREDICTION_RUN_LOCK = threading.Lock()
@@ -5625,6 +5834,7 @@ def render_validation_view_logic(selected_date, selected_symbol, evaluation_stor
     del prediction_store
 
     archive = _load_prediction_archive_raw()
+    overview_total_fig, overview_sector_fig, overview_trend_fig = build_overview_figures(archive)
     evaluation_override: dict[str, dict[str, T.Any]] = {}
     if isinstance(evaluation_store, dict) and evaluation_store.get("date"):
         evaluation_override[str(evaluation_store.get("date"))] = evaluation_store
@@ -5660,6 +5870,9 @@ def render_validation_view_logic(selected_date, selected_symbol, evaluation_stor
             [],
             _empty_figure("暂无数据"),
             _empty_figure("暂无数据"),
+            overview_total_fig,
+            overview_sector_fig,
+            overview_trend_fig,
         )
 
     date_values = {opt["value"] for opt in date_options}
@@ -5696,6 +5909,9 @@ def render_validation_view_logic(selected_date, selected_symbol, evaluation_stor
             [],
             _empty_figure("暂无数据"),
             _empty_figure("暂无数据"),
+            overview_total_fig,
+            overview_sector_fig,
+            overview_trend_fig,
         )
 
     valid_symbol_values = {opt["value"] for opt in symbol_options}
@@ -5748,6 +5964,9 @@ def render_validation_view_logic(selected_date, selected_symbol, evaluation_stor
         table_rows,
         fig_dci,
         fig_prob,
+        overview_total_fig,
+        overview_sector_fig,
+        overview_trend_fig,
     )
 
 

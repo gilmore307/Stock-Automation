@@ -73,6 +73,20 @@ def build_layout(config: "LayoutConfig") -> html.Div:
                 ],
                 className="gy-4",
             ),
+            html.Hr(),
+            html.Div(
+                [
+                    html.H4("预测表现汇总", className="mb-3"),
+                    dbc.Row(
+                        [
+                            dbc.Col(dcc.Graph(id="validation-overview-total"), md=12, lg=4),
+                            dbc.Col(dcc.Graph(id="validation-overview-sector"), md=12, lg=4),
+                            dbc.Col(dcc.Graph(id="validation-overview-trend"), md=12, lg=4),
+                        ],
+                        className="gy-4",
+                    ),
+                ]
+            ),
         ]
     )
 
@@ -89,6 +103,9 @@ def register_callbacks(app: Dash) -> None:
         Output("validation-table", "rowData"),
         Output("validation-graph-dci", "figure"),
         Output("validation-graph-prob", "figure"),
+        Output("validation-overview-total", "figure"),
+        Output("validation-overview-sector", "figure"),
+        Output("validation-overview-trend", "figure"),
         Input("validation-date-dropdown", "value"),
         Input("validation-symbol-dropdown", "value"),
         State("evaluation-store", "data"),
