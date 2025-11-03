@@ -98,7 +98,7 @@ def register_callbacks(app: Dash) -> None:
         State("ft-password", "value"),
         State("ft-2fa", "value"),
         State("prediction-run-id-store", "data"),
-        prevent_initial_call="initial_duplicate",
+        prevent_initial_call=True,
     )
     def update_predictions(
         selected_rows,
@@ -174,6 +174,7 @@ def register_callbacks(app: Dash) -> None:
         Input("post-open-eval", "n_intervals"),
         State("evaluation-store", "data"),
         State("task-store", "data"),
+        prevent_initial_call=True,
     )
     def auto_evaluate_predictions(n_intervals, existing_store, task_state):  # noqa: D401
         return core.auto_evaluate_predictions_logic(
