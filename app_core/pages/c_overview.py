@@ -27,20 +27,20 @@ def build_layout(config: "LayoutConfig") -> html.Div:  # noqa: D401
                 [
                     dbc.CardBody(
                         [
-                            html.H4("测试预测流程", className="mb-3"),
+                            html.H4("预测任务概览", className="mb-3"),
                             html.P(
-                                "系统会自动选取最近载入的 DCI 输入样本，演示一次完整的预测计算过程。",
+                                "系统会同步当前预测任务的执行步骤与关键参数数值。",
                                 className="text-muted",
                             ),
                             dbc.Button(
-                                "重新执行测试",
+                                "刷新概览",
                                 id="overview-preview-run",
                                 color="primary",
                                 size="sm",
                                 className="me-2",
                             ),
                             html.Span(
-                                "点击按钮可强制刷新数据并重新计算。",
+                                "点击按钮可立即获取最新的任务进展与参数。",
                                 className="text-muted",
                             ),
                             html.Hr(),
@@ -69,9 +69,17 @@ def register_callbacks(app: Dash) -> None:
         Output("overview-preview-table", "children"),
         Input("overview-preview-trigger", "n_intervals"),
         Input("overview-preview-run", "n_clicks"),
+        Input("task-store", "data"),
+        Input("prediction-store", "data"),
+        Input("rl-agent-store", "data"),
         prevent_initial_call=False,
     )
-    def render_prediction_preview(n_intervals, run_clicks):  # noqa: D401
+    def render_prediction_preview(n_intervals, run_clicks, task_state, prediction_store, agent_data):  # noqa: D401
         del n_intervals, run_clicks
         force_reload = ctx.triggered_id == "overview-preview-run"
-        return core.build_prediction_preview(force_reload=force_reload)
+        return core.build_prediction_preview(
+            task_state,
+            prediction_store,
+            agent_data,
+            force_reload=force_reload,
+        )

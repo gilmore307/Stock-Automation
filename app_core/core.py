@@ -8,7 +8,7 @@ import uuid
 import copy
 import math
 import traceback
-from collections import deque
+from collections import Counter, deque
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -2269,135 +2269,278 @@ def _render_connection_statuses(
     return html.Div(content)
 
 
-def build_prediction_preview(force_reload: bool = False) -> tuple[str, T.Any, T.Any]:
-    """Run a demonstration DCI prediction using the latest payloads."""
+def build_prediction_preview(
+    task_state: dict[str, T.Any] | None = None,
+    prediction_store: dict[str, T.Any] | None = None,
+    agent_data: dict[str, T.Any] | None = None,
+    *,
+    force_reload: bool = False,
+) -> tuple[str, T.Any, T.Any]:
+    """Summarise the latest prediction task status and key parameters."""
 
-    payloads = load_dci_payloads(force_reload=force_reload)
+    del force_reload  # Manual refresh is handled by Dash trigger semantics.
+
+    tasks: list[dict[str, T.Any]] = []
+    target_date = ""
+    if isinstance(task_state, dict):
+        target_date = str(task_state.get("target_date") or "")
+        raw_tasks = task_state.get("tasks")
+        if isinstance(raw_tasks, list):
+            for entry in raw_tasks:
+                if isinstance(entry, dict):
+                    tasks.append(dict(entry))
+
+    order_map = {task_id: idx for idx, task_id in enumerate(TASK_ORDER)}
+    tasks.sort(
+        key=lambda item: (
+            order_map.get(str(item.get("id") or ""), len(order_map)),
+            str(item.get("start_time") or "9999"),
+            str(item.get("name") or ""),
+        )
+    )
+
+    status_counter: Counter[str] = Counter()
+    last_update = ""
+    for entry in tasks:
+        status_value = str(entry.get("status") or "等待")
+        status_counter[status_value] += 1
+        updated_at = str(entry.get("updated_at") or "")
+        if updated_at and (not last_update or updated_at > last_update):
+            last_update = updated_at
+
+    results: list[dict[str, T.Any]] = []
+    missing_entries: list[str] = []
+    error_entries: list[str] = []
+    if isinstance(prediction_store, dict):
+        raw_results = prediction_store.get("results")
+        if isinstance(raw_results, list):
+            for item in raw_results:
+                if isinstance(item, dict):
+                    results.append(item)
+        raw_missing = prediction_store.get("missing")
+        if isinstance(raw_missing, list):
+            missing_entries = [str(entry) for entry in raw_missing if entry is not None]
+        raw_errors = prediction_store.get("errors")
+        if isinstance(raw_errors, list):
+            error_entries = [str(entry) for entry in raw_errors if entry is not None]
+
+    symbol_set = {
+        str(entry.get("symbol") or "").upper()
+        for entry in results
+        if str(entry.get("symbol") or "")
+    }
+    timeline_set = {
+        str(entry.get("timeline_key") or "")
+        for entry in results
+        if str(entry.get("timeline_key") or "")
+    }
+
     timestamp = dt.datetime.now(US_EASTERN).strftime("%Y-%m-%d %H:%M:%S %Z")
 
-    valid_entries = [(symbol, data) for symbol, data in sorted(payloads.items()) if isinstance(data, dict)]
-    if not valid_entries:
-        status = "未能载入任何 DCI 输入数据，请检查消息源配置。"
-        steps = html.Div(
-            "系统没有找到可用于演示的样本，建议先确认数据采集流程是否正常。",
-            className="text-danger",
+    status_parts: list[str] = []
+    if target_date:
+        status_parts.append(f"目标预测日：{target_date}")
+    if tasks:
+        summary_order = ["进行中", "已完成", "等待", "失败", "无数据"]
+        summary_text = [
+            f"{label}{status_counter[label]}项"
+            for label in summary_order
+            if status_counter.get(label)
+        ]
+        if summary_text:
+            status_parts.append("步骤概况：" + "，".join(summary_text))
+    if last_update:
+        status_parts.append(f"最近更新：{last_update}")
+    if results:
+        status_parts.append(
+            f"预测结果：{len(results)} 条｜标的 {len(symbol_set) or '0'} 个｜时点 {len(timeline_set) or '0'} 个"
         )
-        return status, steps, html.Div()
+    if missing_entries:
+        status_parts.append(f"缺失数据 {len(missing_entries)} 条")
+    if error_entries:
+        status_parts.append(f"异常条目 {len(error_entries)} 条")
+    if status_parts:
+        status_parts.append(f"生成时间：{timestamp}")
+        status_message = " ｜ ".join(status_parts)
+    else:
+        status_message = f"尚未检测到预测任务，请在预测页启动任务。｜生成时间：{timestamp}"
 
-    symbol, payload = valid_entries[0]
-
-    try:
-        inputs = build_inputs(symbol, payload)
-        result = compute_dci(inputs)
-    except Exception as exc:  # pragma: no cover - diagnostic path
-        error_trace = traceback.format_exc()
-        status = f"测试执行失败：{exc}"
-        steps = html.Pre(error_trace, style={"whiteSpace": "pre-wrap", "fontSize": "0.85rem"})
-        return status, steps, html.Div()
-
-    total_samples = len(valid_entries)
-    company = payload.get("company")
-    label = f"{symbol}"
-    if company:
-        label = f"{symbol}｜{company}"
-    source = _resolve_payload_source(payload) or "未知数据源"
-
-    step_details: list[html.Li] = []
-    step_details.append(
-        html.Li(
-            [
-                html.Strong("样本选择："),
-                f"共解析 {total_samples} 份输入数据，选取 {label}（来源：{source}）。",
-            ]
-        )
-    )
-
-    metric_items = [
-        f"一致性z={_format_decimal(inputs.z_cons)}",
-        f"叙事z={_format_decimal(inputs.z_narr)}",
-        f"拥挤度CI={_format_decimal(inputs.crowding_index)}",
-        f"质量Q={_format_decimal(inputs.quality_score)}",
-        f"分歧度D={_format_decimal(inputs.disagreement)}",
-        f"预期波动={_format_decimal(inputs.expected_move_pct)}%",
-        f"稳定性={_format_decimal(inputs.stability)}",
-        f"宏观冲击标记={'是' if inputs.shock_flag else '否'}",
-    ]
-    step_details.append(
-        html.Li(
-            [
-                html.Strong("关键输入："),
-                html.Ul([html.Li(text) for text in metric_items], className="mb-0"),
-            ]
-        )
-    )
-
-    direction = "看多" if result.direction > 0 else "看空"
-    gating_text = "通过所有风控闸门" if result.gating_passed else "未通过风控闸门"
-    gating_reason = ""
-    if not result.gating_passed and result.gating_reasons:
-        gating_reason = "；".join(result.gating_reasons)
-    base_items = [
-        f"方向分 S={_format_decimal(result.base_score)}（判断为{direction}）",
-        gating_text + (f"（{gating_reason}）" if gating_reason else ""),
-    ]
-    step_details.append(
-        html.Li(
-            [
-                html.Strong("方向得分："),
-                html.Ul([html.Li(text) for text in base_items], className="mb-0"),
-            ]
-        )
-    )
-
-    shrink_labels = {
-        "shrink_EG": "一致性收缩",
-        "scale_CI": "拥挤度收缩",
-        "scale_Q": "质量收缩",
-        "disagreement": "分歧调整",
-        "shock": "宏观冲击",
+    status_colors = {
+        "已完成": "success",
+        "进行中": "primary",
+        "等待": "secondary",
+        "失败": "danger",
+        "无数据": "warning",
     }
-    shrink_items = [
-        f"{label_name}={_format_decimal(result.shrink_factors.get(key, 1.0), 3)}"
-        for key, label_name in shrink_labels.items()
-    ]
-    shrink_items.append(f"最终上涨概率={_format_decimal(result.p_up * 100, 2)}%")
-    step_details.append(
-        html.Li(
-            [
-                html.Strong("概率调整："),
-                html.Ul([html.Li(text) for text in shrink_items], className="mb-0"),
-            ]
+
+    if not tasks:
+        steps_component = html.Div(
+            "当前没有预测任务，请先在预测页启动任务。",
+            className="text-muted",
         )
-    )
+    else:
+        step_items: list[html.Li] = []
+        for entry in tasks:
+            name = str(entry.get("name") or entry.get("id") or "未命名步骤")
+            status_value = str(entry.get("status") or "等待")
+            detail_text = str(entry.get("detail") or "").strip()
+            progress_text = str(entry.get("symbol_progress") or "").strip()
+            start_time = str(entry.get("start_time") or "").strip()
+            end_time = str(entry.get("end_time") or "").strip()
+            updated_at = str(entry.get("updated_at") or "").strip()
 
-    penalty = result.dci_penalised - result.dci_base
-    final_items = [
-        f"基础DCI={_format_decimal(result.dci_base)}",
-        f"惩罚后DCI={_format_decimal(result.dci_penalised)}（惩罚{_format_decimal(penalty)}）",
-        f"最终DCI={_format_decimal(result.dci_final)}",
-        f"仓位建议={result.position_bucket}，权重={_format_decimal(result.position_weight * 100, 2)}%",
-    ]
-    step_details.append(
-        html.Li(
-            [
-                html.Strong("结果汇总："),
-                html.Ul([html.Li(text) for text in final_items], className="mb-0"),
-            ]
+            badge = dbc.Badge(
+                status_value,
+                color=status_colors.get(status_value, "secondary"),
+                className="ms-2",
+            )
+
+            header = html.Div(
+                [
+                    html.Span(name, className="fw-semibold"),
+                    badge,
+                ],
+                className="d-flex justify-content-between align-items-center mb-1",
+            )
+
+            meta_parts: list[str] = []
+            if progress_text and progress_text not in {"", "-"}:
+                meta_parts.append(f"进度：{progress_text}")
+            if start_time:
+                meta_parts.append(f"开始：{start_time}")
+            if end_time:
+                meta_parts.append(f"结束：{end_time}")
+            if updated_at:
+                meta_parts.append(f"更新：{updated_at}")
+
+            details: list[T.Any] = []
+            if detail_text:
+                details.append(html.Div(detail_text, className="small text-muted"))
+            if meta_parts:
+                details.append(
+                    html.Div(" ｜ ".join(meta_parts), className="small text-muted")
+                )
+
+            step_items.append(
+                html.Li(
+                    [header, *details],
+                    className="mb-3",
+                )
+            )
+
+        steps_component = html.Ol(step_items, className="mb-0")
+
+    def _format_param_value(value: T.Any) -> str:
+        if isinstance(value, float):
+            return _format_decimal(value, 4)
+        if isinstance(value, (int,)):
+            return str(value)
+        if isinstance(value, (list, tuple, set)):
+            return "，".join(str(item) for item in value)
+        if value in {None, ""}:
+            return "—"
+        return str(value)
+
+    def _add_param_row(label: str, value: T.Any, description: str) -> None:
+        display = _format_param_value(value)
+        if display == "—" and value not in {0, 0.0}:
+            return
+        param_rows.append(
+            html.Tr([html.Td(label), html.Td(display), html.Td(description or "")])
         )
-    )
 
-    steps_component = html.Ol(step_details, className="mb-0")
+    param_rows: list[html.Tr] = []
+    if target_date:
+        _add_param_row("目标预测日", target_date, "当前预测任务关联的决策日。")
+    if tasks:
+        _add_param_row("记录的任务数", len(tasks), "已跟踪的预测流程步骤数量。")
+        status_desc = {
+            "进行中": "当前正在执行的任务数量。",
+            "已完成": "已结束并成功完成的任务数量。",
+            "等待": "尚未开始的任务数量。",
+            "失败": "执行过程中出现异常的任务数量。",
+            "无数据": "缺少数据而被跳过的任务数量。",
+        }
+        for key, desc in status_desc.items():
+            if status_counter.get(key):
+                _add_param_row(f"{key}任务", status_counter[key], desc)
+        if last_update:
+            _add_param_row("最近更新时间", last_update, "最后一次记录任务状态的时间。")
+    if results:
+        _add_param_row("预测结果数量", len(results), "最新预测任务生成的结果条数。")
+        if symbol_set:
+            _add_param_row("涉及标的数", len(symbol_set), "参与预测的独立标的数量。")
+        if timeline_set:
+            _add_param_row("覆盖时点数", len(timeline_set), "本次任务覆盖的预测时点数量。")
+    if missing_entries:
+        _add_param_row("缺失数据条目", len(missing_entries), "因缺少输入数据而未能生成结果的条目数量。")
+    if error_entries:
+        _add_param_row("异常条目", len(error_entries), "执行过程中出现异常的条目数量。")
 
-    rows = _build_preview_rows_for_symbol(symbol, payload)
+    agent_snapshot = agent_data
+    if isinstance(agent_data, dict) and "global" in agent_data and isinstance(agent_data["global"], dict):
+        agent_snapshot = agent_data.get("global")
+
+    rl_descriptions = RL_PARAM_DESCRIPTIONS
+    if isinstance(agent_snapshot, dict):
+        for key, label in [
+            ("learning_rate", "RL 学习率"),
+            ("gamma", "RL 折扣因子"),
+            ("adjustment_scale", "概率调整幅度"),
+            ("bias", "方向偏置"),
+            ("baseline", "RL 基准"),
+            ("update_count", "RL 更新次数"),
+            ("total_predictions", "RL 预测次数"),
+        ]:
+            if key in agent_snapshot:
+                _add_param_row(label, agent_snapshot.get(key), rl_descriptions.get(key, ""))
+
+        pending_counts = agent_data.get("pending_counts") if isinstance(agent_data, dict) else None
+        if not pending_counts and isinstance(agent_snapshot, dict):
+            pending_counts = agent_snapshot.get("pending_counts")
+        if isinstance(pending_counts, dict) and pending_counts:
+            try:
+                pending_total = sum(int(value) for value in pending_counts.values())
+            except (TypeError, ValueError):
+                pending_total = 0
+            preview_items = sorted(
+                ((str(symbol), int(count)) for symbol, count in pending_counts.items()),
+                key=lambda item: (-item[1], item[0]),
+            )
+            preview_text = "；".join(f"{symbol}:{count}" for symbol, count in preview_items[:5])
+            value_text = (
+                f"{pending_total}（{preview_text}）" if preview_text and pending_total else str(pending_total)
+            )
+            _add_param_row("待反馈标的", value_text, "强化学习模块等待实际结果反馈的标的数量。")
+
+        weights = agent_snapshot.get("weights")
+        if isinstance(weights, dict) and weights:
+            top_weights = sorted(
+                ((str(feature), float(weight)) for feature, weight in weights.items()),
+                key=lambda item: abs(item[1]),
+                reverse=True,
+            )
+            preview = "；".join(
+                f"{feature}:{_format_decimal(weight, 4)}" for feature, weight in top_weights[:5]
+            )
+            _add_param_row("权重预览", preview, rl_descriptions.get("weights", "特征权重。"))
+
     table_component = (
-        _render_factor_preview_table(rows)
-        if rows
-        else html.Div("该样本缺少可展示的字段。", className="text-muted")
+        dbc.Table(
+            [
+                html.Thead(html.Tr([html.Th("参数"), html.Th("当前值"), html.Th("说明")])),
+                html.Tbody(param_rows),
+            ],
+            bordered=True,
+            hover=True,
+            size="sm",
+            className="mb-0",
+        )
+        if param_rows
+        else html.Div("暂无可用的预测参数信息。", className="text-muted")
     )
 
-    status = f"测试标的：{label}｜数据源：{source}｜完成时间：{timestamp}"
-
-    return status, steps_component, table_component
+    return status_message, steps_component, table_component
 
 
 PREDICTION_RUN_LOCK = threading.Lock()
