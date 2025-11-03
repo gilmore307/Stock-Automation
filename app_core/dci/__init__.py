@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import logging
 import math
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -11,7 +13,11 @@ from .config import (
     evaluate_quality_scale,
     get_beta_for_symbol,
     load_config,
+    resolve_toggle,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 ROBUST_EPS = 1e-9
@@ -64,6 +70,9 @@ class DCIInputs:
     stability: float
     shock_flag: int
     factor_weights: Dict[str, float] | None = None
+    has_weekly_option: bool = True
+    option_expiry_days: int | None = None
+    option_expiry_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -81,6 +90,14 @@ class DCIResult:
     base_score: float
     scaled_factors: Dict[str, float]
     factor_weights: Dict[str, float]
+    gating_passed: bool
+    gating_reasons: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DCIGatingDecision:
+    passed: bool
+    reasons: Tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -100,34 +117,25 @@ class BucketSpec:
     target: float
 
 
-FACTOR_BUCKET_SPECS: Dict[str, BucketSpec] = {
-    "A": BucketSpec(code="A", label="预期/基本面动能", target=0.45),
-    "B": BucketSpec(code="B", label="经营质量/利润动能", target=0.25),
-    "C": BucketSpec(code="C", label="价格/成交动能", target=0.20),
-    "D": BucketSpec(code="D", label="相对估值", target=0.10),
-}
+_MODEL_CFG = load_config()
+_WEIGHTS_CFG = _MODEL_CFG.weights
 
+FACTOR_BUCKET_SPECS: Dict[str, BucketSpec] = {}
+for code, spec in _WEIGHTS_CFG.buckets.items():
+    FACTOR_BUCKET_SPECS[code] = BucketSpec(code=spec.code, label=spec.label, target=spec.target)
 
-FACTOR_DESCRIPTORS: Dict[str, FactorDescriptor] = {
-    "EPS_Rev_30d": FactorDescriptor(bucket="A", prior=0.20),
-    "Sales_Rev_30d": FactorDescriptor(bucket="A", prior=0.10),
-    "Guide_Drift": FactorDescriptor(bucket="A", prior=0.10),
-    "Backlog_Bookings_Delta": FactorDescriptor(bucket="A", prior=0.05),
-    "GM_YoY_Delta": FactorDescriptor(bucket="B", prior=0.10),
-    "OPM_YoY_Delta": FactorDescriptor(bucket="B", prior=0.10),
-    "FCF_Margin_Slope": FactorDescriptor(bucket="B", prior=0.05),
-    "Ret20_rel": FactorDescriptor(bucket="C", prior=0.10),
-    "Ret60_rel": FactorDescriptor(bucket="C", prior=0.05),
-    "UDVol20": FactorDescriptor(bucket="C", prior=0.05),
-    "Value_vs_Sector": FactorDescriptor(bucket="D", prior=0.07),
-    "EarningsYield_vs_Sector": FactorDescriptor(bucket="D", prior=0.03),
-}
+if not FACTOR_BUCKET_SPECS:
+    raise ValueError("No DCI factor buckets configured.")
 
+FACTOR_DESCRIPTORS: Dict[str, FactorDescriptor] = {}
+for name, spec in _WEIGHTS_CFG.factors.items():
+    if spec.bucket not in FACTOR_BUCKET_SPECS:
+        raise ValueError(f"Factor {name} references unknown bucket {spec.bucket}.")
+    FACTOR_DESCRIPTORS[name] = FactorDescriptor(bucket=spec.bucket, prior=spec.prior)
 
 BASE_FACTOR_WEIGHTS: Dict[str, float] = {
     name: desc.prior for name, desc in FACTOR_DESCRIPTORS.items()
 }
-
 
 FACTOR_BUCKET_FACTORS: Dict[str, List[str]] = {}
 for factor, descriptor in FACTOR_DESCRIPTORS.items():
@@ -174,8 +182,13 @@ class WeightDriftReport:
     style_bias: Dict[str, float]
 
 
-FACTOR_WEIGHT_L2_LIMIT = 0.05
-MAX_INTERCEPT_MAGNITUDE = 0.25
+FACTOR_WEIGHT_L2_LIMIT = _WEIGHTS_CFG.l2_limit
+MAX_INTERCEPT_MAGNITUDE = _WEIGHTS_CFG.intercept_limit
+
+_DEFAULTS_CFG = _MODEL_CFG.defaults
+_GATING_CFG = _MODEL_CFG.gates
+_AUTO_BASELINE_ENABLED = resolve_toggle("auto_baseline")
+_STRUCTURED_LOG_ENABLED = resolve_toggle("structured_log")
 
 
 def _initial_state() -> FactorWeightState:
@@ -405,18 +418,61 @@ def _apply_scale(p_value: float, scale: float) -> float:
     return 0.5 + (p_value - 0.5) * scale_clamped
 
 
+def _evaluate_gating(inputs: DCIInputs) -> DCIGatingDecision:
+    reasons: List[str] = []
+
+    if inputs.expected_move_pct < _GATING_CFG.min_em_pct:
+        reasons.append(
+            f"预期波动 {inputs.expected_move_pct:.2f}% 低于阈值 {_GATING_CFG.min_em_pct:.2f}%"
+        )
+
+    weekly_cfg = _GATING_CFG.weekly
+    if weekly_cfg.require_weekly:
+        has_weekly = bool(inputs.has_weekly_option)
+        expiry_type = (inputs.option_expiry_type or "").strip().upper()
+        if not has_weekly and expiry_type != "W":
+            reasons.append("缺少周度到期合约")
+
+        max_days = weekly_cfg.weekly_max_days
+        expiry_days = inputs.option_expiry_days
+        if expiry_days is None:
+            expiry_days = _DEFAULTS_CFG.option_expiry_days
+        if max_days is not None and (expiry_days is None or expiry_days > max_days):
+            if expiry_days is None:
+                reasons.append(f"周度合约剩余天数未知，需≤{max_days}天")
+            else:
+                reasons.append(
+                    f"周度合约剩余 {expiry_days} 天，超过限制 {max_days} 天"
+                )
+
+    shock_cfg = _GATING_CFG.shock_ci
+    if shock_cfg and inputs.shock_flag:
+        crowding = inputs.crowding_index
+        if shock_cfg.min_ci is not None and crowding < shock_cfg.min_ci:
+            reasons.append(
+                f"冲击期 crowding {crowding:.2f} 低于 {shock_cfg.min_ci:.2f}"
+            )
+        if shock_cfg.max_ci is not None and crowding > shock_cfg.max_ci:
+            reasons.append(
+                f"冲击期 crowding {crowding:.2f} 高于 {shock_cfg.max_ci:.2f}"
+            )
+
+    return DCIGatingDecision(passed=not reasons, reasons=tuple(reasons))
+
+
 def compute_dci(inputs: DCIInputs) -> DCIResult:
     """Compute the Directional Certainty Index as specified."""
 
-    cfg = load_config()
     weights = inputs.factor_weights or get_factor_weights()
     S, scaled = compute_directional_score(inputs.factors, weights)
+
+    gating_decision = _evaluate_gating(inputs)
 
     beta = get_beta_for_symbol(inputs.symbol)
     p_raw = _sigmoid(beta.beta0 + beta.beta1 * S)
 
     eg = 0.7 * inputs.z_cons + 0.3 * inputs.z_narr
-    shrink_eg = 1.0 / (1.0 + math.exp(cfg.gamma * eg))
+    shrink_eg = 1.0 / (1.0 + math.exp(_MODEL_CFG.gamma * eg))
     p_after_eg = _apply_scale(p_raw, shrink_eg)
 
     ci_scale = evaluate_ci_scale(inputs.crowding_index, inputs.quality_score)
@@ -425,11 +481,11 @@ def compute_dci(inputs: DCIInputs) -> DCIResult:
     q_scale = evaluate_quality_scale(inputs.quality_score)
     p_after_quality = _apply_scale(p_after_ci, q_scale)
 
-    disagree_scale = max(0.0, min(1.0, 1.0 - cfg.kappa_d * inputs.disagreement))
+    disagree_scale = max(0.0, min(1.0, 1.0 - _MODEL_CFG.kappa_d * inputs.disagreement))
     p_after_disagreement = _apply_scale(p_after_quality, disagree_scale)
 
     if inputs.shock_flag:
-        shock_scale = cfg.eta_macro
+        shock_scale = _MODEL_CFG.eta_macro
         p_final = _apply_scale(p_after_disagreement, shock_scale)
     else:
         shock_scale = 1.0
@@ -442,22 +498,30 @@ def compute_dci(inputs: DCIInputs) -> DCIResult:
     penalty = min(0.0, penalty)
     dci_pen = max(0.0, dci_base + penalty)
 
-    dci_final = dci_pen * (0.85 + 0.15 * inputs.stability)
+    dci_final_raw = dci_pen * (0.85 + 0.15 * inputs.stability)
 
     direction = 1 if p_up > 0.5 else -1
 
-    weight = max(0.0, min(1.0, (dci_final - 60.0) / 40.0))
+    weight = max(0.0, min(1.0, (dci_final_raw - 60.0) / 40.0))
     if inputs.shock_flag and inputs.crowding_index >= 70.0:
         weight *= 0.5
 
-    if dci_final >= 75:
+    if dci_final_raw >= 75:
         bucket = "加码"
-    elif dci_final >= 65:
+    elif dci_final_raw >= 65:
         bucket = "小仓尝试"
     else:
         bucket = "放弃"
 
-    certainty = dci_final
+    if not gating_decision.passed:
+        bucket = _GATING_CFG.skip_bucket
+        dci_final = 0.0
+        certainty = 0.0
+        position_weight = 0.0
+    else:
+        dci_final = dci_final_raw
+        certainty = dci_final
+        position_weight = weight
 
     shrink_map = {
         "shrink_EG": shrink_eg,
@@ -467,6 +531,21 @@ def compute_dci(inputs: DCIInputs) -> DCIResult:
         "shock": shock_scale,
     }
 
+    if _STRUCTURED_LOG_ENABLED:
+        log_payload = {
+            "symbol": inputs.symbol,
+            "base_score": S,
+            "p_raw": p_raw,
+            "p_final": p_up,
+            "dci_final": dci_final,
+            "gating_passed": gating_decision.passed,
+            "gating_reasons": list(gating_decision.reasons),
+        }
+        try:
+            logger.info(json.dumps(log_payload, ensure_ascii=False, sort_keys=True))
+        except Exception:  # pragma: no cover - logging must not break computation
+            logger.info("%s", log_payload)
+
     return DCIResult(
         symbol=inputs.symbol,
         direction=direction,
@@ -474,35 +553,53 @@ def compute_dci(inputs: DCIInputs) -> DCIResult:
         dci_base=dci_base,
         dci_penalised=dci_pen,
         dci_final=dci_final,
-        position_weight=weight,
+        position_weight=position_weight,
         certainty=certainty,
         position_bucket=bucket,
         shrink_factors=shrink_map,
         base_score=S,
         scaled_factors=scaled,
         factor_weights=dict(weights),
+        gating_passed=gating_decision.passed,
+        gating_reasons=gating_decision.reasons,
     )
 
 
-def parse_factor_inputs(raw: Dict[str, float | Dict[str, float]]) -> Dict[str, FactorInput]:
-    """Parse raw JSON-friendly factor inputs into FactorInput objects."""
 
-    out: Dict[str, FactorInput] = {}
-    for name, value in raw.items():
-        if isinstance(value, dict):
-            if "z" in value:
-                out[name] = FactorInput(z=float(value["z"]))
-            elif {"value", "median", "mad"} <= value.keys():
-                out[name] = FactorInput(
-                    value=float(value["value"]),
-                    median=float(value["median"]),
-                    mad=float(value["mad"]),
-                )
-            else:
-                raise ValueError(f"Unsupported factor schema for '{name}'.")
+
+
+def _coerce_factor(value: float | Dict[str, float]) -> FactorInput:
+    if isinstance(value, dict):
+        if "z" in value:
+            return FactorInput(z=float(value["z"]))
+        if {"value", "median", "mad"} <= value.keys():
+            return FactorInput(
+                value=float(value["value"]),
+                median=float(value["median"]),
+                mad=float(value["mad"]),
+            )
+        raise ValueError("Unsupported factor schema.")
+    return FactorInput(z=float(value))
+
+
+def parse_factor_inputs(
+    raw: Dict[str, float | Dict[str, float]] | None,
+    *,
+    allow_defaults: bool,
+) -> Dict[str, FactorInput]:
+    """Parse raw factor inputs using configuration defaults for missing entries."""
+
+    factors: Dict[str, FactorInput] = {}
+    raw_map = raw or {}
+    missing_default = _DEFAULTS_CFG.missing_factor_z
+    for name in BASE_FACTOR_WEIGHTS:
+        if name in raw_map:
+            factors[name] = _coerce_factor(raw_map[name])
+        elif allow_defaults:
+            factors[name] = FactorInput(z=missing_default)
         else:
-            out[name] = FactorInput(z=float(value))
-    return out
+            raise KeyError(f"Missing factor '{name}' and auto baseline disabled")
+    return factors
 
 
 def build_inputs(symbol: str, payload: Dict[str, float | Dict[str, float]]) -> DCIInputs:
@@ -510,18 +607,85 @@ def build_inputs(symbol: str, payload: Dict[str, float | Dict[str, float]]) -> D
 
     factors_raw = payload.get("factors")
     if not isinstance(factors_raw, dict):
-        raise ValueError("Payload must include 'factors' map.")
-    factors = parse_factor_inputs(factors_raw)
+        if _AUTO_BASELINE_ENABLED:
+            factors_raw = {}
+        else:
+            raise ValueError("Payload must include 'factors' map.")
+
+    factors = parse_factor_inputs(factors_raw, allow_defaults=_AUTO_BASELINE_ENABLED)
+
+    def _resolve_numeric(
+        name: str,
+        *,
+        aliases: Iterable[str] = (),
+        cast: type = float,
+        required: bool = True,
+    ) -> float:
+        keys = [name, *aliases]
+        for key in keys:
+            if key in payload and payload[key] is not None:
+                value = payload[key]
+                if cast is int:
+                    return int(float(value))
+                return float(value)
+        default = _DEFAULTS_CFG.get_field(name, 0.0)
+        if required and not _AUTO_BASELINE_ENABLED:
+            raise ValueError(f"Missing field '{name}' and auto baseline disabled")
+        if cast is int:
+            return int(default)
+        return float(default)
+
+    z_cons = _resolve_numeric("z_cons")
+    z_narr = _resolve_numeric("z_narr")
+    crowding = _resolve_numeric("CI")
+    quality = _resolve_numeric("Q")
+    disagreement = _resolve_numeric("D")
+    expected_move = _resolve_numeric("EM_pct", aliases=("EM",))
+    stability = _resolve_numeric("S_stab", required=False)
+    shock_flag = _resolve_numeric("shock_flag", cast=int, required=False)
+
+    def _resolve_bool(keys: Iterable[str], default: bool) -> bool:
+        for key in keys:
+            if key in payload:
+                value = payload[key]
+                if isinstance(value, str):
+                    return value.strip().lower() not in {"", "0", "false", "no", "off"}
+                return bool(value)
+        return default
+
+    has_weekly = _resolve_bool(["has_weekly", "has_weekly_option"], _DEFAULTS_CFG.has_weekly_option)
+
+    def _resolve_option_days() -> int | None:
+        for key in ("option_expiry_days", "expiry_days"):
+            if key in payload and payload[key] is not None:
+                try:
+                    return int(float(payload[key]))
+                except (TypeError, ValueError):
+                    continue
+        return _DEFAULTS_CFG.option_expiry_days
+
+    option_days = _resolve_option_days()
+
+    def _resolve_option_type() -> str | None:
+        for key in ("option_expiry_type", "expiry_type"):
+            if key in payload and payload[key]:
+                return str(payload[key]).strip()
+        return _DEFAULTS_CFG.option_expiry_type
+
+    option_type = _resolve_option_type()
 
     return DCIInputs(
         symbol=symbol,
         factors=factors,
-        z_cons=float(payload.get("z_cons", 0.0)),
-        z_narr=float(payload.get("z_narr", 0.0)),
-        crowding_index=float(payload.get("CI", 0.0)),
-        quality_score=float(payload.get("Q", 0.0)),
-        disagreement=float(payload.get("D", 0.0)),
-        expected_move_pct=float(payload.get("EM_pct", payload.get("EM", 0.0))),
-        stability=float(payload.get("S_stab", 0.0)),
-        shock_flag=int(payload.get("shock_flag", 0)),
+        z_cons=z_cons,
+        z_narr=z_narr,
+        crowding_index=crowding,
+        quality_score=quality,
+        disagreement=disagreement,
+        expected_move_pct=expected_move,
+        stability=stability,
+        shock_flag=int(shock_flag),
+        has_weekly_option=has_weekly,
+        option_expiry_days=option_days,
+        option_expiry_type=option_type,
     )

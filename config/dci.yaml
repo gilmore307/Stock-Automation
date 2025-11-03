@@ -1,0 +1,78 @@
+{
+  "defaults": {
+    "missing_factor_z": 0.0,
+    "option_expiry_days": 7,
+    "has_weekly_option": true,
+    "option_expiry_type": "W",
+    "fields": {
+      "z_cons": 0.0,
+      "z_narr": 0.0,
+      "CI": 50.0,
+      "Q": 50.0,
+      "D": 0.0,
+      "EM_pct": 5.0,
+      "S_stab": 0.8,
+      "shock_flag": 0
+    },
+    "provider": {
+      "url": "",
+      "directory": "",
+      "path": ""
+    }
+  },
+  "weights": {
+    "l2_limit": 0.05,
+    "intercept_limit": 0.25,
+    "buckets": {
+      "A": {"label": "预期/基本面动能", "target": 0.45},
+      "B": {"label": "经营质量/利润动能", "target": 0.25},
+      "C": {"label": "价格/成交动能", "target": 0.2},
+      "D": {"label": "相对估值", "target": 0.1}
+    },
+    "factors": {
+      "EPS_Rev_30d": {"bucket": "A", "prior": 0.2},
+      "Sales_Rev_30d": {"bucket": "A", "prior": 0.1},
+      "Guide_Drift": {"bucket": "A", "prior": 0.1},
+      "Backlog_Bookings_Delta": {"bucket": "A", "prior": 0.05},
+      "GM_YoY_Delta": {"bucket": "B", "prior": 0.1},
+      "OPM_YoY_Delta": {"bucket": "B", "prior": 0.1},
+      "FCF_Margin_Slope": {"bucket": "B", "prior": 0.05},
+      "Ret20_rel": {"bucket": "C", "prior": 0.1},
+      "Ret60_rel": {"bucket": "C", "prior": 0.05},
+      "UDVol20": {"bucket": "C", "prior": 0.05},
+      "Value_vs_Sector": {"bucket": "D", "prior": 0.07},
+      "EarningsYield_vs_Sector": {"bucket": "D", "prior": 0.03}
+    }
+  },
+  "bounds": {
+    "beta": {"beta0": 0.0, "beta1": 1.0},
+    "gamma": 0.35,
+    "kappa_d": 0.4,
+    "eta_macro": 0.8,
+    "ci_scale": {
+      "x": [0.0, 30.0, 50.0, 70.0, 100.0],
+      "y": [0.55, 0.65, 0.75, 0.85, 0.9]
+    },
+    "q_scale": {
+      "x": [0.0, 40.0, 60.0, 80.0, 100.0],
+      "y": [0.95, 0.85, 0.7, 0.6, 0.55]
+    },
+    "penalty_curve": {
+      "x": [0.0, 2.0, 5.0, 10.0],
+      "y": [-10.0, -6.0, -2.0, 0.0]
+    },
+    "quality_gate": {"threshold": 60.0, "cap": 55.0},
+    "platt": {"path": ""}
+  },
+  "gates": {
+    "min_em_pct": 2.0,
+    "require_weekly": true,
+    "weekly_max_days": 9,
+    "shock_ci": {"min_ci": 25.0, "max_ci": 85.0},
+    "skip_bucket": "跳过标的"
+  },
+  "toggles": {
+    "auto_baseline": {"env": "DCI_AUTO_BASELINE", "default": true},
+    "structured_log": {"env": "DCI_STRUCTURED_LOG", "default": false}
+  }
+}

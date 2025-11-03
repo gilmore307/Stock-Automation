@@ -43,6 +43,7 @@ set_factor_weights = dci_module.set_factor_weights
 adjust_factor_weights = dci_module.adjust_factor_weights
 get_last_weight_report = dci_module.get_last_weight_report
 get_factor_biases = dci_module.get_factor_biases
+gating_config = config_module.gating_config
 
 
 def _build_base_inputs(**overrides: float) -> DCIInputs:
@@ -187,4 +188,14 @@ def test_adjust_factor_weights_projects_to_bucket_targets() -> None:
     total_c = sum(weights[name] for name in FACTOR_BUCKET_FACTORS["C"])
     assert math.isclose(total_c, FACTOR_BUCKET_SPECS["C"].target, rel_tol=1e-6, abs_tol=1e-6)
     assert all(value >= 0.0 for value in weights.values())
+
+
+def test_gating_blocks_low_em_move() -> None:
+    cfg = gating_config()
+    low_em_inputs = _build_base_inputs(expected_move_pct=cfg.min_em_pct - 0.5)
+    result = compute_dci(low_em_inputs)
+    assert result.gating_passed is False
+    assert result.position_weight == 0.0
+    assert math.isclose(result.dci_final, 0.0)
+    assert result.position_bucket == cfg.skip_bucket
 

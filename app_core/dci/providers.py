@@ -10,6 +10,8 @@ from typing import Any, Dict
 
 import requests
 
+from .config import provider_defaults
+
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,7 @@ class DCIDataProvider:
 
 
 _CUSTOM_PROVIDER: DCIDataProvider | None = None
+_PROVIDER_DEFAULTS = provider_defaults()
 
 
 def register_dci_provider(provider: DCIDataProvider | None) -> None:
@@ -160,15 +163,19 @@ def get_default_provider() -> DCIDataProvider:
     if _CUSTOM_PROVIDER is not None:
         return _CUSTOM_PROVIDER
 
-    url = os.getenv("DCI_DATA_URL")
+    url = os.getenv("DCI_DATA_URL") or (_PROVIDER_DEFAULTS.url if _PROVIDER_DEFAULTS.url else None)
     if url:
         return HTTPDCIDataProvider(url)
 
-    directory = os.getenv("DCI_DATA_DIR")
+    directory = os.getenv("DCI_DATA_DIR") or (
+        str(_PROVIDER_DEFAULTS.directory) if _PROVIDER_DEFAULTS.directory else None
+    )
     if directory:
         return DirectoryDCIDataProvider(Path(directory))
 
-    path = os.getenv("DCI_DATA_PATH")
+    path = os.getenv("DCI_DATA_PATH") or (
+        str(_PROVIDER_DEFAULTS.path) if _PROVIDER_DEFAULTS.path else None
+    )
     if path:
         return FileDCIDataProvider(Path(path))
 
