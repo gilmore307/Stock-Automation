@@ -2117,6 +2117,23 @@ def _stringify_json(value: T.Any, *, fallback: str = "", limit: int = 480) -> st
     return text[: limit - 1] + "…"
 
 
+def _stringify_used_fields(value: T.Any, keys: tuple[str, ...]) -> str:
+    """Return JSON containing only ``keys`` from ``value`` when it is a mapping."""
+
+    if not isinstance(value, dict):
+        return _stringify_json(value)
+
+    filtered: dict[str, T.Any] = {}
+    for key in keys:
+        if key in value:
+            filtered[key] = value.get(key)
+
+    if not filtered:
+        return ""
+
+    return _stringify_json(filtered)
+
+
 def _coerce_text(value: T.Any) -> str:
     """Return ``value`` as a human-friendly string."""
 
@@ -2151,7 +2168,20 @@ def _sample_nasdaq_rows(symbol: str) -> list[dict[str, str]]:
                 {
                     "label": label,
                     "detail": detail,
-                    "raw": _stringify_json(raw_source),
+                    "raw": _stringify_used_fields(
+                        raw_source,
+                        (
+                            "symbol",
+                            "company",
+                            "companyName",
+                            "companyTickerSymbol",
+                            "time",
+                            "Time",
+                            "EPSTime",
+                            "timeStatus",
+                            "when",
+                        ),
+                    ),
                 }
             )
         if matching:
@@ -2183,7 +2213,16 @@ def _sample_finnhub_rows(symbol: str) -> list[dict[str, str]]:
     else:
         if quote:
             detail = f"现价 {quote.get('price')}｜昨收 {quote.get('prev_close')}"
-            rows.append({"label": f"{symbol} 行情", "detail": detail, "raw": _stringify_json(quote)})
+            rows.append(
+                {
+                    "label": f"{symbol} 行情",
+                    "detail": detail,
+                    "raw": _stringify_used_fields(
+                        quote,
+                        ("price", "prev_close", "timestamp"),
+                    ),
+                }
+            )
         else:
             rows.append({"label": f"{symbol} 行情", "detail": "返回空数据", "raw": ""})
 
@@ -2196,7 +2235,16 @@ def _sample_finnhub_rows(symbol: str) -> list[dict[str, str]]:
             name = profile.get("name") or profile.get("ticker") or symbol
             sector = profile.get("sector") or profile.get("industry") or ""
             detail = f"{name}｜{sector}".rstrip("｜")
-            rows.append({"label": f"{symbol} 公司资料", "detail": detail, "raw": _stringify_json(profile)})
+            rows.append(
+                {
+                    "label": f"{symbol} 公司资料",
+                    "detail": detail,
+                    "raw": _stringify_used_fields(
+                        profile,
+                        ("name", "sector", "industry", "exchange", "source", "last_updated"),
+                    ),
+                }
+            )
         else:
             rows.append({"label": f"{symbol} 公司资料", "detail": "返回空数据", "raw": ""})
 
@@ -2217,7 +2265,10 @@ def _sample_openfigi_rows(symbol: str) -> list[dict[str, str]]:
     for entry in mappings[:3]:
         figi = entry.get("figi") or ""
         detail = f"FIGI {figi}" if figi else "缺少 FIGI"
-        raw = _stringify_json(entry)
+        raw = _stringify_used_fields(
+            entry,
+            ("ticker", "figi", "name", "securityType", "marketSector"),
+        )
         rows.append({"label": f"{symbol} 映射", "detail": detail, "raw": raw})
     return rows
 
@@ -2232,7 +2283,13 @@ def _sample_fred_rows(series_id: str) -> list[dict[str, str]]:
         return [{"label": series_id, "detail": "返回空数据", "raw": ""}]
 
     detail = f"{latest.get('date')} → {latest.get('value')}"
-    return [{"label": series_id, "detail": detail, "raw": _stringify_json(latest)}]
+    return [
+        {
+            "label": series_id,
+            "detail": detail,
+            "raw": _stringify_used_fields(latest, ("date", "value")),
+        }
+    ]
 
 
 def _sample_tv_rows(symbol: str, exchange: str) -> list[dict[str, str]]:
@@ -2263,7 +2320,20 @@ def _sample_tv_rows(symbol: str, exchange: str) -> list[dict[str, str]]:
             {
                 "label": f"最近数据 {idx}",
                 "detail": timestamp,
-                "raw": _stringify_json(record),
+                "raw": _stringify_used_fields(
+                    record,
+                    (
+                        "datetime",
+                        "index",
+                        "time",
+                        "Date",
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                        "volume",
+                    ),
+                ),
             }
         )
     return rows
@@ -2275,7 +2345,16 @@ def _sample_ft_session_rows(ft_session: dict[str, T.Any] | None) -> list[dict[st
 
     keys = ", ".join(sorted(map(str, ft_session.keys())))
     detail = f"字段：{keys}" if keys else "会话字段为空"
-    return [{"label": "缓存会话", "detail": detail, "raw": _stringify_json(ft_session)}]
+    return [
+        {
+            "label": "缓存会话",
+            "detail": detail,
+            "raw": _stringify_used_fields(
+                ft_session,
+                ("sid", "ftat", "timestamp", "accounts"),
+            ),
+        }
+    ]
 
 
 def _check_resource_connections(
