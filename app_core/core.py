@@ -1543,8 +1543,8 @@ DEFAULT_PICKER_DATE, MIN_PICKER_DATE, MAX_PICKER_DATE = _date_picker_bounds()
 
 
 
-def _load_dci_payloads() -> dict[str, dict[str, T.Any]]:
-    payload = load_dci_payloads()
+def _load_dci_payloads(*, force_reload: bool = False) -> dict[str, dict[str, T.Any]]:
+    payload = load_dci_payloads(force_reload=force_reload)
     if not isinstance(payload, dict):
         return {}
 
@@ -1553,6 +1553,240 @@ def _load_dci_payloads() -> dict[str, dict[str, T.Any]]:
         if isinstance(key, str) and isinstance(value, dict):
             out[key.upper()] = value
     return out
+
+
+def _normalise_timestamp(value: T.Any) -> str:
+    if isinstance(value, dt.datetime):
+        return value.isoformat()
+    if isinstance(value, dt.date):
+        return value.isoformat()
+    if isinstance(value, (int, float)):
+        try:
+            return _format_decimal(value)
+        except Exception:  # pragma: no cover - best effort formatting
+            return str(value)
+    if value in {None, ""}:
+        return ""
+    return str(value)
+
+
+def _stringify_raw_payload(value: T.Any) -> str:
+    if value in {None, ""}:
+        return ""
+    if isinstance(value, (int, float)):
+        return _format_decimal(value)
+    if isinstance(value, (dt.datetime, dt.date)):
+        return value.isoformat()
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except TypeError:  # pragma: no cover - fallback for non-serialisable objects
+        return str(value)
+
+
+def _extract_payload_timestamp(payload: dict[str, T.Any] | None) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("as_of", "asof", "timestamp", "ts", "updated_at", "date", "time"):
+        candidate = payload.get(key)
+        text = _normalise_timestamp(candidate)
+        if text:
+            return text
+    return ""
+
+
+def _extract_factor_timestamp(payload: T.Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("as_of", "asof", "timestamp", "ts", "updated_at", "date", "time"):
+        candidate = payload.get(key)
+        text = _normalise_timestamp(candidate)
+        if text:
+            return text
+    raw_payload = payload.get("raw")
+    if isinstance(raw_payload, dict):
+        for key in ("as_of", "asof", "timestamp", "ts", "updated_at", "date", "time"):
+            candidate = raw_payload.get(key)
+            text = _normalise_timestamp(candidate)
+            if text:
+                return text
+    return ""
+
+
+def _friendly_timeline_label(key: str) -> str:
+    key = str(key or "").strip()
+    if not key or key == "__global__":
+        return "全局默认"
+    cfg = _resolve_timeline_config(key, key)
+    if cfg and cfg.get("label"):
+        return str(cfg.get("label"))
+    return key
+
+
+def _iter_timeline_payloads(
+    payload: dict[str, T.Any] | None,
+) -> list[tuple[str, dict[str, T.Any]]]:
+    results: list[tuple[str, dict[str, T.Any]]] = []
+    if not isinstance(payload, dict):
+        return results
+
+    results.append(("__global__", payload))
+
+    snapshots = payload.get("snapshots")
+    if isinstance(snapshots, dict):
+        for raw_key, snap_payload in snapshots.items():
+            if isinstance(snap_payload, dict):
+                results.append((str(raw_key), snap_payload))
+
+    return results
+
+
+def _summarise_factor_details(payload: T.Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+
+    extras: list[str] = []
+    for key, value in payload.items():
+        if key in {"z", "value", "median", "mad", "raw", "source", "__source__", "provider"}:
+            continue
+        text = _stringify_raw_payload(value)
+        if text:
+            extras.append(f"{key}={text}")
+
+    raw_payload = payload.get("raw")
+    if raw_payload and not extras:
+        extras.append(_stringify_raw_payload(raw_payload))
+
+    return "；".join(extras)
+
+
+def build_data_source_audit(
+    *, force_reload: bool = False
+) -> tuple[str, list[dict[str, str]], str]:
+    """组装用于原始数据校验表格的内容。"""
+
+    payloads = _load_dci_payloads(force_reload=force_reload)
+    timestamp = dt.datetime.now(US_EASTERN).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+    if not payloads:
+        status = f"尚未载入任何原始数据。｜刷新时间：{timestamp}"
+        return status, [], ""
+
+    rows: list[dict[str, str]] = []
+    symbol_count = 0
+    timeline_count = 0
+    source_set: set[str] = set()
+
+    for raw_symbol in sorted(payloads.keys()):
+        symbol_payload = payloads.get(raw_symbol)
+        if not isinstance(symbol_payload, dict):
+            continue
+
+        symbol = str(raw_symbol).upper()
+        symbol_count += 1
+
+        base_source = _resolve_payload_source(symbol_payload)
+        base_timestamp = _extract_payload_timestamp(symbol_payload)
+
+        for timeline_key, timeline_payload in _iter_timeline_payloads(symbol_payload):
+            if not isinstance(timeline_payload, dict):
+                continue
+
+            factors = timeline_payload.get("factors")
+            if not isinstance(factors, dict) or not factors:
+                continue
+
+            timeline_count += 1
+
+            timeline_label = _friendly_timeline_label(timeline_key)
+            timeline_source = _resolve_payload_source(timeline_payload)
+            timeline_timestamp = _extract_payload_timestamp(timeline_payload) or base_timestamp
+
+            for factor_name in sorted(factors.keys()):
+                factor_payload = factors.get(factor_name)
+                if factor_payload in {None, ""}:
+                    continue
+
+                if isinstance(factor_payload, dict):
+                    z_value = (
+                        _format_decimal(factor_payload.get("z"))
+                        if factor_payload.get("z") is not None
+                        else "—"
+                    )
+                    value_text = (
+                        _format_decimal(factor_payload.get("value"))
+                        if factor_payload.get("value") is not None
+                        else "—"
+                    )
+                    median_text = (
+                        _format_decimal(factor_payload.get("median"))
+                        if factor_payload.get("median") is not None
+                        else "—"
+                    )
+                    mad_text = (
+                        _format_decimal(factor_payload.get("mad"))
+                        if factor_payload.get("mad") is not None
+                        else "—"
+                    )
+                    raw_text = _stringify_raw_payload(
+                        factor_payload.get("raw")
+                        if factor_payload.get("raw") is not None
+                        else factor_payload.get("value")
+                    )
+                    as_of_text = (
+                        _extract_factor_timestamp(factor_payload)
+                        or timeline_timestamp
+                        or base_timestamp
+                    )
+                    details_text = _summarise_factor_details(factor_payload)
+                    source_text = _extract_factor_source(
+                        factor_payload,
+                        timeline_payload,
+                    )
+                else:
+                    z_value = "—"
+                    value_text = _stringify_raw_payload(factor_payload)
+                    median_text = "—"
+                    mad_text = "—"
+                    raw_text = value_text
+                    as_of_text = timeline_timestamp or base_timestamp
+                    details_text = ""
+                    source_text = timeline_source or base_source
+
+                if not source_text:
+                    source_text = timeline_source or base_source or ""
+
+                if source_text:
+                    source_set.add(source_text)
+
+                rows.append(
+                    {
+                        "symbol": symbol,
+                        "timeline": timeline_label,
+                        "timeline_key": "" if timeline_key == "__global__" else str(timeline_key),
+                        "factor": factor_name,
+                        "z": z_value,
+                        "value": value_text,
+                        "median": median_text,
+                        "mad": mad_text,
+                        "raw": raw_text,
+                        "as_of": as_of_text,
+                        "source": source_text,
+                        "details": details_text,
+                    }
+                )
+
+    factor_count = len(rows)
+    status = (
+        f"已载入 {symbol_count} 个标的、{timeline_count} 个时点，共 {factor_count} 条原始因子记录。"
+        f"｜刷新时间：{timestamp}"
+    )
+    summary = ""
+    if source_set:
+        summary = "数据来源：" + "、".join(sorted(source_set))
+
+    return status, rows, summary
 
 
 def _extract_timeline_payload(

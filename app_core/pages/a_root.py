@@ -216,7 +216,7 @@ def build_layout(config: LayoutConfig) -> html.Div:
                     dcc.Tabs(
                         [
                             dcc.Tab(
-                                label="数据与预测预览",
+                                label="数据源校验",
                                 children=[
                                     html.Div(
                                         [
