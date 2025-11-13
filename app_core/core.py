@@ -2102,7 +2102,7 @@ def _compute_dci_for_symbols(
 def _stringify_json(value: T.Any, *, fallback: str = "", limit: int = 480) -> str:
     """Serialize ``value`` into a readable JSON snippet."""
 
-    if value in {None, ""}:
+    if value is None or value == "":
         return fallback
     if isinstance(value, str):
         text = value
