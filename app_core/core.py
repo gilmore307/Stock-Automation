@@ -10,8 +10,6 @@ import math
 import traceback
 from collections import deque
 from pathlib import Path
-from urllib.parse import urlparse
-
 import requests
 import dash_bootstrap_components as dbc
 import pandas as pd
@@ -22,7 +20,7 @@ from dash import dcc, html, ctx, no_update
 
 from .dci import BASE_FACTOR_WEIGHTS, build_inputs, compute_dci, get_factor_weights
 from .dci.providers import load_dci_payloads
-from .data import finnhub, fred, nasdaq, openfigi, tv as tv_data
+from .data import finnhub, firstrade, fred, nasdaq, openfigi, tv as tv_data
 
 try:
     from .dci.rl import RLAgentManager, get_global_manager
@@ -294,14 +292,6 @@ def load_recent_logs(max_entries: int = 500) -> list[str]:
             continue
 
     return list(buffer)
-
-
-def _has_valid_ft_session(session_state: dict[str, T.Any] | None) -> bool:
-    if not isinstance(session_state, dict):
-        return False
-    sid = str(session_state.get("sid") or "").strip()
-    ftat = str(session_state.get("ftat") or "").strip()
-    return bool(sid and ftat)
 
 
 def _earnings_archive_dir(date_value: dt.date) -> Path:
@@ -1543,8 +1533,8 @@ DEFAULT_PICKER_DATE, MIN_PICKER_DATE, MAX_PICKER_DATE = _date_picker_bounds()
 
 
 
-def _load_dci_payloads() -> dict[str, dict[str, T.Any]]:
-    payload = load_dci_payloads()
+def _load_dci_payloads(*, force_reload: bool = False) -> dict[str, dict[str, T.Any]]:
+    payload = load_dci_payloads(force_reload=force_reload)
     if not isinstance(payload, dict):
         return {}
 
@@ -1553,6 +1543,240 @@ def _load_dci_payloads() -> dict[str, dict[str, T.Any]]:
         if isinstance(key, str) and isinstance(value, dict):
             out[key.upper()] = value
     return out
+
+
+def _normalise_timestamp(value: T.Any) -> str:
+    if isinstance(value, dt.datetime):
+        return value.isoformat()
+    if isinstance(value, dt.date):
+        return value.isoformat()
+    if isinstance(value, (int, float)):
+        try:
+            return _format_decimal(value)
+        except Exception:  # pragma: no cover - best effort formatting
+            return str(value)
+    if value in {None, ""}:
+        return ""
+    return str(value)
+
+
+def _stringify_raw_payload(value: T.Any) -> str:
+    if value in {None, ""}:
+        return ""
+    if isinstance(value, (int, float)):
+        return _format_decimal(value)
+    if isinstance(value, (dt.datetime, dt.date)):
+        return value.isoformat()
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except TypeError:  # pragma: no cover - fallback for non-serialisable objects
+        return str(value)
+
+
+def _extract_payload_timestamp(payload: dict[str, T.Any] | None) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("as_of", "asof", "timestamp", "ts", "updated_at", "date", "time"):
+        candidate = payload.get(key)
+        text = _normalise_timestamp(candidate)
+        if text:
+            return text
+    return ""
+
+
+def _extract_factor_timestamp(payload: T.Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("as_of", "asof", "timestamp", "ts", "updated_at", "date", "time"):
+        candidate = payload.get(key)
+        text = _normalise_timestamp(candidate)
+        if text:
+            return text
+    raw_payload = payload.get("raw")
+    if isinstance(raw_payload, dict):
+        for key in ("as_of", "asof", "timestamp", "ts", "updated_at", "date", "time"):
+            candidate = raw_payload.get(key)
+            text = _normalise_timestamp(candidate)
+            if text:
+                return text
+    return ""
+
+
+def _friendly_timeline_label(key: str) -> str:
+    key = str(key or "").strip()
+    if not key or key == "__global__":
+        return "全局默认"
+    cfg = _resolve_timeline_config(key, key)
+    if cfg and cfg.get("label"):
+        return str(cfg.get("label"))
+    return key
+
+
+def _iter_timeline_payloads(
+    payload: dict[str, T.Any] | None,
+) -> list[tuple[str, dict[str, T.Any]]]:
+    results: list[tuple[str, dict[str, T.Any]]] = []
+    if not isinstance(payload, dict):
+        return results
+
+    results.append(("__global__", payload))
+
+    snapshots = payload.get("snapshots")
+    if isinstance(snapshots, dict):
+        for raw_key, snap_payload in snapshots.items():
+            if isinstance(snap_payload, dict):
+                results.append((str(raw_key), snap_payload))
+
+    return results
+
+
+def _summarise_factor_details(payload: T.Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+
+    extras: list[str] = []
+    for key, value in payload.items():
+        if key in {"z", "value", "median", "mad", "raw", "source", "__source__", "provider"}:
+            continue
+        text = _stringify_raw_payload(value)
+        if text:
+            extras.append(f"{key}={text}")
+
+    raw_payload = payload.get("raw")
+    if raw_payload and not extras:
+        extras.append(_stringify_raw_payload(raw_payload))
+
+    return "；".join(extras)
+
+
+def build_data_source_audit(
+    *, force_reload: bool = False
+) -> tuple[str, list[dict[str, str]], str]:
+    """组装用于原始数据校验表格的内容。"""
+
+    payloads = _load_dci_payloads(force_reload=force_reload)
+    timestamp = dt.datetime.now(US_EASTERN).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+    if not payloads:
+        status = f"尚未载入任何原始数据。｜刷新时间：{timestamp}"
+        return status, [], ""
+
+    rows: list[dict[str, str]] = []
+    symbol_count = 0
+    timeline_count = 0
+    source_set: set[str] = set()
+
+    for raw_symbol in sorted(payloads.keys()):
+        symbol_payload = payloads.get(raw_symbol)
+        if not isinstance(symbol_payload, dict):
+            continue
+
+        symbol = str(raw_symbol).upper()
+        symbol_count += 1
+
+        base_source = _resolve_payload_source(symbol_payload)
+        base_timestamp = _extract_payload_timestamp(symbol_payload)
+
+        for timeline_key, timeline_payload in _iter_timeline_payloads(symbol_payload):
+            if not isinstance(timeline_payload, dict):
+                continue
+
+            factors = timeline_payload.get("factors")
+            if not isinstance(factors, dict) or not factors:
+                continue
+
+            timeline_count += 1
+
+            timeline_label = _friendly_timeline_label(timeline_key)
+            timeline_source = _resolve_payload_source(timeline_payload)
+            timeline_timestamp = _extract_payload_timestamp(timeline_payload) or base_timestamp
+
+            for factor_name in sorted(factors.keys()):
+                factor_payload = factors.get(factor_name)
+                if factor_payload in {None, ""}:
+                    continue
+
+                if isinstance(factor_payload, dict):
+                    z_value = (
+                        _format_decimal(factor_payload.get("z"))
+                        if factor_payload.get("z") is not None
+                        else "—"
+                    )
+                    value_text = (
+                        _format_decimal(factor_payload.get("value"))
+                        if factor_payload.get("value") is not None
+                        else "—"
+                    )
+                    median_text = (
+                        _format_decimal(factor_payload.get("median"))
+                        if factor_payload.get("median") is not None
+                        else "—"
+                    )
+                    mad_text = (
+                        _format_decimal(factor_payload.get("mad"))
+                        if factor_payload.get("mad") is not None
+                        else "—"
+                    )
+                    raw_text = _stringify_raw_payload(
+                        factor_payload.get("raw")
+                        if factor_payload.get("raw") is not None
+                        else factor_payload.get("value")
+                    )
+                    as_of_text = (
+                        _extract_factor_timestamp(factor_payload)
+                        or timeline_timestamp
+                        or base_timestamp
+                    )
+                    details_text = _summarise_factor_details(factor_payload)
+                    source_text = _extract_factor_source(
+                        factor_payload,
+                        timeline_payload,
+                    )
+                else:
+                    z_value = "—"
+                    value_text = _stringify_raw_payload(factor_payload)
+                    median_text = "—"
+                    mad_text = "—"
+                    raw_text = value_text
+                    as_of_text = timeline_timestamp or base_timestamp
+                    details_text = ""
+                    source_text = timeline_source or base_source
+
+                if not source_text:
+                    source_text = timeline_source or base_source or ""
+
+                if source_text:
+                    source_set.add(source_text)
+
+                rows.append(
+                    {
+                        "symbol": symbol,
+                        "timeline": timeline_label,
+                        "timeline_key": "" if timeline_key == "__global__" else str(timeline_key),
+                        "factor": factor_name,
+                        "z": z_value,
+                        "value": value_text,
+                        "median": median_text,
+                        "mad": mad_text,
+                        "raw": raw_text,
+                        "as_of": as_of_text,
+                        "source": source_text,
+                        "details": details_text,
+                    }
+                )
+
+    factor_count = len(rows)
+    status = (
+        f"已载入 {symbol_count} 个标的、{timeline_count} 个时点，共 {factor_count} 条原始因子记录。"
+        f"｜刷新时间：{timestamp}"
+    )
+    summary = ""
+    if source_set:
+        summary = "数据来源：" + "、".join(sorted(source_set))
+
+    return status, rows, summary
 
 
 def _extract_timeline_payload(
@@ -1865,22 +2089,279 @@ def _compute_dci_for_symbols(
     return results, missing, errors, missing_detail_map
 
 
-def _check_resource_connections(ft_session: dict[str, T.Any] | None) -> list[dict[str, T.Any]]:
-    statuses: list[dict[str, T.Any]] = []
+def _stringify_json(value: T.Any, *, fallback: str = "", limit: int = 480) -> str:
+    """Serialize ``value`` into a readable JSON snippet."""
 
-    def add_status(name: str, parameter: str, ok: bool, detail: str) -> None:
-        statuses.append(
+    if value is None or value == "":
+        return fallback
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        except Exception:
+            text = str(value)
+    text = text.strip()
+    if not limit or len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _stringify_used_fields(value: T.Any, keys: tuple[str, ...]) -> str:
+    """Return JSON containing only ``keys`` from ``value`` when it is a mapping."""
+
+    if not isinstance(value, dict):
+        return _stringify_json(value)
+
+    filtered: dict[str, T.Any] = {}
+    for key in keys:
+        if key in value:
+            filtered[key] = value.get(key)
+
+    if not filtered:
+        return ""
+
+    return _stringify_json(filtered)
+
+
+def _coerce_text(value: T.Any) -> str:
+    """Return ``value`` as a human-friendly string."""
+
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _sample_nasdaq_rows(symbol: str) -> list[dict[str, str]]:
+    symbol = symbol.upper()
+    today = dt.date.today()
+    candidates = [today + dt.timedelta(days=offset) for offset in (-1, 0, 1)]
+    collected: list[dict[str, str]] = []
+    errors: list[str] = []
+
+    for date in candidates:
+        try:
+            rows = nasdaq.fetch_earnings(date, retries=0)
+        except Exception as exc:  # pragma: no cover - network errors
+            errors.append(f"{date.isoformat()}：{exc}")
+            continue
+
+        matching = [row for row in rows if str(row.get("symbol", "")).upper() == symbol]
+        target_rows = matching or rows[:3]
+        for entry in target_rows[:3]:
+            label = f"{entry.get('symbol', symbol)}｜{date.isoformat()}"
+            detail = _coerce_text(entry.get("time") or entry.get("company") or "")
+            raw_source = entry.get("raw") or entry
+            collected.append(
+                {
+                    "label": label,
+                    "detail": detail,
+                    "raw": _stringify_used_fields(
+                        raw_source,
+                        (
+                            "symbol",
+                            "company",
+                            "companyName",
+                            "companyTickerSymbol",
+                            "time",
+                            "Time",
+                            "EPSTime",
+                            "timeStatus",
+                            "when",
+                        ),
+                    ),
+                }
+            )
+        if matching:
+            break
+
+    if collected:
+        return collected
+
+    if errors:
+        return [{"label": "采样失败", "detail": "；".join(errors)[:240], "raw": ""}]
+
+    return [
+        {
+            "label": "无匹配样本",
+            "detail": f"未在近三天的日程中找到 {symbol} 的财报记录",
+            "raw": "",
+        }
+    ]
+
+
+def _sample_finnhub_rows(symbol: str) -> list[dict[str, str]]:
+    symbol = symbol.upper()
+    rows: list[dict[str, str]] = []
+
+    try:
+        quote = finnhub.fetch_quote(symbol)
+    except Exception as exc:  # pragma: no cover - network errors
+        rows.append({"label": f"{symbol} 行情", "detail": f"请求异常：{exc}", "raw": ""})
+    else:
+        if quote:
+            detail = f"现价 {quote.get('price')}｜昨收 {quote.get('prev_close')}"
+            rows.append(
+                {
+                    "label": f"{symbol} 行情",
+                    "detail": detail,
+                    "raw": _stringify_used_fields(
+                        quote,
+                        ("price", "prev_close", "timestamp"),
+                    ),
+                }
+            )
+        else:
+            rows.append({"label": f"{symbol} 行情", "detail": "返回空数据", "raw": ""})
+
+    try:
+        profile = finnhub.fetch_company_profile(symbol)
+    except Exception as exc:  # pragma: no cover - network errors
+        rows.append({"label": f"{symbol} 公司资料", "detail": f"请求异常：{exc}", "raw": ""})
+    else:
+        if profile:
+            name = profile.get("name") or profile.get("ticker") or symbol
+            sector = profile.get("sector") or profile.get("industry") or ""
+            detail = f"{name}｜{sector}".rstrip("｜")
+            rows.append(
+                {
+                    "label": f"{symbol} 公司资料",
+                    "detail": detail,
+                    "raw": _stringify_used_fields(
+                        profile,
+                        ("name", "sector", "industry", "exchange", "source", "last_updated"),
+                    ),
+                }
+            )
+        else:
+            rows.append({"label": f"{symbol} 公司资料", "detail": "返回空数据", "raw": ""})
+
+    return rows
+
+
+def _sample_openfigi_rows(symbol: str) -> list[dict[str, str]]:
+    symbol = symbol.upper()
+    try:
+        mappings = openfigi.map_ticker(symbol)
+    except Exception as exc:  # pragma: no cover - network errors
+        return [{"label": "映射请求", "detail": f"请求异常：{exc}", "raw": ""}]
+
+    if not mappings:
+        return [{"label": "映射请求", "detail": "返回空数据", "raw": ""}]
+
+    rows: list[dict[str, str]] = []
+    for entry in mappings[:3]:
+        figi = entry.get("figi") or ""
+        detail = f"FIGI {figi}" if figi else "缺少 FIGI"
+        raw = _stringify_used_fields(
+            entry,
+            ("ticker", "figi", "name", "securityType", "marketSector"),
+        )
+        rows.append({"label": f"{symbol} 映射", "detail": detail, "raw": raw})
+    return rows
+
+
+def _sample_fred_rows(series_id: str) -> list[dict[str, str]]:
+    try:
+        latest = fred.fetch_latest_observation(series_id)
+    except Exception as exc:  # pragma: no cover - network errors
+        return [{"label": series_id, "detail": f"请求异常：{exc}", "raw": ""}]
+
+    if not latest:
+        return [{"label": series_id, "detail": "返回空数据", "raw": ""}]
+
+    detail = f"{latest.get('date')} → {latest.get('value')}"
+    return [
+        {
+            "label": series_id,
+            "detail": detail,
+            "raw": _stringify_used_fields(latest, ("date", "value")),
+        }
+    ]
+
+
+def _sample_tv_rows(symbol: str, exchange: str) -> list[dict[str, str]]:
+    symbol = symbol.upper()
+    if not tv_data.is_available():
+        return [{"label": "会话状态", "detail": "tvDatafeed 未启用（缺少凭据或依赖）", "raw": ""}]
+
+    try:
+        data = tv_data.fetch_hist(symbol, exchange or "NASDAQ", n_bars=5)
+    except tv_data.TVDataError as exc:  # pragma: no cover - optional dependency errors
+        return [{"label": "行情拉取", "detail": str(exc), "raw": ""}]
+    except Exception as exc:  # pragma: no cover - defensive guard
+        return [{"label": "行情拉取", "detail": f"异常：{exc}", "raw": ""}]
+
+    if data is None or data.empty:
+        return [{"label": "行情拉取", "detail": "返回空数据", "raw": ""}]
+
+    rows: list[dict[str, str]] = []
+    sample = data.tail(3).reset_index()  # type: ignore[attr-defined]
+    records = sample.to_dict(orient="records")  # type: ignore[call-arg]
+    for idx, record in enumerate(records, start=1):
+        timestamp = ""
+        for key in ("datetime", "index", "time", "Date"):
+            if key in record:
+                timestamp = _coerce_text(record[key])
+                break
+        rows.append(
             {
-                "resource": name,
-                "parameter": parameter,
-                "ok": ok,
-                "detail": detail,
+                "label": f"最近数据 {idx}",
+                "detail": timestamp,
+                "raw": _stringify_used_fields(
+                    record,
+                    (
+                        "datetime",
+                        "index",
+                        "time",
+                        "Date",
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                        "volume",
+                    ),
+                ),
             }
         )
+    return rows
+
+
+def _check_resource_connections(
+    ft_session: dict[str, T.Any] | None,
+    *,
+    sample_symbol: str = "AAPL",
+) -> list[dict[str, T.Any]]:
+    rows: list[dict[str, T.Any]] = []
+    sample_symbol = (sample_symbol or "AAPL").upper()
+
+    def add_row(
+        path: list[str],
+        *,
+        parameter: str = "",
+        status: str = "",
+        detail: str = "",
+        raw: str = "",
+        ok: bool | None = None,
+    ) -> None:
+        entry: dict[str, T.Any] = {
+            "path": path,
+            "parameter": parameter,
+            "status": status,
+            "detail": detail,
+            "raw": raw,
+        }
+        if ok is not None:
+            entry["ok"] = ok
+        rows.append(entry)
 
     today_str = dt.date.today().isoformat()
 
-    def run_with_retry(checker: T.Callable[[], tuple[bool, str]], retries: int = 1) -> tuple[bool, str]:
+    def run_with_retry(
+        checker: T.Callable[[], tuple[bool, str]], retries: int = 1
+    ) -> tuple[bool, str]:
         attempts = retries + 1
         details: list[str] = []
         for attempt in range(attempts):
@@ -1897,60 +2378,110 @@ def _check_resource_connections(ft_session: dict[str, T.Any] | None) -> list[dic
             combined = f"{combined}{retry_note}" if combined else retry_note
         return False, combined
 
-    # Nasdaq earnings API
-    def _check_nasdaq_once() -> tuple[bool, str]:
-        return nasdaq.check_status(today_str)
+    def add_resource(
+        name: str,
+        parameter: str,
+        checker: T.Callable[[], tuple[bool, str]],
+        sample_provider: T.Callable[[], list[dict[str, str]]],
+    ) -> None:
+        ok, detail = run_with_retry(checker)
+        status_text = "正常" if ok else "异常"
+        add_row([name], parameter=parameter, status=status_text, detail=detail, ok=ok)
 
-    ok, detail = run_with_retry(_check_nasdaq_once)
-    add_status("Nasdaq 财报 API", "财报列表（代码/时间段）", ok, detail)
-
-    # Finnhub API
-    def _check_finnhub_once() -> tuple[bool, str]:
-        return finnhub.check_status("AAPL")
-
-    ok, detail = run_with_retry(_check_finnhub_once)
-    add_status("Finnhub API", "实时行情（现价/昨收）", ok, detail)
-
-    # OpenFIGI API
-    def _check_openfigi_once() -> tuple[bool, str]:
-        return openfigi.check_status("AAPL")
-
-    ok, detail = run_with_retry(_check_openfigi_once)
-    add_status("OpenFIGI API", "Ticker → FIGI 映射", ok, detail)
-
-    # FRED API
-    def _check_fred_once() -> tuple[bool, str]:
-        return fred.check_status("DGS3MO")
-
-    ok, detail = run_with_retry(_check_fred_once)
-    add_status("FRED API", "DGS3MO 系列（最新观测值）", ok, detail)
-
-    # TradingView tvDatafeed
-    def _check_tradingview_once() -> tuple[bool, str]:
-        if not tv_data.is_available():
-            return False, "tvDatafeed 未启用（缺少凭据或依赖）"
         try:
-            client = tv_data.ensure_client()
-        except tv_data.TVDataError as exc:  # pragma: no cover - network/login errors
-            return False, str(exc)
-        if client is None:
-            return False, "未能建立 tvDatafeed 会话"
-        return True, "凭据有效"
+            samples = sample_provider()
+        except Exception as exc:  # pragma: no cover - defensive guard
+            samples = [{"label": "采样异常", "detail": str(exc), "raw": ""}]
 
-    ok, detail = run_with_retry(_check_tradingview_once)
-    add_status("TradingView 数据源", "tvDatafeed 登录", ok, detail)
+        for sample in samples:
+            label = _coerce_text(sample.get("label") or "原始数据")
+            add_row(
+                [name, label],
+                parameter=_coerce_text(sample.get("parameter")),
+                status=_coerce_text(sample.get("status")),
+                detail=_coerce_text(sample.get("detail")),
+                raw=_coerce_text(sample.get("raw")),
+            )
 
-    # Firstrade session status
-    if isinstance(ft_session, dict) and ft_session:
-        sid = str(ft_session.get("sid", ""))
-        ok = bool(ft_session.get("sid"))
-        detail = f"已缓存会话 (sid {sid[:4]}...)" if ok else "会话信息不完整"
-    else:
-        ok = False
-        detail = "尚未登录或无会话信息"
-    add_status("Firstrade 会话", "周五期权筛选凭证", ok, detail)
+    add_resource(
+        "Nasdaq 财报 API",
+        "财报列表（代码/时间段）",
+        lambda: nasdaq.check_status(today_str),
+        lambda: _sample_nasdaq_rows(sample_symbol),
+    )
 
-    return statuses
+    add_resource(
+        "Finnhub API",
+        "实时行情（现价/昨收）",
+        lambda: finnhub.check_status(sample_symbol),
+        lambda: _sample_finnhub_rows(sample_symbol),
+    )
+
+    add_resource(
+        "OpenFIGI API",
+        "Ticker → FIGI 映射",
+        lambda: openfigi.check_status(sample_symbol),
+        lambda: _sample_openfigi_rows(sample_symbol),
+    )
+
+    add_resource(
+        "FRED API",
+        "DGS3MO 系列（最新观测值）",
+        lambda: fred.check_status("DGS3MO"),
+        lambda: _sample_fred_rows("DGS3MO"),
+    )
+
+    add_resource(
+        "TradingView 数据源",
+        "tvDatafeed 登录",
+        _build_tradingview_checker,
+        lambda: _sample_tv_rows(sample_symbol, TV_DEFAULT_EXCHANGE or "NASDAQ"),
+    )
+
+    ft_rows = firstrade.sample_session_rows(
+        ft_session,
+        formatter=_stringify_used_fields,
+    )
+    ft_ok = firstrade.has_valid_session(ft_session)
+    add_row(
+        ["Firstrade 会话"],
+        parameter="周五期权筛选凭证",
+        status="正常" if ft_ok else "异常",
+        detail="已缓存会话" if ft_ok else "尚未登录或无会话信息",
+        ok=ft_ok,
+    )
+    for sample in ft_rows:
+        add_row(
+            ["Firstrade 会话", _coerce_text(sample.get("label")) or "缓存会话"],
+            detail=_coerce_text(sample.get("detail")),
+            raw=_coerce_text(sample.get("raw")),
+        )
+
+    return rows
+
+
+def _build_tradingview_checker() -> tuple[bool, str]:
+    if not tv_data.is_available():
+        return False, "tvDatafeed 未启用（缺少凭据或依赖）"
+    try:
+        client = tv_data.ensure_client()
+    except tv_data.TVDataError as exc:  # pragma: no cover - network/login errors
+        return False, str(exc)
+    if client is None:
+        return False, "未能建立 tvDatafeed 会话"
+    return True, "凭据有效"
+
+
+def build_resource_connection_overview(
+    ft_session: dict[str, T.Any] | None,
+    *,
+    sample_symbol: str = "AAPL",
+) -> tuple[str, list[dict[str, T.Any]]]:
+    rows = _check_resource_connections(ft_session, sample_symbol=sample_symbol)
+    timestamp = dt.datetime.now(US_EASTERN).strftime("最后检查时间：%Y-%m-%d %H:%M:%S %Z")
+    if not rows:
+        return timestamp, []
+    return timestamp, rows
 
 
 def _format_decimal(value: T.Any, digits: int = 4) -> str:
@@ -2106,67 +2637,6 @@ def _build_preview_rows_for_symbol(
             )
 
     return rows
-
-
-def _render_connection_statuses(
-    statuses: list[dict[str, T.Any]], checked_at: str | None = None
-) -> T.Union[str, dbc.Table, html.Div]:
-    timestamp_block = None
-    if checked_at:
-        timestamp_block = html.Div(
-            f"最后检查时间：{checked_at}",
-            style={"marginBottom": "6px", "fontWeight": "bold"},
-        )
-
-    if not statuses:
-        message = html.Div("暂无连接状态信息。")
-        if timestamp_block:
-            return html.Div([timestamp_block, message])
-        return message
-
-    rows: list[html.Tr] = []
-    for entry in statuses:
-        ok = bool(entry.get("ok"))
-        badge = dbc.Badge(
-            "正常" if ok else "异常",
-            color="success" if ok else "danger",
-            pill=True,
-        )
-        rows.append(
-            html.Tr(
-                [
-                    html.Td(entry.get("resource", "")),
-                    html.Td(entry.get("parameter", "")),
-                    html.Td(badge),
-                    html.Td(entry.get("detail", "")),
-                ]
-            )
-        )
-
-    table = dbc.Table(
-        [
-            html.Thead(
-                html.Tr([
-                    html.Th("资源"),
-                    html.Th("参数"),
-                    html.Th("状态"),
-                    html.Th("详情"),
-                ])
-            ),
-            html.Tbody(rows),
-        ],
-        bordered=True,
-        hover=True,
-        responsive=True,
-        striped=True,
-        className="mt-2",
-    )
-    content: list[T.Any] = []
-    if timestamp_block:
-        content.append(timestamp_block)
-    content.append(table)
-
-    return html.Div(content)
 
 
 def _parse_prediction_date(value: T.Any) -> dt.date | None:
@@ -2718,6 +3188,16 @@ def _is_time_not_supplied(s: str) -> bool:
     return ("not" in lowered and "suppl" in lowered) or ("tbd" in lowered) or ("unconfirmed" in lowered) or (lowered == "")
 
 
+def _resolve_earnings_decision_date(
+    earnings_date: dt.date, time_label: str | None
+) -> dt.date:
+    """Derive the decision date for an earnings row based on its time slot."""
+
+    if _is_pre_market(time_label or ""):
+        return previous_trading_day(earnings_date)
+    return earnings_date
+
+
 def pick_by_times(rows: T.List[dict], want_after_hours=False, want_pre_market=False, want_not_supplied=False) -> T.List[dict]:
     out = []
     for r in rows:
@@ -2755,321 +3235,6 @@ def append_log(
     entry = f"[{stamp}] {label}{message}"
     _persist_log_entry(entry)
     return logs + [entry]
-# ---------- Firstrade (unofficial) ----------
-class FTClient:
-    LOGIN_URL = "https://api3x.firstrade.com/sess/login"
-    VERIFY_URL = "https://api3x.firstrade.com/sess/verify_pin"
-    OPTIONS_URL = "https://api3x.firstrade.com/public/oc"
-    OPTION_QUOTE_URL = "https://api3x.firstrade.com/market/quote/option"
-    OPTION_PREVIEW_URL = "https://api3x.firstrade.com/trade/options/preview"
-    OPTION_PLACE_URL = "https://api3x.firstrade.com/trade/options/place"
-    SESSION_HEADERS = {
-        "Accept-Encoding": "gzip",
-        "Connection": "Keep-Alive",
-        "User-Agent": "okhttp/4.9.2",
-        "access-token": "833w3XuIFycv18ybi",
-    }
-
-    def __init__(
-        self,
-        username: str,
-        password: str,
-        twofa_code: str | None = None,
-        session_state: dict[str, T.Any] | None = None,
-        login: bool = True,
-        logger: T.Optional[T.Callable[[str], None]] = None,
-    ):
-        self.username = username or ""
-        self.password = password or ""
-        self.twofa_code = (twofa_code or "").strip()
-        self.session: T.Optional[requests.Session] = None
-        self.enabled = False
-        self.error: str | None = None
-        self._login_json: dict[str, T.Any] | None = None
-        self.session_state: dict[str, T.Any] = {}
-        self._logger = logger
-        self.account_ids: list[str] = []
-        self._default_host = urlparse(self.LOGIN_URL).netloc
-
-        if session_state:
-            self._restore_session(session_state)
-        elif login:
-            self._init()
-
-    def _log(self, message: str) -> None:
-        if self._logger:
-            try:
-                self._logger(message)
-            except Exception:
-                pass
-
-    def _init(self) -> None:
-        try:
-            sess = requests.Session()
-            sess.headers.update(self.SESSION_HEADERS)
-            if self._default_host:
-                sess.headers["Host"] = self._default_host
-            self._log("正在初始化 Firstrade 会话并发送登录请求。")
-            login_resp = sess.post(
-                self.LOGIN_URL,
-                data={"username": self.username, "password": self.password},
-                timeout=20,
-            )
-            login_data = self._safe_json(login_resp)
-            self._login_json = login_data
-
-            if login_resp.status_code != 200:
-                detail = ""
-                if isinstance(login_data, dict):
-                    detail = str(login_data.get("message") or login_data.get("error") or "").strip()
-                self._log(f"Firstrade 登录出现 HTTP {login_resp.status_code}{f'（{detail}）' if detail else ''} 错误。")
-                self.error = f"登录 HTTP {login_resp.status_code}{f'（{detail}）' if detail else ''}"
-                return
-            if not isinstance(login_data, dict):
-                self._log("Firstrade 登录返回异常数据。")
-                self.error = "登录响应异常"
-                return
-
-            err_msg = str(login_data.get("error") or "").strip()
-            if err_msg:
-                self._log(f"Firstrade 登录返回错误：{err_msg}")
-                self.error = err_msg
-                return
-
-            sid = login_data.get("sid")
-            ftat = login_data.get("ftat")
-            t_token = login_data.get("t_token")
-            verification_sid = login_data.get("verificationSid")
-            requires_mfa = bool(login_data.get("mfa"))
-
-            if sid:
-                sess.headers["sid"] = sid
-                self._log("已从 Firstrade 登录响应中获取会话 ID。")
-
-            if requires_mfa:
-                self._log("Firstrade 登录需要多重验证。")
-                if not self.twofa_code:
-                    self.error = "Firstrade 登录需要输入双重验证码（短信或动态口令）。"
-                    return
-
-                verify_payload: dict[str, T.Any] = {
-                    "remember_for": "30",
-                }
-                if t_token:
-                    verify_payload["t_token"] = t_token
-
-                # SMS/email style MFA exposes verificationSid; authenticator-only accounts do not.
-                code = self.twofa_code
-                if verification_sid:
-                    sess.headers["sid"] = verification_sid
-                    self._log("使用验证 SID 进行一次性验证码校验。")
-                    verify_payload["verificationSid"] = verification_sid
-                    verify_payload["otpCode"] = code
-                else:
-                    self._log("提交认证器验证码进行校验。")
-                    verify_payload["mfaCode"] = code
-
-                verify_resp = sess.post(self.VERIFY_URL, data=verify_payload, timeout=20)
-                verify_data = self._safe_json(verify_resp)
-                if verify_resp.status_code != 200:
-                    detail = ""
-                    if isinstance(verify_data, dict):
-                        detail = str(verify_data.get("message") or verify_data.get("error") or "").strip()
-                    self._log(
-                        f"Firstrade 多重验证失败，HTTP {verify_resp.status_code}{f'（{detail}）' if detail else ''}。"
-                    )
-                    self.error = f"双重验证 HTTP {verify_resp.status_code}{f'（{detail}）' if detail else ''}"
-                    return
-                if not isinstance(verify_data, dict):
-                    self._log("Firstrade 多重验证返回异常数据。")
-                    self.error = "双重验证响应异常"
-                    return
-                err_msg = str(verify_data.get("error") or "").strip()
-                if err_msg:
-                    self._log(f"Firstrade 多重验证报错：{err_msg}")
-                    self.error = err_msg
-                    return
-                ftat = verify_data.get("ftat", ftat)
-                sid = verify_data.get("sid") or verify_data.get("verificationSid") or verification_sid or sid
-
-            if ftat:
-                sess.headers["ftat"] = ftat
-            if sid:
-                sess.headers["sid"] = sid
-
-            self.session = sess
-            self.enabled = bool(ftat and sid)
-            if self.enabled:
-                self._update_accounts(login_data)
-                self.session_state = {
-                    "ftat": ftat,
-                    "sid": sid,
-                    "timestamp": time.time(),
-                    "accounts": list(self.account_ids),
-                }
-                self._log("Firstrade 会话建立成功。")
-            if not self.enabled and not self.error:
-                self._log("Firstrade 会话缺少 SID/FTAT。")
-                self.error = "Firstrade 会话缺少 SID/FTAT"
-        except Exception as exc:
-            self._log(f"Firstrade 登录出现意外错误：{exc}")
-            self.error = str(exc)
-            return
-
-    def _restore_session(self, session_state: dict[str, T.Any]) -> None:
-        ftat = session_state.get("ftat")
-        sid = session_state.get("sid")
-        if not ftat or not sid:
-            self._log("无法恢复 Firstrade 会话：缺少 SID/FTAT。")
-            self.error = "缺少会话令牌"
-            self.enabled = False
-            self.session_state = {}
-            return
-
-        sess = requests.Session()
-        sess.headers.update(self.SESSION_HEADERS)
-        host = urlparse(self.LOGIN_URL).netloc or self._default_host
-        if host:
-            sess.headers["Host"] = host
-        sess.headers["ftat"] = ftat
-        sess.headers["sid"] = sid
-        self.session = sess
-        self.enabled = True
-        self.error = None
-        self.session_state = {
-            "ftat": ftat,
-            "sid": sid,
-            "timestamp": session_state.get("timestamp", time.time()),
-            "accounts": list(session_state.get("accounts") or []),
-        }
-        self.account_ids = [
-            str(a).strip()
-            for a in session_state.get("accounts", [])
-            if isinstance(a, str) and str(a).strip()
-        ]
-        self._log("已通过缓存令牌恢复 Firstrade 会话。")
-
-    @staticmethod
-    def _safe_json(resp: requests.Response) -> T.Any:
-        try:
-            return resp.json()
-        except Exception:
-            return None
-
-    def export_session_state(self) -> dict[str, T.Any]:
-        state = dict(self.session_state)
-        if self.account_ids:
-            state.setdefault("accounts", list(self.account_ids))
-        return state
-
-    def _update_accounts(self, payload: dict[str, T.Any] | None) -> None:
-        if not isinstance(payload, dict):
-            return
-        accounts: list[str] = []
-
-        def add(value: T.Any) -> None:
-            if value is None:
-                return
-            text = str(value).strip()
-            if text and text not in accounts:
-                accounts.append(text)
-
-        candidate_keys = [
-            "accounts",
-            "accountList",
-            "acctList",
-            "account_list",
-            "acctNoList",
-            "data",
-        ]
-        for key in candidate_keys:
-            items = payload.get(key)
-            if isinstance(items, list):
-                for item in items:
-                    if isinstance(item, dict):
-                        add(item.get("account"))
-                        add(item.get("acctNo"))
-                        add(item.get("accountNumber"))
-                    else:
-                        add(item)
-
-        for key in ("account", "acctNo", "accountNumber", "primaryAccount"):
-            add(payload.get(key))
-
-        if accounts:
-            self.account_ids = accounts
-
-    def has_weekly_expiring_on(
-        self, symbol: str, expiry: dt.date
-    ) -> tuple[T.Optional[bool], T.Optional[str], bool]:
-        """Check whether a symbol lists the target Friday contract in Firstrade.
-
-        Returns a tuple ``(has_weekly, expiry_type, matched)`` where:
-
-        - ``has_weekly`` is ``True`` if a weekly option matches the target expiry,
-          ``False`` if a non-weekly contract matches, and ``None`` when the lookup
-          fails.
-        - ``expiry_type`` surfaces the matched ``exp_type`` (such as ``"W"`` or
-          ``"M"``) when available.
-        - ``matched`` indicates whether Firstrade reported a contract for the
-          target expiry regardless of the option type.
-        """
-
-        if not self.enabled or not self.session:
-            return None, None, False
-
-        try:
-            self._log(f"正在请求 {symbol.upper()} 的周度期权到期日。")
-            resp = self.session.get(
-                self.OPTIONS_URL,
-                params={"m": "get_exp_dates", "root_symbol": symbol.upper()},
-                timeout=20,
-            )
-            data = self._safe_json(resp)
-            if resp.status_code == 401:
-                self.enabled = False
-                self.error = "Firstrade 会话已过期"
-                self._log("查询期权时 Firstrade 会话已过期（HTTP 401）。")
-                return None, None, False
-            if resp.status_code != 200 or not isinstance(data, dict):
-                self._log(f"查询 {symbol.upper()} 的期权失败，HTTP {resp.status_code}。")
-                return None, None, False
-            err_msg = str(data.get("error") or "").strip()
-            if err_msg:
-                self._log(f"查询 {symbol.upper()} 的期权返回错误：{err_msg}")
-                return None, None, False
-            items = data.get("items")
-            if not isinstance(items, list):
-                return None, None, False
-
-            target = expiry.strftime("%Y%m%d")
-            for entry in items:
-                if not isinstance(entry, dict):
-                    continue
-                exp_date = str(entry.get("exp_date", "")).strip()
-                if exp_date != target:
-                    continue
-                exp_type = str(entry.get("exp_type", "")).upper()
-                # exp_type "W" => weekly, "M" => monthly, other codes possible
-                if exp_type == "W":
-                    self._log(
-                        f"找到 {symbol.upper()} 在 {target} 的到期日 {exp_date}（类型 {exp_type}）。"
-                    )
-                    return True, exp_type, True
-                self._log(
-                    f"找到 {symbol.upper()} 在 {target} 的到期日 {exp_date}（类型 {exp_type}，非周度期权）。"
-                )
-                return False, exp_type or None, True
-            self._log(f"未找到 {symbol.upper()} 在 {target} 的匹配到期日。")
-            return False, None, False
-        except Exception:
-            self._log(f"获取 {symbol.upper()} 期权到期日时出现异常。")
-            return None, None, False
-
-
-
-
-
 def _prepare_earnings_dataset(
     target_date: dt.date,
     session_state: dict[str, T.Any] | None,
@@ -3106,12 +3271,12 @@ def _prepare_earnings_dataset(
         f"{target_date.strftime('%Y-%m-%d')} 财报列表共 {len(base_rows)} 条，准备执行 Firstrade 筛选。"
     )
 
-    has_session = _has_valid_ft_session(session_payload)
-    ft_client: FTClient | None = None
+    has_session = firstrade.has_valid_session(session_payload)
+    ft_client: firstrade.FTClient | None = None
     session_out: dict[str, T.Any] | None = None
 
     if has_session or (username and password):
-        ft_client = FTClient(
+        ft_client = firstrade.FTClient(
             username,
             password,
             twofa,
@@ -3239,12 +3404,14 @@ def _prepare_earnings_dataset(
         symbol = str(entry.get("symbol") or "").upper()
         if not symbol:
             continue
+        time_label = entry.get("time") or ""
+        decision_date = _resolve_earnings_decision_date(target_date, time_label)
         row = {
             "symbol": symbol,
             "company": entry.get("company") or "",
-            "time": entry.get("time") or "",
-            "bucket": _describe_time_bucket(entry.get("time")),
-            "decision_date": target_date.isoformat(),
+            "time": time_label,
+            "bucket": _describe_time_bucket(time_label),
+            "decision_date": decision_date.isoformat(),
             "timeline_date": target_date.isoformat(),
         }
         note = option_notes.get(symbol)
@@ -3276,7 +3443,7 @@ def start_run_logic(
     trigger = ctx.triggered_id
     session_state = session_data if isinstance(session_data, dict) else {}
     initial_logs = log_state if isinstance(log_state, list) else []
-    logged_in = _has_valid_ft_session(session_state)
+    logged_in = firstrade.has_valid_session(session_state)
     manual_refresh = trigger == "earnings-refresh-btn"
     login_trigger = trigger == "ft-session-store"
     if trigger == "auto-run-trigger":
@@ -3546,7 +3713,7 @@ def update_predictions_logic(
         )
 
     session_data = session_state if isinstance(session_state, dict) else {}
-    logged_in = _has_valid_ft_session(session_data)
+    logged_in = firstrade.has_valid_session(session_data)
     username = (username or "").strip()
     password = (password or "").strip()
     twofa = (twofa or "").strip()

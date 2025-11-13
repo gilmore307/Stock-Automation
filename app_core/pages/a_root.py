@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -9,8 +10,8 @@ import dash_bootstrap_components as dbc
 from dash import Dash, Input, Output, State, dcc, html, no_update
 
 from .. import core
+from ..data.firstrade import FTClient, has_valid_session
 from .b_connections import build_layout as build_connections_tab
-from .c_overview import build_layout as build_overview_tab
 from .d_earnings import build_layout as build_earnings_tab
 from .e_tasks import build_layout as build_tasks_tab
 from .f_predictions import build_layout as build_predictions_tab
@@ -189,6 +190,7 @@ def build_layout(config: LayoutConfig) -> html.Div:
                 n_intervals=0,
                 disabled=True,
             ),
+            dcc.Interval(id="navbar-clock", interval=60000, n_intervals=0),
             html.Div(
                 build_login_panel(config),
                 id="login-shell",
@@ -198,12 +200,17 @@ def build_layout(config: LayoutConfig) -> html.Div:
                     dbc.Navbar(
                         dbc.Container(
                             [
-                                dbc.NavbarBrand(config.navbar_title),
+                                dbc.NavbarBrand(config.navbar_title, className="me-2"),
+                                html.Span(
+                                    "美东时间同步中…",
+                                    id="navbar-clock-display",
+                                    className="navbar-text ms-auto text-white",
+                                ),
                                 dbc.Button(
                                     "查看日志",
                                     id="show-log-btn",
                                     color="primary",
-                                    className="ms-auto",
+                                    className="ms-3",
                                 ),
                             ],
                             fluid=True,
@@ -216,19 +223,8 @@ def build_layout(config: LayoutConfig) -> html.Div:
                     dcc.Tabs(
                         [
                             dcc.Tab(
-                                label="数据与预测预览",
-                                children=[
-                                    html.Div(
-                                        [
-                                            html.Div(
-                                                build_connections_tab(config),
-                                                className="mb-4",
-                                            ),
-                                            html.Div(build_overview_tab(config)),
-                                        ],
-                                        className="p-3",
-                                    )
-                                ],
+                                label="数据源校验",
+                                children=[html.Div(build_connections_tab(config), className="p-3")],
                             ),
                             dcc.Tab(label="任务中心", children=[build_tasks_tab(config)]),
                             dcc.Tab(label="财报日程", children=[build_earnings_tab(config)]),
@@ -297,7 +293,7 @@ def register_callbacks(app: Dash) -> None:
             return no_update, "Firstrade 登录失败：请填写用户名和密码。", logs
 
         log("正在尝试登录 Firstrade……")
-        ft = core.FTClient(
+        ft = FTClient(
             username=username,
             password=password,
             twofa_code=twofa if twofa else None,
@@ -322,7 +318,7 @@ def register_callbacks(app: Dash) -> None:
         Input("ft-session-store", "data"),
     )
     def _toggle_gate(session_state):
-        logged_in = bool(session_state and isinstance(session_state, dict) and session_state.get("sid"))
+        logged_in = has_valid_session(session_state)
         if logged_in:
             login_style = {"display": "none"}
             app_style = {}
@@ -371,3 +367,11 @@ def register_callbacks(app: Dash) -> None:
         Input("log-output", "children"),
         prevent_initial_call=True,
     )
+
+    @app.callback(
+        Output("navbar-clock-display", "children"),
+        Input("navbar-clock", "n_intervals"),
+    )
+    def _update_navbar_clock(_):
+        now = dt.datetime.now(core.US_EASTERN)
+        return now.strftime("美东时间 %Y-%m-%d %H:%M:%S")
