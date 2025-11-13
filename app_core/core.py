@@ -2099,22 +2099,218 @@ def _compute_dci_for_symbols(
     return results, missing, errors, missing_detail_map
 
 
-def _check_resource_connections(ft_session: dict[str, T.Any] | None) -> list[dict[str, T.Any]]:
-    statuses: list[dict[str, T.Any]] = []
+def _stringify_json(value: T.Any, *, fallback: str = "", limit: int = 480) -> str:
+    """Serialize ``value`` into a readable JSON snippet."""
 
-    def add_status(name: str, parameter: str, ok: bool, detail: str) -> None:
-        statuses.append(
+    if value in {None, ""}:
+        return fallback
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        except Exception:
+            text = str(value)
+    text = text.strip()
+    if not limit or len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _coerce_text(value: T.Any) -> str:
+    """Return ``value`` as a human-friendly string."""
+
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _sample_nasdaq_rows(symbol: str) -> list[dict[str, str]]:
+    symbol = symbol.upper()
+    today = dt.date.today()
+    candidates = [today + dt.timedelta(days=offset) for offset in (-1, 0, 1)]
+    collected: list[dict[str, str]] = []
+    errors: list[str] = []
+
+    for date in candidates:
+        try:
+            rows = nasdaq.fetch_earnings(date, retries=0)
+        except Exception as exc:  # pragma: no cover - network errors
+            errors.append(f"{date.isoformat()}：{exc}")
+            continue
+
+        matching = [row for row in rows if str(row.get("symbol", "")).upper() == symbol]
+        target_rows = matching or rows[:3]
+        for entry in target_rows[:3]:
+            label = f"{entry.get('symbol', symbol)}｜{date.isoformat()}"
+            detail = _coerce_text(entry.get("time") or entry.get("company") or "")
+            raw_source = entry.get("raw") or entry
+            collected.append(
+                {
+                    "label": label,
+                    "detail": detail,
+                    "raw": _stringify_json(raw_source),
+                }
+            )
+        if matching:
+            break
+
+    if collected:
+        return collected
+
+    if errors:
+        return [{"label": "采样失败", "detail": "；".join(errors)[:240], "raw": ""}]
+
+    return [
+        {
+            "label": "无匹配样本",
+            "detail": f"未在近三天的日程中找到 {symbol} 的财报记录",
+            "raw": "",
+        }
+    ]
+
+
+def _sample_finnhub_rows(symbol: str) -> list[dict[str, str]]:
+    symbol = symbol.upper()
+    rows: list[dict[str, str]] = []
+
+    try:
+        quote = finnhub.fetch_quote(symbol)
+    except Exception as exc:  # pragma: no cover - network errors
+        rows.append({"label": f"{symbol} 行情", "detail": f"请求异常：{exc}", "raw": ""})
+    else:
+        if quote:
+            detail = f"现价 {quote.get('price')}｜昨收 {quote.get('prev_close')}"
+            rows.append({"label": f"{symbol} 行情", "detail": detail, "raw": _stringify_json(quote)})
+        else:
+            rows.append({"label": f"{symbol} 行情", "detail": "返回空数据", "raw": ""})
+
+    try:
+        profile = finnhub.fetch_company_profile(symbol)
+    except Exception as exc:  # pragma: no cover - network errors
+        rows.append({"label": f"{symbol} 公司资料", "detail": f"请求异常：{exc}", "raw": ""})
+    else:
+        if profile:
+            name = profile.get("name") or profile.get("ticker") or symbol
+            sector = profile.get("sector") or profile.get("industry") or ""
+            detail = f"{name}｜{sector}".rstrip("｜")
+            rows.append({"label": f"{symbol} 公司资料", "detail": detail, "raw": _stringify_json(profile)})
+        else:
+            rows.append({"label": f"{symbol} 公司资料", "detail": "返回空数据", "raw": ""})
+
+    return rows
+
+
+def _sample_openfigi_rows(symbol: str) -> list[dict[str, str]]:
+    symbol = symbol.upper()
+    try:
+        mappings = openfigi.map_ticker(symbol)
+    except Exception as exc:  # pragma: no cover - network errors
+        return [{"label": "映射请求", "detail": f"请求异常：{exc}", "raw": ""}]
+
+    if not mappings:
+        return [{"label": "映射请求", "detail": "返回空数据", "raw": ""}]
+
+    rows: list[dict[str, str]] = []
+    for entry in mappings[:3]:
+        figi = entry.get("figi") or ""
+        detail = f"FIGI {figi}" if figi else "缺少 FIGI"
+        raw = _stringify_json(entry)
+        rows.append({"label": f"{symbol} 映射", "detail": detail, "raw": raw})
+    return rows
+
+
+def _sample_fred_rows(series_id: str) -> list[dict[str, str]]:
+    try:
+        latest = fred.fetch_latest_observation(series_id)
+    except Exception as exc:  # pragma: no cover - network errors
+        return [{"label": series_id, "detail": f"请求异常：{exc}", "raw": ""}]
+
+    if not latest:
+        return [{"label": series_id, "detail": "返回空数据", "raw": ""}]
+
+    detail = f"{latest.get('date')} → {latest.get('value')}"
+    return [{"label": series_id, "detail": detail, "raw": _stringify_json(latest)}]
+
+
+def _sample_tv_rows(symbol: str, exchange: str) -> list[dict[str, str]]:
+    symbol = symbol.upper()
+    if not tv_data.is_available():
+        return [{"label": "会话状态", "detail": "tvDatafeed 未启用（缺少凭据或依赖）", "raw": ""}]
+
+    try:
+        data = tv_data.fetch_hist(symbol, exchange or "NASDAQ", n_bars=5)
+    except tv_data.TVDataError as exc:  # pragma: no cover - optional dependency errors
+        return [{"label": "行情拉取", "detail": str(exc), "raw": ""}]
+    except Exception as exc:  # pragma: no cover - defensive guard
+        return [{"label": "行情拉取", "detail": f"异常：{exc}", "raw": ""}]
+
+    if data is None or data.empty:
+        return [{"label": "行情拉取", "detail": "返回空数据", "raw": ""}]
+
+    rows: list[dict[str, str]] = []
+    sample = data.tail(3).reset_index()  # type: ignore[attr-defined]
+    records = sample.to_dict(orient="records")  # type: ignore[call-arg]
+    for idx, record in enumerate(records, start=1):
+        timestamp = ""
+        for key in ("datetime", "index", "time", "Date"):
+            if key in record:
+                timestamp = _coerce_text(record[key])
+                break
+        rows.append(
             {
-                "resource": name,
-                "parameter": parameter,
-                "ok": ok,
-                "detail": detail,
+                "label": f"最近数据 {idx}",
+                "detail": timestamp,
+                "raw": _stringify_json(record),
             }
         )
+    return rows
+
+
+def _sample_ft_session_rows(ft_session: dict[str, T.Any] | None) -> list[dict[str, str]]:
+    if not isinstance(ft_session, dict) or not ft_session:
+        return [{"label": "缓存会话", "detail": "尚未登录或无会话信息", "raw": ""}]
+
+    keys = ", ".join(sorted(map(str, ft_session.keys())))
+    detail = f"字段：{keys}" if keys else "会话字段为空"
+    return [{"label": "缓存会话", "detail": detail, "raw": _stringify_json(ft_session)}]
+
+
+def _check_resource_connections(
+    ft_session: dict[str, T.Any] | None,
+    *,
+    sample_symbol: str = "AAPL",
+) -> list[dict[str, T.Any]]:
+    rows: list[dict[str, T.Any]] = []
+    sample_symbol = (sample_symbol or "AAPL").upper()
+
+    def add_row(
+        path: list[str],
+        *,
+        parameter: str = "",
+        status: str = "",
+        detail: str = "",
+        raw: str = "",
+        ok: bool | None = None,
+    ) -> None:
+        entry: dict[str, T.Any] = {
+            "path": path,
+            "parameter": parameter,
+            "status": status,
+            "detail": detail,
+            "raw": raw,
+        }
+        if ok is not None:
+            entry["ok"] = ok
+        rows.append(entry)
 
     today_str = dt.date.today().isoformat()
 
-    def run_with_retry(checker: T.Callable[[], tuple[bool, str]], retries: int = 1) -> tuple[bool, str]:
+    def run_with_retry(
+        checker: T.Callable[[], tuple[bool, str]], retries: int = 1
+    ) -> tuple[bool, str]:
         attempts = retries + 1
         details: list[str] = []
         for attempt in range(attempts):
@@ -2131,60 +2327,107 @@ def _check_resource_connections(ft_session: dict[str, T.Any] | None) -> list[dic
             combined = f"{combined}{retry_note}" if combined else retry_note
         return False, combined
 
-    # Nasdaq earnings API
-    def _check_nasdaq_once() -> tuple[bool, str]:
-        return nasdaq.check_status(today_str)
+    def add_resource(
+        name: str,
+        parameter: str,
+        checker: T.Callable[[], tuple[bool, str]],
+        sample_provider: T.Callable[[], list[dict[str, str]]],
+    ) -> None:
+        ok, detail = run_with_retry(checker)
+        status_text = "正常" if ok else "异常"
+        add_row([name], parameter=parameter, status=status_text, detail=detail, ok=ok)
 
-    ok, detail = run_with_retry(_check_nasdaq_once)
-    add_status("Nasdaq 财报 API", "财报列表（代码/时间段）", ok, detail)
-
-    # Finnhub API
-    def _check_finnhub_once() -> tuple[bool, str]:
-        return finnhub.check_status("AAPL")
-
-    ok, detail = run_with_retry(_check_finnhub_once)
-    add_status("Finnhub API", "实时行情（现价/昨收）", ok, detail)
-
-    # OpenFIGI API
-    def _check_openfigi_once() -> tuple[bool, str]:
-        return openfigi.check_status("AAPL")
-
-    ok, detail = run_with_retry(_check_openfigi_once)
-    add_status("OpenFIGI API", "Ticker → FIGI 映射", ok, detail)
-
-    # FRED API
-    def _check_fred_once() -> tuple[bool, str]:
-        return fred.check_status("DGS3MO")
-
-    ok, detail = run_with_retry(_check_fred_once)
-    add_status("FRED API", "DGS3MO 系列（最新观测值）", ok, detail)
-
-    # TradingView tvDatafeed
-    def _check_tradingview_once() -> tuple[bool, str]:
-        if not tv_data.is_available():
-            return False, "tvDatafeed 未启用（缺少凭据或依赖）"
         try:
-            client = tv_data.ensure_client()
-        except tv_data.TVDataError as exc:  # pragma: no cover - network/login errors
-            return False, str(exc)
-        if client is None:
-            return False, "未能建立 tvDatafeed 会话"
-        return True, "凭据有效"
+            samples = sample_provider()
+        except Exception as exc:  # pragma: no cover - defensive guard
+            samples = [{"label": "采样异常", "detail": str(exc), "raw": ""}]
 
-    ok, detail = run_with_retry(_check_tradingview_once)
-    add_status("TradingView 数据源", "tvDatafeed 登录", ok, detail)
+        for sample in samples:
+            label = _coerce_text(sample.get("label") or "原始数据")
+            add_row(
+                [name, label],
+                parameter=_coerce_text(sample.get("parameter")),
+                status=_coerce_text(sample.get("status")),
+                detail=_coerce_text(sample.get("detail")),
+                raw=_coerce_text(sample.get("raw")),
+            )
 
-    # Firstrade session status
-    if isinstance(ft_session, dict) and ft_session:
-        sid = str(ft_session.get("sid", ""))
-        ok = bool(ft_session.get("sid"))
-        detail = f"已缓存会话 (sid {sid[:4]}...)" if ok else "会话信息不完整"
-    else:
-        ok = False
-        detail = "尚未登录或无会话信息"
-    add_status("Firstrade 会话", "周五期权筛选凭证", ok, detail)
+    add_resource(
+        "Nasdaq 财报 API",
+        "财报列表（代码/时间段）",
+        lambda: nasdaq.check_status(today_str),
+        lambda: _sample_nasdaq_rows(sample_symbol),
+    )
 
-    return statuses
+    add_resource(
+        "Finnhub API",
+        "实时行情（现价/昨收）",
+        lambda: finnhub.check_status(sample_symbol),
+        lambda: _sample_finnhub_rows(sample_symbol),
+    )
+
+    add_resource(
+        "OpenFIGI API",
+        "Ticker → FIGI 映射",
+        lambda: openfigi.check_status(sample_symbol),
+        lambda: _sample_openfigi_rows(sample_symbol),
+    )
+
+    add_resource(
+        "FRED API",
+        "DGS3MO 系列（最新观测值）",
+        lambda: fred.check_status("DGS3MO"),
+        lambda: _sample_fred_rows("DGS3MO"),
+    )
+
+    add_resource(
+        "TradingView 数据源",
+        "tvDatafeed 登录",
+        _build_tradingview_checker,
+        lambda: _sample_tv_rows(sample_symbol, TV_DEFAULT_EXCHANGE or "NASDAQ"),
+    )
+
+    ft_rows = _sample_ft_session_rows(ft_session)
+    ft_ok = bool(isinstance(ft_session, dict) and ft_session.get("sid"))
+    add_row(
+        ["Firstrade 会话"],
+        parameter="周五期权筛选凭证",
+        status="正常" if ft_ok else "异常",
+        detail="已缓存会话" if ft_ok else "尚未登录或无会话信息",
+        ok=ft_ok,
+    )
+    for sample in ft_rows:
+        add_row(
+            ["Firstrade 会话", _coerce_text(sample.get("label")) or "缓存会话"],
+            detail=_coerce_text(sample.get("detail")),
+            raw=_coerce_text(sample.get("raw")),
+        )
+
+    return rows
+
+
+def _build_tradingview_checker() -> tuple[bool, str]:
+    if not tv_data.is_available():
+        return False, "tvDatafeed 未启用（缺少凭据或依赖）"
+    try:
+        client = tv_data.ensure_client()
+    except tv_data.TVDataError as exc:  # pragma: no cover - network/login errors
+        return False, str(exc)
+    if client is None:
+        return False, "未能建立 tvDatafeed 会话"
+    return True, "凭据有效"
+
+
+def build_resource_connection_overview(
+    ft_session: dict[str, T.Any] | None,
+    *,
+    sample_symbol: str = "AAPL",
+) -> tuple[str, list[dict[str, T.Any]]]:
+    rows = _check_resource_connections(ft_session, sample_symbol=sample_symbol)
+    timestamp = dt.datetime.now(US_EASTERN).strftime("最后检查时间：%Y-%m-%d %H:%M:%S %Z")
+    if not rows:
+        return timestamp, []
+    return timestamp, rows
 
 
 def _format_decimal(value: T.Any, digits: int = 4) -> str:
@@ -2340,67 +2583,6 @@ def _build_preview_rows_for_symbol(
             )
 
     return rows
-
-
-def _render_connection_statuses(
-    statuses: list[dict[str, T.Any]], checked_at: str | None = None
-) -> T.Union[str, dbc.Table, html.Div]:
-    timestamp_block = None
-    if checked_at:
-        timestamp_block = html.Div(
-            f"最后检查时间：{checked_at}",
-            style={"marginBottom": "6px", "fontWeight": "bold"},
-        )
-
-    if not statuses:
-        message = html.Div("暂无连接状态信息。")
-        if timestamp_block:
-            return html.Div([timestamp_block, message])
-        return message
-
-    rows: list[html.Tr] = []
-    for entry in statuses:
-        ok = bool(entry.get("ok"))
-        badge = dbc.Badge(
-            "正常" if ok else "异常",
-            color="success" if ok else "danger",
-            pill=True,
-        )
-        rows.append(
-            html.Tr(
-                [
-                    html.Td(entry.get("resource", "")),
-                    html.Td(entry.get("parameter", "")),
-                    html.Td(badge),
-                    html.Td(entry.get("detail", "")),
-                ]
-            )
-        )
-
-    table = dbc.Table(
-        [
-            html.Thead(
-                html.Tr([
-                    html.Th("资源"),
-                    html.Th("参数"),
-                    html.Th("状态"),
-                    html.Th("详情"),
-                ])
-            ),
-            html.Tbody(rows),
-        ],
-        bordered=True,
-        hover=True,
-        responsive=True,
-        striped=True,
-        className="mt-2",
-    )
-    content: list[T.Any] = []
-    if timestamp_block:
-        content.append(timestamp_block)
-    content.append(table)
-
-    return html.Div(content)
 
 
 def _parse_prediction_date(value: T.Any) -> dt.date | None:

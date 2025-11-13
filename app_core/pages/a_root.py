@@ -11,7 +11,6 @@ from dash import Dash, Input, Output, State, dcc, html, no_update
 
 from .. import core
 from .b_connections import build_layout as build_connections_tab
-from .c_overview import build_layout as build_overview_tab
 from .d_earnings import build_layout as build_earnings_tab
 from .e_tasks import build_layout as build_tasks_tab
 from .f_predictions import build_layout as build_predictions_tab
@@ -224,18 +223,7 @@ def build_layout(config: LayoutConfig) -> html.Div:
                         [
                             dcc.Tab(
                                 label="数据源校验",
-                                children=[
-                                    html.Div(
-                                        [
-                                            html.Div(
-                                                build_connections_tab(config),
-                                                className="mb-4",
-                                            ),
-                                            html.Div(build_overview_tab(config)),
-                                        ],
-                                        className="p-3",
-                                    )
-                                ],
+                                children=[html.Div(build_connections_tab(config), className="p-3")],
                             ),
                             dcc.Tab(label="任务中心", children=[build_tasks_tab(config)]),
                             dcc.Tab(label="财报日程", children=[build_earnings_tab(config)]),
