@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -189,6 +190,7 @@ def build_layout(config: LayoutConfig) -> html.Div:
                 n_intervals=0,
                 disabled=True,
             ),
+            dcc.Interval(id="navbar-clock", interval=60000, n_intervals=0),
             html.Div(
                 build_login_panel(config),
                 id="login-shell",
@@ -198,12 +200,17 @@ def build_layout(config: LayoutConfig) -> html.Div:
                     dbc.Navbar(
                         dbc.Container(
                             [
-                                dbc.NavbarBrand(config.navbar_title),
+                                dbc.NavbarBrand(config.navbar_title, className="me-2"),
+                                dbc.NavbarText(
+                                    "美东时间同步中…",
+                                    id="navbar-clock-display",
+                                    className="ms-auto text-white",
+                                ),
                                 dbc.Button(
                                     "查看日志",
                                     id="show-log-btn",
                                     color="primary",
-                                    className="ms-auto",
+                                    className="ms-3",
                                 ),
                             ],
                             fluid=True,
@@ -371,3 +378,11 @@ def register_callbacks(app: Dash) -> None:
         Input("log-output", "children"),
         prevent_initial_call=True,
     )
+
+    @app.callback(
+        Output("navbar-clock-display", "children"),
+        Input("navbar-clock", "n_intervals"),
+    )
+    def _update_navbar_clock(_):
+        now = dt.datetime.now(core.US_EASTERN)
+        return now.strftime("美东时间 %Y-%m-%d %H:%M:%S")

@@ -2952,6 +2952,16 @@ def _is_time_not_supplied(s: str) -> bool:
     return ("not" in lowered and "suppl" in lowered) or ("tbd" in lowered) or ("unconfirmed" in lowered) or (lowered == "")
 
 
+def _resolve_earnings_decision_date(
+    earnings_date: dt.date, time_label: str | None
+) -> dt.date:
+    """Derive the decision date for an earnings row based on its time slot."""
+
+    if _is_pre_market(time_label or ""):
+        return previous_trading_day(earnings_date)
+    return earnings_date
+
+
 def pick_by_times(rows: T.List[dict], want_after_hours=False, want_pre_market=False, want_not_supplied=False) -> T.List[dict]:
     out = []
     for r in rows:
@@ -3473,12 +3483,14 @@ def _prepare_earnings_dataset(
         symbol = str(entry.get("symbol") or "").upper()
         if not symbol:
             continue
+        time_label = entry.get("time") or ""
+        decision_date = _resolve_earnings_decision_date(target_date, time_label)
         row = {
             "symbol": symbol,
             "company": entry.get("company") or "",
-            "time": entry.get("time") or "",
-            "bucket": _describe_time_bucket(entry.get("time")),
-            "decision_date": target_date.isoformat(),
+            "time": time_label,
+            "bucket": _describe_time_bucket(time_label),
+            "decision_date": decision_date.isoformat(),
             "timeline_date": target_date.isoformat(),
         }
         note = option_notes.get(symbol)
