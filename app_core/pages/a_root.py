@@ -10,6 +10,7 @@ import dash_bootstrap_components as dbc
 from dash import Dash, Input, Output, State, dcc, html, no_update
 
 from .. import core
+from ..data.firstrade import FTClient, has_valid_session
 from .b_connections import build_layout as build_connections_tab
 from .d_earnings import build_layout as build_earnings_tab
 from .e_tasks import build_layout as build_tasks_tab
@@ -292,7 +293,7 @@ def register_callbacks(app: Dash) -> None:
             return no_update, "Firstrade 登录失败：请填写用户名和密码。", logs
 
         log("正在尝试登录 Firstrade……")
-        ft = core.FTClient(
+        ft = FTClient(
             username=username,
             password=password,
             twofa_code=twofa if twofa else None,
@@ -317,7 +318,7 @@ def register_callbacks(app: Dash) -> None:
         Input("ft-session-store", "data"),
     )
     def _toggle_gate(session_state):
-        logged_in = bool(session_state and isinstance(session_state, dict) and session_state.get("sid"))
+        logged_in = has_valid_session(session_state)
         if logged_in:
             login_style = {"display": "none"}
             app_style = {}
