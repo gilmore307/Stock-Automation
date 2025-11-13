@@ -201,10 +201,10 @@ def build_layout(config: LayoutConfig) -> html.Div:
                         dbc.Container(
                             [
                                 dbc.NavbarBrand(config.navbar_title, className="me-2"),
-                                dbc.NavbarText(
+                                html.Span(
                                     "美东时间同步中…",
                                     id="navbar-clock-display",
-                                    className="ms-auto text-white",
+                                    className="navbar-text ms-auto text-white",
                                 ),
                                 dbc.Button(
                                     "查看日志",
